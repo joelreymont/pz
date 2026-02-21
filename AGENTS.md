@@ -2,7 +2,7 @@
 
 ## Mission
 
-Build `pizi`: a Zig CLI harness with TUI. Do not optimize for compatibility with pi.
+Build `pz`: a Zig CLI harness with TUI. Do not optimize for compatibility with pi.
 
 ## Feature Fidelity (BLOCKING)
 
@@ -33,7 +33,7 @@ Use `jj`, not `git`.
 For multi-agent work, use separate `jj` workspaces.
 
 1. Create workspace per agent:
-   - `jj workspace add ../pizi-<agent>`
+   - `jj workspace add ../pz-<agent>`
 2. Assign file ownership per workspace.
 3. Do not edit files owned by another workspace.
 4. Reconcile by rebasing/squashing after each track stabilizes.

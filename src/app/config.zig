@@ -3,8 +3,8 @@ const args = @import("args.zig");
 
 pub const model_default = "default";
 pub const provider_default = "default";
-pub const session_dir_default = ".pizi/sessions";
-pub const auto_cfg_path = ".pizi.json";
+pub const session_dir_default = ".pz/sessions";
+pub const auto_cfg_path = ".pz.json";
 pub const pi_settings_rel_path = ".pi/agent/settings.json";
 
 pub const Env = struct {
@@ -17,11 +17,11 @@ pub const Env = struct {
 
     pub fn fromProcess(alloc: std.mem.Allocator) !Env {
         return .{
-            .model = dupEnvAlias(alloc, "PIZI_MODEL", "PI_MODEL"),
-            .provider = dupEnvAlias(alloc, "PIZI_PROVIDER", "PI_PROVIDER"),
-            .session_dir = dupEnvAlias(alloc, "PIZI_SESSION_DIR", "PI_SESSION_DIR"),
-            .mode = dupEnvAlias(alloc, "PIZI_MODE", "PI_MODE"),
-            .provider_cmd = dupEnvAlias(alloc, "PIZI_PROVIDER_CMD", "PI_PROVIDER_CMD"),
+            .model = dupEnvAlias(alloc, "PZ_MODEL", "PI_MODEL"),
+            .provider = dupEnvAlias(alloc, "PZ_PROVIDER", "PI_PROVIDER"),
+            .session_dir = dupEnvAlias(alloc, "PZ_SESSION_DIR", "PI_SESSION_DIR"),
+            .mode = dupEnvAlias(alloc, "PZ_MODE", "PI_MODE"),
+            .provider_cmd = dupEnvAlias(alloc, "PZ_PROVIDER_CMD", "PI_PROVIDER_CMD"),
             .home = dupEnv(alloc, "HOME"),
         };
     }

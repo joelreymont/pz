@@ -362,27 +362,27 @@ test "parse defaults to tui and auto config" {
 }
 
 test "parse print subcommand positional prompt and config path" {
-    const out = try parse(&.{ "print", "hello", "--config", "/tmp/pizi.json" });
+    const out = try parse(&.{ "print", "hello", "--config", "/tmp/pz.json" });
 
     try std.testing.expectEqual(Mode.print, out.mode);
     try std.testing.expect(out.prompt != null);
     try std.testing.expect(std.mem.eql(u8, out.prompt.?, "hello"));
 
     switch (out.cfg) {
-        .path => |path| try std.testing.expect(std.mem.eql(u8, path, "/tmp/pizi.json")),
+        .path => |path| try std.testing.expect(std.mem.eql(u8, path, "/tmp/pz.json")),
         else => return error.TestUnexpectedResult,
     }
 }
 
 test "parse long forms with equals syntax" {
-    const out = try parse(&.{ "--mode=print", "--prompt=ship-it", "--config=/tmp/pizi.toml" });
+    const out = try parse(&.{ "--mode=print", "--prompt=ship-it", "--config=/tmp/pz.toml" });
 
     try std.testing.expectEqual(Mode.print, out.mode);
     try std.testing.expect(out.prompt != null);
     try std.testing.expect(std.mem.eql(u8, out.prompt.?, "ship-it"));
 
     switch (out.cfg) {
-        .path => |path| try std.testing.expect(std.mem.eql(u8, path, "/tmp/pizi.toml")),
+        .path => |path| try std.testing.expect(std.mem.eql(u8, path, "/tmp/pz.toml")),
         else => return error.TestUnexpectedResult,
     }
 }

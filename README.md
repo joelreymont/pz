@@ -1,34 +1,35 @@
-# pizi
+# pz
 
-`pizi` is a Zig-first coding-agent harness with an integrated terminal UI.
+Minimal re-implementation of [pi](https://github.com/nicholasgasior/pi) coding-agent harness in Zig.
 
-It is inspired by pi, but intentionally not API- or format-compatible.
+Single binary, no runtime dependencies. Interactive TUI, headless print/JSON modes, and an RPC interface.
 
-## Scope
+## Build
 
-- CLI harness
-- Interactive TUI
-- Headless print mode
-- Headless JSON mode
-- RPC stdin/stdout command mode
-- Core tools: `read`, `bash`, `edit`, `write`
-- Extra built-ins: `grep`, `find`, `ls`
-- Session persistence
-- Streaming model responses
-- Session control: continue/resume/explicit session IDs and paths
-- Interactive slash command surface (`/model`, `/provider`, `/tools`, `/session`, `/tree`, `/fork`, `/compact`, ...)
-- Auto-import of pi defaults from `~/.pi/agent/settings.json` (model/provider/mode/provider command)
+```
+zig build
+```
 
-## Non-Goals
+## Run
 
-- Backward compatibility with pi
-- Web UI
-- Slack bot integrations
-- Multi-package monorepo layout
-- SDK/extension ecosystem parity
+```
+zig build run -- --provider google --model gemini-2.5-pro
+```
 
-## Status
+## Test
 
-Core runtime, tooling, and mode surface are implemented with tests.
+```
+zig build test
+```
 
-See `PLAN.md` for execution order and `docs/parity.md` for feature-level parity tracking.
+## Features
+
+- Interactive TUI with streaming responses
+- Headless print, JSON, and RPC modes
+- Tools: `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- Session persistence and resume
+- Auto-import of pi settings from `~/.pi/agent/settings.json`
+
+## License
+
+MIT

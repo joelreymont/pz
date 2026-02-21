@@ -1,4 +1,4 @@
-# pizi Feature Parity
+# pz Feature Parity
 
 Tracks user-visible harness parity targets and proof points.
 
@@ -51,4 +51,4 @@ Tracks user-visible harness parity targets and proof points.
 - [ ] SDK integration
 - [ ] extension/plugin ecosystem
 
-These are out of scope for Zig-first `pizi` unless explicitly requested.
+These are out of scope for Zig-first `pz` unless explicitly requested.

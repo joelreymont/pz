@@ -1,0 +1,15 @@
+{"version":1,"at_ms":1771704242320,"data":{"prompt":{"text":"dgdg"}}}
+{"version":1,"at_ms":1771704242321,"data":{"err":{"text":"provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD"}}}
+{"version":1,"at_ms":1771704242321,"data":{"stop":{"reason":"err"}}}
+{"version":1,"at_ms":1771704244427,"data":{"prompt":{"text":"dgdg"}}}
+{"version":1,"at_ms":1771704244428,"data":{"err":{"text":"provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD"}}}
+{"version":1,"at_ms":1771704244428,"data":{"stop":{"reason":"err"}}}
+{"version":1,"at_ms":1771704246361,"data":{"prompt":{"text":"djgh"}}}
+{"version":1,"at_ms":1771704246362,"data":{"err":{"text":"provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD"}}}
+{"version":1,"at_ms":1771704246362,"data":{"stop":{"reason":"err"}}}
+{"version":1,"at_ms":1771704247931,"data":{"prompt":{"text":"hthis"}}}
+{"version":1,"at_ms":1771704247931,"data":{"err":{"text":"provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD"}}}
+{"version":1,"at_ms":1771704247932,"data":{"stop":{"reason":"err"}}}
+{"version":1,"at_ms":1771704248461,"data":{"prompt":{"text":"s"}}}
+{"version":1,"at_ms":1771704248462,"data":{"err":{"text":"provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD"}}}
+{"version":1,"at_ms":1771704248463,"data":{"stop":{"reason":"err"}}}

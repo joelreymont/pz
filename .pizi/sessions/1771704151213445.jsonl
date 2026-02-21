@@ -1,0 +1,3 @@
+{"version":1,"at_ms":1771704151213,"data":{"prompt":{"text":"ping"}}}
+{"version":1,"at_ms":1771704151214,"data":{"err":{"text":"provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD"}}}
+{"version":1,"at_ms":1771704151215,"data":{"stop":{"reason":"err"}}}
