@@ -27,6 +27,8 @@ Tracks user-visible harness parity targets and proof points.
 - [x] `--model <MODEL>`
 - [x] `--provider <PROVIDER>`
 - [x] `--provider-cmd <CMD>`
+- [x] auto-import pi defaults from `~/.pi/agent/settings.json`
+  - Proof: `src/app/config.zig:test "config auto imports pi settings from home"`
 - [x] `/model` and `/provider` commands in TUI
 - [x] `model` and `provider` commands in RPC
 - [x] `/tools` and `tools` commands for live tool-surface control

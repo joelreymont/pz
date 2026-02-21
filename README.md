@@ -17,6 +17,7 @@ It is inspired by pi, but intentionally not API- or format-compatible.
 - Streaming model responses
 - Session control: continue/resume/explicit session IDs and paths
 - Interactive slash command surface (`/model`, `/provider`, `/tools`, `/session`, `/tree`, `/fork`, `/compact`, ...)
+- Auto-import of pi defaults from `~/.pi/agent/settings.json` (model/provider/mode/provider command)
 
 ## Non-Goals
 
