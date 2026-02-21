@@ -6,7 +6,6 @@ const print_err = @import("../modes/print/errors.zig");
 const tui_harness = @import("../modes/tui/harness.zig");
 
 pub const Err = error{
-    MissingProviderCommand,
     SessionNotFound,
     AmbiguousSession,
     InvalidSessionPath,
@@ -55,6 +54,48 @@ const ProviderRuntime = struct {
     fn deinit(self: *ProviderRuntime) void {
         self.tr.deinit();
         self.* = undefined;
+    }
+};
+
+const missing_provider_msg = "provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD";
+
+const MissingProvider = struct {
+    alloc: std.mem.Allocator,
+
+    fn asProvider(self: *MissingProvider) core.providers.Provider {
+        return core.providers.Provider.from(MissingProvider, self, MissingProvider.start);
+    }
+
+    fn start(self: *MissingProvider, _: core.providers.Req) !core.providers.Stream {
+        const stream = try self.alloc.create(MissingProviderStream);
+        stream.* = .{
+            .alloc = self.alloc,
+        };
+        return core.providers.Stream.from(
+            MissingProviderStream,
+            stream,
+            MissingProviderStream.next,
+            MissingProviderStream.deinit,
+        );
+    }
+};
+
+const MissingProviderStream = struct {
+    alloc: std.mem.Allocator,
+    idx: u8 = 0,
+
+    fn next(self: *MissingProviderStream) !?core.providers.Ev {
+        defer self.idx +|= 1;
+
+        return switch (self.idx) {
+            0 => .{ .err = missing_provider_msg },
+            1 => .{ .stop = .{ .reason = .err } },
+            else => null,
+        };
+    }
+
+    fn deinit(self: *MissingProviderStream) void {
+        self.alloc.destroy(self);
     }
 };
 
@@ -160,11 +201,21 @@ pub fn execWithIo(
     in: ?std.Io.AnyReader,
     out: ?std.Io.AnyWriter,
 ) (Err || anyerror)![]u8 {
-    const provider_cmd = run_cmd.cfg.provider_cmd orelse return error.MissingProviderCommand;
-
     var provider_rt: ProviderRuntime = undefined;
-    try provider_rt.init(alloc, provider_cmd);
-    defer provider_rt.deinit();
+    var missing_provider = MissingProvider{
+        .alloc = alloc,
+    };
+    var provider: core.providers.Provider = undefined;
+    var has_provider_rt = false;
+    defer if (has_provider_rt) provider_rt.deinit();
+
+    if (run_cmd.cfg.provider_cmd) |provider_cmd| {
+        try provider_rt.init(alloc, provider_cmd);
+        has_provider_rt = true;
+        provider = provider_rt.client.asProvider();
+    } else {
+        provider = missing_provider.asProvider();
+    }
 
     var tools_rt = core.tools.builtin.Runtime.init(.{
         .alloc = alloc,
@@ -207,7 +258,7 @@ pub fn execWithIo(
             alloc,
             run_cmd,
             sid,
-            provider_rt.client.asProvider(),
+            provider,
             store,
             tools_rt.registry(),
             writer,
@@ -216,7 +267,7 @@ pub fn execWithIo(
             alloc,
             run_cmd,
             sid,
-            provider_rt.client.asProvider(),
+            provider,
             store,
             tools_rt.registry(),
             reader,
@@ -226,7 +277,7 @@ pub fn execWithIo(
             alloc,
             run_cmd,
             &sid,
-            provider_rt.client.asProvider(),
+            provider,
             store,
             &tools_rt,
             reader,
@@ -238,7 +289,7 @@ pub fn execWithIo(
             alloc,
             run_cmd,
             &sid,
-            provider_rt.client.asProvider(),
+            provider,
             store,
             &tools_rt,
             reader,
@@ -1416,21 +1467,35 @@ test "runtime executes tui mode path with provided prompt" {
     }
 }
 
-test "runtime rejects missing provider command" {
+test "runtime tui reports missing provider command via provider error stream" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("sess");
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
     var cfg = cli.Run{
-        .mode = .print,
+        .mode = .tui,
         .prompt = "ping",
         .cfg = .{
-            .mode = .print,
+            .mode = .tui,
             .model = try std.testing.allocator.dupe(u8, "m"),
             .provider = try std.testing.allocator.dupe(u8, "p"),
-            .session_dir = try std.testing.allocator.dupe(u8, ".pizi/sessions"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
             .provider_cmd = null,
         },
     };
     defer cfg.cfg.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.MissingProviderCommand, exec(std.testing.allocator, cfg));
+    var out_buf: [16384]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    defer std.testing.allocator.free(sid);
+
+    const written = out_fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "provider_cmd missing") != null);
 }
 
 test "runtime tui consumes multiple prompts from input stream" {
