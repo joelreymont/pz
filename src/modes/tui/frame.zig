@@ -1,28 +1,30 @@
 const std = @import("std");
+const wcwidth = @import("wcwidth.zig").wcwidth;
 
-pub const Color = enum(u5) {
-    default,
-    black,
-    red,
-    green,
-    yellow,
-    blue,
-    magenta,
-    cyan,
-    white,
-    bright_black,
-    bright_red,
-    bright_green,
-    bright_yellow,
-    bright_blue,
-    bright_magenta,
-    bright_cyan,
-    bright_white,
+pub const Color = union(enum) {
+    default: void,
+    idx: u8,
+    rgb: u24,
+
+    pub fn eql(a: Color, b: Color) bool {
+        const ta = std.meta.activeTag(a);
+        const tb = std.meta.activeTag(b);
+        if (ta != tb) return false;
+        return switch (a) {
+            .default => true,
+            .idx => |v| v == b.idx,
+            .rgb => |v| v == b.rgb,
+        };
+    }
+
+    pub fn isDefault(c: Color) bool {
+        return c == .default;
+    }
 };
 
 pub const Style = struct {
-    fg: Color = .default,
-    bg: Color = .default,
+    fg: Color = .{ .default = {} },
+    bg: Color = .{ .default = {} },
     bold: bool = false,
     dim: bool = false,
     italic: bool = false,
@@ -30,8 +32,8 @@ pub const Style = struct {
     inverse: bool = false,
 
     pub fn eql(a: Style, b: Style) bool {
-        return a.fg == b.fg and
-            a.bg == b.bg and
+        return Color.eql(a.fg, b.fg) and
+            Color.eql(a.bg, b.bg) and
             a.bold == b.bold and
             a.dim == b.dim and
             a.italic == b.italic and
@@ -106,15 +108,25 @@ pub const Frame = struct {
         });
     }
 
+    /// Sentinel codepoint for the trailing cell of a wide character.
+    pub const wide_pad: u21 = 0;
+
     pub fn write(self: *Frame, x: usize, y: usize, text: []const u8, style: Style) WriteError!usize {
         if (x >= self.w or y >= self.h) return error.OutOfBounds;
 
         var col = x;
         var ct: usize = 0;
         var it = (try std.unicode.Utf8View.init(text)).iterator();
-        while (col < self.w) : (col += 1) {
+        while (col < self.w) {
             const cp = it.nextCodepoint() orelse break;
+            const w: usize = wcwidth(cp);
+            if (w == 0) continue;
+            if (col + w > self.w) break; // no room for wide char
             self.cells[y * self.w + col] = .{ .cp = cp, .style = style };
+            if (w == 2) {
+                self.cells[y * self.w + col + 1] = .{ .cp = wide_pad, .style = style };
+            }
+            col += w;
             ct += 1;
         }
 
@@ -140,7 +152,7 @@ test "frame write clips utf8 input at row width" {
     defer f.deinit(std.testing.allocator);
 
     const st = Style{
-        .fg = .green,
+        .fg = .{ .idx = 2 },
         .underline = true,
     };
 
@@ -185,4 +197,40 @@ test "frame copy requires matching size" {
     try std.testing.expect(b.eql(&a));
 
     try std.testing.expectError(error.SizeMismatch, c.copyFrom(&a));
+}
+
+test "frame write wide CJK characters" {
+    // 6-col frame: write "A中B" → A(1) + 中(2) + B(1) = 4 cols used
+    var f = try Frame.init(std.testing.allocator, 6, 1);
+    defer f.deinit(std.testing.allocator);
+
+    const wrote = try f.write(0, 0, "A中B", .{});
+    try std.testing.expectEqual(@as(usize, 3), wrote);
+
+    try std.testing.expectEqual(@as(u21, 'A'), (try f.cell(0, 0)).cp);
+    try std.testing.expectEqual(@as(u21, 0x4E2D), (try f.cell(1, 0)).cp); // '中'
+    try std.testing.expectEqual(@as(u21, Frame.wide_pad), (try f.cell(2, 0)).cp); // pad
+    try std.testing.expectEqual(@as(u21, 'B'), (try f.cell(3, 0)).cp);
+}
+
+test "frame write wide char clipped at boundary" {
+    // 3-col frame: write "A中" → A fills col 0, 中 needs cols 1-2 → fits
+    var f = try Frame.init(std.testing.allocator, 3, 1);
+    defer f.deinit(std.testing.allocator);
+
+    const wrote = try f.write(0, 0, "A中X", .{});
+    try std.testing.expectEqual(@as(usize, 2), wrote); // A + 中, no room for X
+
+    try std.testing.expectEqual(@as(u21, 'A'), (try f.cell(0, 0)).cp);
+    try std.testing.expectEqual(@as(u21, 0x4E2D), (try f.cell(1, 0)).cp);
+    try std.testing.expectEqual(@as(u21, Frame.wide_pad), (try f.cell(2, 0)).cp);
+}
+
+test "frame write wide char dropped when only 1 col left" {
+    // 2-col frame starting at col 1: only 1 col left, wide char won't fit
+    var f = try Frame.init(std.testing.allocator, 2, 1);
+    defer f.deinit(std.testing.allocator);
+
+    const wrote = try f.write(1, 0, "中", .{});
+    try std.testing.expectEqual(@as(usize, 0), wrote);
 }

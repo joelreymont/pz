@@ -54,6 +54,10 @@ Only include files changed by the current agent/task. No broad staging.
 Run relevant tests before and after each fix or feature.
 Every bug fix must add or strengthen a test.
 
+## Zig Rules
+
+See `~/.agents/docs/zig.md`.
+
 ## Plan Rule
 
 Track execution against `PLAN.md`.

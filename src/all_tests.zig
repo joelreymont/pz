@@ -7,6 +7,8 @@ const prov = @import("core/providers/first_provider.zig");
 const mode_contract = @import("modes/contract.zig");
 const print_run = @import("modes/print/run.zig");
 const tui_harness = @import("modes/tui/harness.zig");
+const tui_vscreen = @import("modes/tui/vscreen.zig");
+const tui_fixture = @import("modes/tui/fixture.zig");
 const perf_baseline = @import("perf/baseline.zig");
 
 test "all module tests" {
@@ -19,5 +21,7 @@ test "all module tests" {
     _ = mode_contract;
     _ = print_run;
     _ = tui_harness;
+    _ = tui_vscreen;
+    _ = tui_fixture;
     _ = perf_baseline;
 }

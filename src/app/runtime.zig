@@ -4,11 +4,16 @@ const core = @import("../core/mod.zig");
 const print_fmt = @import("../modes/print/format.zig");
 const print_err = @import("../modes/print/errors.zig");
 const tui_harness = @import("../modes/tui/harness.zig");
+const tui_render = @import("../modes/tui/render.zig");
+const tui_term = @import("../modes/tui/term.zig");
+const tui_input = @import("../modes/tui/input.zig");
+const tui_editor = @import("../modes/tui/editor.zig");
 
 pub const Err = error{
     SessionNotFound,
     AmbiguousSession,
     InvalidSessionPath,
+    TerminalSetupFailed,
 };
 
 const map_ctx_t = struct {
@@ -171,7 +176,7 @@ const JsonSink = struct {
 const RpcReq = struct {
     id: ?[]const u8 = null,
     cmd: ?[]const u8 = null,
-    @"type": ?[]const u8 = null,
+    type: ?[]const u8 = null,
     text: ?[]const u8 = null,
     arg: ?[]const u8 = null,
     tools: ?[]const u8 = null,
@@ -412,8 +417,14 @@ fn runTui(
     var provider_owned: ?[]u8 = null;
     defer if (provider_owned) |p| alloc.free(p);
 
-    var ui = try tui_harness.Ui.init(alloc, 100, 28, model, provider_label);
+    const tsz = tui_term.size(std.posix.STDOUT_FILENO) orelse tui_term.Size{ .w = 80, .h = 24 };
+    var ui = try tui_harness.Ui.init(alloc, tsz.w, tsz.h, model, provider_label);
     defer ui.deinit();
+
+    _ = tui_term.installSigwinch();
+    try tui_render.Renderer.setup(out);
+
+    defer tui_render.Renderer.cleanup(out) catch {};
 
     var sink_impl = TuiSink{
         .ui = &ui,
@@ -456,52 +467,153 @@ fn runTui(
         return;
     }
 
-    var turn_ct: usize = 0;
-    var cmd_ct: usize = 0;
-    while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 64 * 1024)) |raw_line| {
-        defer alloc.free(raw_line);
+    const stdin_fd = std.posix.STDIN_FILENO;
+    const is_tty = std.posix.isatty(stdin_fd);
 
-        var line = raw_line;
-        if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
-        const trimmed = std.mem.trim(u8, line, " \t");
-        if (trimmed.len == 0) continue;
+    if (is_tty) {
+        if (!tui_term.enableRaw(stdin_fd)) return error.TerminalSetupFailed;
+        defer tui_term.restore(stdin_fd);
 
-        const cmd = try handleSlashCommand(
-            alloc,
-            trimmed,
-            sid,
-            &model,
-            &model_owned,
-            &provider_label,
-            &provider_owned,
-            tools_rt,
-            session_dir_path,
-            no_session,
-            out,
-        );
-        if (cmd == .quit) return;
-        if (cmd == .handled) {
-            try ui.setModel(model);
-            try ui.setProvider(provider_label);
-            try ui.draw(out);
-            cmd_ct += 1;
-            continue;
+        var reader = tui_input.Reader.init(stdin_fd);
+
+        while (true) {
+            if (tui_term.pollResize()) {
+                if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
+                    try ui.resize(sz.w, sz.h);
+                    try ui.draw(out);
+                }
+            }
+
+            const ev = reader.next();
+            switch (ev) {
+                .key => |key| {
+                    // Capture editor text before onKey clears it on submit
+                    const snap = ui.editorText();
+                    var pre: ?[]u8 = if (snap.len > 0) alloc.dupe(u8, snap) catch null else null;
+
+                    const act = try ui.onKey(key);
+                    switch (act) {
+                        .submit => {
+                            const prompt = pre orelse {
+                                try ui.draw(out);
+                                continue;
+                            };
+                            pre = null; // ownership transferred
+                            defer alloc.free(prompt);
+
+                            const cmd = try handleSlashCommand(
+                                alloc,
+                                prompt,
+                                sid,
+                                &model,
+                                &model_owned,
+                                &provider_label,
+                                &provider_owned,
+                                tools_rt,
+                                session_dir_path,
+                                no_session,
+                                out,
+                            );
+                            if (cmd == .quit) return;
+                            if (cmd == .handled) {
+                                try ui.setModel(model);
+                                try ui.setProvider(provider_label);
+                                try ui.draw(out);
+                                continue;
+                            }
+
+                            try runTuiTurn(
+                                alloc,
+                                sid.*,
+                                prompt,
+                                model,
+                                provider_label,
+                                provider,
+                                store,
+                                tools_rt.registry(),
+                                mode,
+                            );
+                            try ui.draw(out);
+                        },
+                        .cancel => {
+                            if (pre) |p| alloc.free(p);
+                            return;
+                        },
+                        .none => {
+                            if (pre) |p| alloc.free(p);
+                            try ui.draw(out);
+                        },
+                    }
+                },
+                .mouse => |mev| {
+                    ui.onMouse(mev);
+                    try ui.draw(out);
+                },
+                .resize => {
+                    if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
+                        try ui.resize(sz.w, sz.h);
+                        try ui.draw(out);
+                    }
+                },
+                .none => {},
+            }
         }
+    } else {
+        // Non-TTY (piped input): line-buffered mode for tests/scripts
+        var turn_ct: usize = 0;
+        var cmd_ct: usize = 0;
+        while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 64 * 1024)) |raw_line| {
+            defer alloc.free(raw_line);
 
-        try runTuiTurn(
-            alloc,
-            sid.*,
-            trimmed,
-            model,
-            provider_label,
-            provider,
-            store,
-            tools_rt.registry(),
-            mode,
-        );
-        turn_ct += 1;
+            if (tui_term.pollResize()) {
+                if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
+                    try ui.resize(sz.w, sz.h);
+                    try ui.draw(out);
+                }
+            }
+
+            var line = raw_line;
+            if (line.len > 0 and line[line.len - 1] == '\r') line = line[0 .. line.len - 1];
+            const trimmed = std.mem.trim(u8, line, " \t");
+            if (trimmed.len == 0) continue;
+
+            const cmd = try handleSlashCommand(
+                alloc,
+                trimmed,
+                sid,
+                &model,
+                &model_owned,
+                &provider_label,
+                &provider_owned,
+                tools_rt,
+                session_dir_path,
+                no_session,
+                out,
+            );
+            if (cmd == .quit) return;
+            if (cmd == .handled) {
+                try ui.setModel(model);
+                try ui.setProvider(provider_label);
+                try ui.draw(out);
+                cmd_ct += 1;
+                continue;
+            }
+
+            try runTuiTurn(
+                alloc,
+                sid.*,
+                trimmed,
+                model,
+                provider_label,
+                provider,
+                store,
+                tools_rt.registry(),
+                mode,
+            );
+            turn_ct += 1;
+        }
+        if (turn_ct == 0 and cmd_ct == 0) return error.EmptyPrompt;
     }
-    if (turn_ct == 0 and cmd_ct == 0) return error.EmptyPrompt;
 }
 
 fn runRpc(
@@ -547,7 +659,7 @@ fn runRpc(
         };
         defer parsed.deinit();
         const req = parsed.value;
-        const raw_cmd = req.cmd orelse req.@"type" orelse "";
+        const raw_cmd = req.cmd orelse req.type orelse "";
         if (raw_cmd.len == 0) {
             try writeJsonLine(alloc, out, .{
                 .type = "rpc_error",

@@ -1,18 +1,46 @@
 const std = @import("std");
 const frame = @import("frame.zig");
+const termcap = @import("termcap.zig");
+
+/// DEC private mode IDs used for terminal control.
+const DecMode = enum(u16) {
+    cursor = 25,
+    alt_screen = 1049,
+    sync = 2026,
+};
+
+const Layer = termcap.Layer;
+
+fn decSeq(comptime mode: DecMode, comptime c: u8) *const [std.fmt.count("\x1b[?{d}" ++ [_]u8{c}, .{@intFromEnum(mode)})]u8 {
+    return comptime std.fmt.comptimePrint("\x1b[?{d}" ++ [_]u8{c}, .{@intFromEnum(mode)});
+}
+
+fn decSet(comptime mode: DecMode) @TypeOf(decSeq(mode, 'h')) {
+    return decSeq(mode, 'h');
+}
+
+fn decRst(comptime mode: DecMode) @TypeOf(decSeq(mode, 'l')) {
+    return decSeq(mode, 'l');
+}
 
 pub const Renderer = struct {
     alloc: std.mem.Allocator,
     prev: frame.Frame,
+    cap: termcap.ColorCap,
     cold: bool = true,
 
     pub const InitError = frame.Frame.InitError;
     pub const RenderError = error{SizeMismatch};
 
     pub fn init(alloc: std.mem.Allocator, w: usize, h: usize) InitError!Renderer {
+        return initCap(alloc, w, h, .truecolor);
+    }
+
+    pub fn initCap(alloc: std.mem.Allocator, w: usize, h: usize, cap: termcap.ColorCap) InitError!Renderer {
         return .{
             .alloc = alloc,
             .prev = try frame.Frame.init(alloc, w, h),
+            .cap = cap,
             .cold = true,
         };
     }
@@ -26,8 +54,20 @@ pub const Renderer = struct {
         self.cold = true;
     }
 
+    pub fn setup(out: anytype) !void {
+        try out.writeAll(decSet(.alt_screen) ++ decRst(.cursor) ++
+            "\x1b[?1000h\x1b[?1006h");
+    }
+
+    pub fn cleanup(out: anytype) !void {
+        try out.writeAll("\x1b[?1006l\x1b[?1000l" ++
+            decSet(.cursor) ++ decRst(.alt_screen));
+    }
+
     pub fn render(self: *Renderer, next: *const frame.Frame, out: anytype) (RenderError || anyerror)!void {
         if (self.prev.w != next.w or self.prev.h != next.h) return error.SizeMismatch;
+
+        try out.writeAll(decSet(.sync));
 
         if (self.cold) {
             try out.writeAll("\x1b[0m\x1b[2J\x1b[H");
@@ -56,8 +96,11 @@ pub const Renderer = struct {
                 var col = run_start;
                 while (col < x) : (col += 1) {
                     const c = next.cells[y * next.w + col];
+                    // Skip wide-char padding cells — the wide char
+                    // already occupies this column from the previous cell
+                    if (c.cp == frame.Frame.wide_pad) continue;
                     if (!frame.Style.eql(cur_st, c.style)) {
-                        try writeStyle(out, c.style);
+                        try writeStyle(out, c.style, self.cap);
                         cur_st = c.style;
                     }
                     try writeCodepoint(out, c.cp);
@@ -68,6 +111,8 @@ pub const Renderer = struct {
         if (!cur_st.isDefault()) {
             try out.writeAll("\x1b[0m");
         }
+
+        try out.writeAll(decRst(.sync));
 
         try self.prev.copyFrom(next);
         self.cold = false;
@@ -80,7 +125,7 @@ fn writeFmt(out: anytype, comptime fmt: []const u8, args: anytype) !void {
     try out.writeAll(msg);
 }
 
-fn writeStyle(out: anytype, st: frame.Style) !void {
+fn writeStyle(out: anytype, st: frame.Style, cap: termcap.ColorCap) !void {
     if (st.isDefault()) {
         try out.writeAll("\x1b[0m");
         return;
@@ -93,11 +138,8 @@ fn writeStyle(out: anytype, st: frame.Style) !void {
     if (st.underline) try out.writeAll(";4");
     if (st.inverse) try out.writeAll(";7");
 
-    const fg = fgCode(st.fg);
-    if (fg != 39) try writeFmt(out, ";{}", .{fg});
-
-    const bg = bgCode(st.bg);
-    if (bg != 49) try writeFmt(out, ";{}", .{bg});
+    try termcap.writeColor(out, .fg, st.fg, cap);
+    try termcap.writeColor(out, .bg, st.bg, cap);
 
     try out.writeAll("m");
 }
@@ -106,50 +148,6 @@ fn writeCodepoint(out: anytype, cp: u21) !void {
     var buf: [4]u8 = undefined;
     const n = try std.unicode.utf8Encode(cp, &buf);
     try out.writeAll(buf[0..n]);
-}
-
-fn fgCode(color: frame.Color) u8 {
-    return switch (color) {
-        .default => 39,
-        .black => 30,
-        .red => 31,
-        .green => 32,
-        .yellow => 33,
-        .blue => 34,
-        .magenta => 35,
-        .cyan => 36,
-        .white => 37,
-        .bright_black => 90,
-        .bright_red => 91,
-        .bright_green => 92,
-        .bright_yellow => 93,
-        .bright_blue => 94,
-        .bright_magenta => 95,
-        .bright_cyan => 96,
-        .bright_white => 97,
-    };
-}
-
-fn bgCode(color: frame.Color) u8 {
-    return switch (color) {
-        .default => 49,
-        .black => 40,
-        .red => 41,
-        .green => 42,
-        .yellow => 43,
-        .blue => 44,
-        .magenta => 45,
-        .cyan => 46,
-        .white => 47,
-        .bright_black => 100,
-        .bright_red => 101,
-        .bright_green => 102,
-        .bright_yellow => 103,
-        .bright_blue => 104,
-        .bright_magenta => 105,
-        .bright_cyan => 106,
-        .bright_white => 107,
-    };
 }
 
 const TestBuf = struct {
@@ -164,7 +162,7 @@ const TestBuf = struct {
         self.len = 0;
     }
 
-    fn writeAll(self: *TestBuf, bytes: []const u8) !void {
+    pub fn writeAll(self: *TestBuf, bytes: []const u8) !void {
         if (self.len + bytes.len > self.buf.len) return error.NoSpaceLeft;
         @memcpy(self.buf[self.len .. self.len + bytes.len], bytes);
         self.len += bytes.len;
@@ -190,7 +188,7 @@ test "renderer first frame clears and paints dirty runs" {
     try rnd.render(&frm, &out);
 
     try std.testing.expectEqualStrings(
-        "\x1b[0m\x1b[2J\x1b[H\x1b[1;1HAB\x1b[2;4HQ",
+        decSet(.sync) ++ "\x1b[0m\x1b[2J\x1b[H\x1b[1;1HAB\x1b[2;4HQ" ++ decRst(.sync),
         out.view(),
     );
 }
@@ -213,7 +211,7 @@ test "renderer only emits changed cells after initial frame" {
     try frm.set(1, 0, 'Z', .{});
     try rnd.render(&frm, &out);
 
-    try std.testing.expectEqualStrings("\x1b[1;2HZ", out.view());
+    try std.testing.expectEqualStrings(decSet(.sync) ++ "\x1b[1;2HZ" ++ decRst(.sync), out.view());
 }
 
 test "renderer emits style transitions and resets to default" {
@@ -224,7 +222,7 @@ test "renderer emits style transitions and resets to default" {
     defer frm.deinit(std.testing.allocator);
 
     const emph = frame.Style{
-        .fg = .red,
+        .fg = .{ .idx = 1 },
         .bold = true,
     };
 
@@ -236,7 +234,7 @@ test "renderer emits style transitions and resets to default" {
     try rnd.render(&frm, &out);
 
     try std.testing.expectEqualStrings(
-        "\x1b[0m\x1b[2J\x1b[H\x1b[1;1H\x1b[0;1;31mAB\x1b[0mC",
+        decSet(.sync) ++ "\x1b[0m\x1b[2J\x1b[H\x1b[1;1H\x1b[0;1;38;5;1mAB\x1b[0mC" ++ decRst(.sync),
         out.view(),
     );
 }

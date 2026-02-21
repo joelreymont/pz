@@ -1,10 +1,12 @@
 const std = @import("std");
 const core = @import("../../core/mod.zig");
 const editor = @import("editor.zig");
+const mouse = @import("mouse.zig");
 const transcript = @import("transcript.zig");
 const panels = @import("panels.zig");
 const frame = @import("frame.zig");
 const render = @import("render.zig");
+const theme = @import("theme.zig");
 
 pub const Ui = struct {
     alloc: std.mem.Allocator,
@@ -21,14 +23,35 @@ pub const Ui = struct {
         model: []const u8,
         provider: []const u8,
     ) !Ui {
+        return initFull(alloc, w, h, model, provider, "", "");
+    }
+
+    pub fn initFull(
+        alloc: std.mem.Allocator,
+        w: usize,
+        h: usize,
+        model: []const u8,
+        provider: []const u8,
+        cwd: []const u8,
+        branch: []const u8,
+    ) !Ui {
+        theme.init();
         return .{
             .alloc = alloc,
             .ed = editor.Editor.init(alloc),
             .tr = transcript.Transcript.init(alloc),
-            .pn = try panels.Panels.init(alloc, model, provider),
+            .pn = try panels.Panels.initFull(alloc, model, provider, cwd, branch),
             .frm = try frame.Frame.init(alloc, w, h),
             .rnd = try render.Renderer.init(alloc, w, h),
         };
+    }
+
+    pub fn resize(self: *Ui, w: usize, h: usize) !void {
+        if (w == self.frm.w and h == self.frm.h) return;
+        self.rnd.deinit();
+        self.frm.deinit(self.alloc);
+        self.frm = try frame.Frame.init(self.alloc, w, h);
+        self.rnd = try render.Renderer.init(self.alloc, w, h);
     }
 
     pub fn deinit(self: *Ui) void {
@@ -49,11 +72,20 @@ pub const Ui = struct {
         const act = try self.ed.apply(key);
         if (act == .submit) {
             if (self.ed.text().len != 0) {
-                try self.tr.append(.{ .text = self.ed.text() });
+                try self.tr.userText(self.ed.text());
             }
             self.ed.clear();
+            self.tr.scrollToBottom();
         }
         return act;
+    }
+
+    pub fn onMouse(self: *Ui, ev: mouse.Ev) void {
+        switch (ev) {
+            .scroll_up => self.tr.scrollUp(3),
+            .scroll_down => self.tr.scrollDown(3),
+            else => {},
+        }
     }
 
     pub fn draw(self: *Ui, out: anytype) !void {
@@ -79,8 +111,13 @@ pub const Ui = struct {
         if (h > 2 and w > 0) {
             const body_y: usize = 1;
             const body_h = h - 2;
-            const tool_w = splitToolW(w);
-            const tx_w = w - tool_w;
+            const raw_tool_w = splitToolW(w);
+
+            // Reserve 1 col for separator if room for sep + 2 cols of tools
+            const has_sep = raw_tool_w >= 3 and w > raw_tool_w;
+            const sep_w: usize = if (has_sep) 1 else 0;
+            const tool_w = if (has_sep) raw_tool_w - sep_w else raw_tool_w;
+            const tx_w = w - raw_tool_w;
 
             if (tx_w > 0) {
                 try self.tr.render(&self.frm, .{
@@ -90,9 +127,19 @@ pub const Ui = struct {
                     .h = body_h,
                 });
             }
+
+            if (has_sep) {
+                const sep_x = tx_w;
+                const sep_st = frame.Style{ .fg = theme.get().border_muted };
+                var sy: usize = 0;
+                while (sy < body_h) : (sy += 1) {
+                    try self.frm.set(sep_x, body_y + sy, 0x2502, sep_st); // │
+                }
+            }
+
             if (tool_w > 0) {
                 try self.pn.renderTools(&self.frm, .{
-                    .x = tx_w,
+                    .x = tx_w + sep_w,
                     .y = body_y,
                     .w = tool_w,
                     .h = body_h,
@@ -118,7 +165,7 @@ pub const Ui = struct {
     fn drawEditorLine(self: *Ui, y: usize) !void {
         const prompt = "> ";
         const st = frame.Style{
-            .fg = .bright_white,
+            .fg = theme.get().accent,
             .bold = true,
         };
         _ = try self.frm.write(0, y, prompt, st);
@@ -219,4 +266,63 @@ test "harness renders tiny terminal without bounds errors" {
     try ui.draw(&out);
     out.clear();
     try ui.draw(&out);
+}
+
+test "harness resize reallocates frame and renderer" {
+    var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
+    defer ui.deinit();
+
+    var raw: [4096]u8 = undefined;
+    var out = TestBuf.init(raw[0..]);
+    try ui.draw(&out);
+
+    try ui.resize(20, 4);
+
+    out.clear();
+    try ui.draw(&out);
+    try std.testing.expect(out.view().len != 0);
+}
+
+test "harness onMouse scrolls transcript" {
+    var ui = try Ui.init(std.testing.allocator, 20, 4, "m", "p");
+    defer ui.deinit();
+
+    try ui.onProvider(.{ .text = "line1" });
+    try ui.tr.userText("line2");
+    try ui.tr.userText("line3");
+    try ui.tr.userText("line4");
+    try ui.tr.userText("line5");
+
+    try std.testing.expectEqual(@as(usize, 0), ui.tr.scroll_off);
+
+    ui.onMouse(.scroll_up);
+    try std.testing.expectEqual(@as(usize, 3), ui.tr.scroll_off);
+
+    ui.onMouse(.scroll_down);
+    try std.testing.expectEqual(@as(usize, 0), ui.tr.scroll_off);
+
+    // Extra scroll down doesn't underflow
+    ui.onMouse(.scroll_down);
+    try std.testing.expectEqual(@as(usize, 0), ui.tr.scroll_off);
+}
+
+test "harness submit resets scroll" {
+    var ui = try Ui.init(std.testing.allocator, 20, 4, "m", "p");
+    defer ui.deinit();
+
+    ui.tr.scrollUp(10);
+    _ = try ui.onKey(.{ .char = 'x' });
+    _ = try ui.onKey(.{ .enter = {} });
+    try std.testing.expectEqual(@as(usize, 0), ui.tr.scroll_off);
+}
+
+test "harness resize to same size is noop" {
+    var ui = try Ui.init(std.testing.allocator, 10, 5, "m", "p");
+    defer ui.deinit();
+    try ui.resize(10, 5);
+
+    var raw: [1024]u8 = undefined;
+    var out = TestBuf.init(raw[0..]);
+    try ui.draw(&out);
+    try std.testing.expect(out.view().len != 0);
 }

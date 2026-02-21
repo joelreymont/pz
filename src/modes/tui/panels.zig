@@ -1,6 +1,7 @@
 const std = @import("std");
 const core = @import("../../core/mod.zig");
 const frame = @import("frame.zig");
+const theme = @import("theme.zig");
 
 pub const Rect = struct {
     x: usize,
@@ -42,8 +43,11 @@ pub const Panels = struct {
     model: std.ArrayListUnmanaged(u8) = .empty,
     provider: std.ArrayListUnmanaged(u8) = .empty,
     last_err: std.ArrayListUnmanaged(u8) = .empty,
+    cwd: []const u8 = "",
+    branch: []const u8 = "",
     usage: core.providers.Usage = .{},
     has_usage: bool = false,
+    ctx_limit: u64 = 0,
     run_state: RunState = .idle,
 
     pub const InitError = std.mem.Allocator.Error || error{InvalidUtf8};
@@ -54,8 +58,20 @@ pub const Panels = struct {
     };
 
     pub fn init(alloc: std.mem.Allocator, model: []const u8, provider: []const u8) InitError!Panels {
+        return initFull(alloc, model, provider, "", "");
+    }
+
+    pub fn initFull(
+        alloc: std.mem.Allocator,
+        model: []const u8,
+        provider: []const u8,
+        cwd: []const u8,
+        branch: []const u8,
+    ) InitError!Panels {
         var out = Panels{
             .alloc = alloc,
+            .cwd = cwd,
+            .branch = branch,
         };
         errdefer out.deinit();
         try out.setModel(model);
@@ -152,7 +168,7 @@ pub const Panels = struct {
 
         var head_x = rect.x;
         try writePart(frm, &head_x, x_end, rect.y, "TOOLS", .{
-            .fg = .bright_white,
+            .fg = theme.get().accent,
             .bold = true,
         });
 
@@ -177,57 +193,71 @@ pub const Panels = struct {
         try clearRect(frm, rect);
 
         const y = rect.y;
-        var x = rect.x;
+        const label_st = frame.Style{ .fg = theme.get().dim };
 
-        const label_st = frame.Style{
-            .fg = .bright_black,
-        };
-
-        try writePart(frm, &x, x_end, y, "model ", label_st);
-        try writePart(frm, &x, x_end, y, self.model.items, .{
-            .fg = .cyan,
-            .bold = true,
-        });
-
-        try writePart(frm, &x, x_end, y, "  provider ", label_st);
-        try writePart(frm, &x, x_end, y, self.provider.items, .{
-            .fg = .yellow,
-            .bold = true,
-        });
-
-        try writePart(frm, &x, x_end, y, "  status ", label_st);
-        try writePart(frm, &x, x_end, y, runStateText(self.run_state), runStateStyle(self.run_state));
-
-        var tool_buf: [64]u8 = undefined;
-        const tool_txt = std.fmt.bufPrint(&tool_buf, "{}/{}", .{
-            self.runningCount(),
-            self.rows.items.len,
-        }) catch |fmt_err| switch (fmt_err) {
-            error.NoSpaceLeft => return error.NoSpaceLeft,
-        };
-        try writePart(frm, &x, x_end, y, "  tools ", label_st);
-        try writePart(frm, &x, x_end, y, tool_txt, .{});
-
+        // Measure right side to reserve space
+        var right_cols: usize = 0;
         if (self.has_usage) {
-            var use_buf: [128]u8 = undefined;
-            const use_txt = std.fmt.bufPrint(&use_buf, "{}/{}/{}", .{
-                self.usage.in_tok,
-                self.usage.out_tok,
-                self.usage.tot_tok,
-            }) catch |fmt_err| switch (fmt_err) {
-                error.NoSpaceLeft => return error.NoSpaceLeft,
-            };
-            try writePart(frm, &x, x_end, y, "  tok ", label_st);
-            try writePart(frm, &x, x_end, y, use_txt, .{
-                .fg = .bright_white,
-            });
+            // ↑N ↓N = ~3 + digits + 3 + digits. Add pct if ctx_limit.
+            right_cols = usageCols(self);
         }
 
+        const gap: usize = 2;
+        const left_limit = if (right_cols > 0 and right_cols + gap < rect.w)
+            x_end - right_cols - gap
+        else
+            x_end;
+
+        // Left: [cwd:branch • ] model • state [err]
+        var x = rect.x;
+
+        if (self.cwd.len > 0) {
+            try writePart(frm, &x, left_limit, y, self.cwd, .{ .fg = theme.get().accent });
+            if (self.branch.len > 0) {
+                try writePart(frm, &x, left_limit, y, ":", label_st);
+                try writePart(frm, &x, left_limit, y, self.branch, .{ .fg = theme.get().muted });
+            }
+            try writePart(frm, &x, left_limit, y, " \xe2\x80\xa2 ", label_st);
+        }
+
+        try writePart(frm, &x, left_limit, y, self.model.items, .{
+            .fg = theme.get().border_accent,
+            .bold = true,
+        });
+        try writePart(frm, &x, left_limit, y, " \xe2\x80\xa2 ", label_st);
+        try writePart(frm, &x, left_limit, y, runStateText(self.run_state), runStateStyle(self.run_state));
+
         if (self.run_state == .failed and self.last_err.items.len > 0) {
-            try writePart(frm, &x, x_end, y, "  err ", label_st);
-            try writePart(frm, &x, x_end, y, self.last_err.items, .{
-                .fg = .red,
-            });
+            try writePart(frm, &x, left_limit, y, " ", label_st);
+            try writePart(frm, &x, left_limit, y, self.last_err.items, .{ .fg = theme.get().err });
+        }
+
+        // Right: ↑in ↓out [pct%/Nk]
+        if (self.has_usage and right_cols > 0) {
+            var rx = x_end - right_cols;
+
+            try writePart(frm, &rx, x_end, y, "\xe2\x86\x91", label_st);
+            var ib: [16]u8 = undefined;
+            const it = fmtBuf(&ib, "{d}", .{self.usage.in_tok}) catch return error.NoSpaceLeft;
+            try writePart(frm, &rx, x_end, y, it, .{ .fg = theme.get().accent });
+
+            try writePart(frm, &rx, x_end, y, " \xe2\x86\x93", label_st);
+            var ob: [16]u8 = undefined;
+            const ot = fmtBuf(&ob, "{d}", .{self.usage.out_tok}) catch return error.NoSpaceLeft;
+            try writePart(frm, &rx, x_end, y, ot, .{ .fg = theme.get().accent });
+
+            if (self.ctx_limit > 0) {
+                const pct = self.usage.tot_tok * 100 / self.ctx_limit;
+                const pct_fg = if (pct >= 90) theme.get().err else if (pct >= 70) theme.get().warn else theme.get().accent;
+
+                try writePart(frm, &rx, x_end, y, " ", label_st);
+                var pb: [8]u8 = undefined;
+                const pt = fmtBuf(&pb, "{d}%", .{pct}) catch return error.NoSpaceLeft;
+                try writePart(frm, &rx, x_end, y, pt, .{ .fg = pct_fg });
+                var lb: [16]u8 = undefined;
+                const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
+                try writePart(frm, &rx, x_end, y, lt, label_st);
+            }
         }
     }
 
@@ -310,6 +340,33 @@ pub const Panels = struct {
     }
 };
 
+fn fmtBuf(buf: []u8, comptime fmt: []const u8, args: anytype) error{NoSpaceLeft}![]const u8 {
+    return std.fmt.bufPrint(buf, fmt, args) catch return error.NoSpaceLeft;
+}
+
+fn digitCols(n: u64) usize {
+    if (n == 0) return 1;
+    var v = n;
+    var c: usize = 0;
+    while (v > 0) : (v /= 10) c += 1;
+    return c;
+}
+
+fn usageCols(self: *const Panels) usize {
+    // ↑N ↓N = 1+digits + 1 + 1+digits
+    var c: usize = 0;
+    c += 1 + digitCols(self.usage.in_tok); // ↑N (↑ is 1 col)
+    c += 1; // space
+    c += 1 + digitCols(self.usage.out_tok); // ↓N
+    if (self.ctx_limit > 0) {
+        const pct = self.usage.tot_tok * 100 / self.ctx_limit;
+        c += 1; // space
+        c += digitCols(pct) + 1; // N%
+        c += 1 + digitCols(self.ctx_limit / 1000) + 1; // /Nk
+    }
+    return c;
+}
+
 fn drawToolRow(frm: *frame.Frame, rect: Rect, y: usize, row: ToolRow) Panels.RenderError!void {
     const x_end = try rectEndX(frm, rect);
     var x = rect.x;
@@ -318,10 +375,10 @@ fn drawToolRow(frm: *frame.Frame, rect: Rect, y: usize, row: ToolRow) Panels.Ren
     try writePart(frm, &x, x_end, y, " ", .{});
     try writePart(frm, &x, x_end, y, row.name, .{});
     try writePart(frm, &x, x_end, y, " #", .{
-        .fg = .bright_black,
+        .fg = theme.get().dim,
     });
     try writePart(frm, &x, x_end, y, row.id, .{
-        .fg = .bright_black,
+        .fg = theme.get().dim,
     });
 }
 
@@ -336,13 +393,13 @@ fn toolStateText(st: ToolState) []const u8 {
 fn toolStateStyle(st: ToolState) frame.Style {
     return switch (st) {
         .running => .{
-            .fg = .yellow,
+            .fg = theme.get().warn,
         },
         .ok => .{
-            .fg = .green,
+            .fg = theme.get().success,
         },
         .failed => .{
-            .fg = .red,
+            .fg = theme.get().err,
             .bold = true,
         },
     };
@@ -362,24 +419,24 @@ fn runStateText(st: RunState) []const u8 {
 fn runStateStyle(st: RunState) frame.Style {
     return switch (st) {
         .idle => .{
-            .fg = .bright_black,
+            .fg = theme.get().dim,
         },
         .streaming => .{
-            .fg = .cyan,
+            .fg = theme.get().border_accent,
         },
         .tool => .{
-            .fg = .yellow,
+            .fg = theme.get().warn,
             .bold = true,
         },
         .done => .{
-            .fg = .green,
+            .fg = theme.get().success,
             .bold = true,
         },
         .canceled => .{
-            .fg = .magenta,
+            .fg = theme.get().muted,
         },
         .failed => .{
-            .fg = .red,
+            .fg = theme.get().err,
             .bold = true,
         },
     };
@@ -548,15 +605,16 @@ test "panels render tool rows with clipping and styles" {
     try expectPrefix(&frm, 3, "RUN edit #c3");
 
     const ok_cell = try frm.cell(0, 1);
-    try std.testing.expect(ok_cell.style.fg == .green);
+    try std.testing.expect(frame.Color.eql(ok_cell.style.fg, theme.get().success));
 
     const run_cell = try frm.cell(0, 2);
-    try std.testing.expect(run_cell.style.fg == .yellow);
+    try std.testing.expect(frame.Color.eql(run_cell.style.fg, theme.get().warn));
 }
 
-test "panels render model status and usage indicators" {
+test "panels render status bar with model and usage" {
     var ps = try Panels.init(std.testing.allocator, "gpt-5-mini", "claude");
     defer ps.deinit();
+    ps.ctx_limit = 200000;
 
     try ps.append(.{ .tool_call = .{
         .id = "call-9",
@@ -566,42 +624,88 @@ test "panels render model status and usage indicators" {
     try ps.append(.{ .usage = .{
         .in_tok = 10,
         .out_tok = 20,
-        .tot_tok = 30,
+        .tot_tok = 180000,
     } });
 
     var frm = try frame.Frame.init(std.testing.allocator, 72, 1);
     defer frm.deinit(std.testing.allocator);
 
-    try ps.renderStatus(&frm, .{
-        .x = 0,
-        .y = 0,
-        .w = 72,
-        .h = 1,
-    });
+    try ps.renderStatus(&frm, .{ .x = 0, .y = 0, .w = 72, .h = 1 });
 
-    var raw: [72]u8 = undefined;
-    const row = try rowAscii(&frm, 0, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, row, "model gpt-5-mini") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "provider claude") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "status tool") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "tools 1/1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row, "tok 10/20/30") != null);
-
-    const model_idx = std.mem.indexOf(u8, row, "gpt-5-mini").?;
-    const provider_idx = std.mem.indexOf(u8, row, "claude").?;
-    const state_idx = std.mem.indexOf(u8, row, "tool").?;
-
-    const model_cell = try frm.cell(model_idx, 0);
-    try std.testing.expect(model_cell.style.fg == .cyan);
+    // Model at col 0
+    const model_cell = try frm.cell(0, 0);
+    try std.testing.expect(model_cell.cp == 'g'); // "gpt-5-mini"
+    try std.testing.expect(frame.Color.eql(model_cell.style.fg, theme.get().border_accent));
     try std.testing.expect(model_cell.style.bold);
 
-    const provider_cell = try frm.cell(provider_idx, 0);
-    try std.testing.expect(provider_cell.style.fg == .yellow);
-    try std.testing.expect(provider_cell.style.bold);
+    // State "tool" appears after model + " • "
+    // model=10 + " • "=3 = col 13
+    const state_cell = try frm.cell(13, 0);
+    try std.testing.expect(state_cell.cp == 't'); // "tool"
+    try std.testing.expect(frame.Color.eql(state_cell.style.fg, theme.get().warn));
 
-    const state_cell = try frm.cell(state_idx, 0);
-    try std.testing.expect(state_cell.style.fg == .yellow);
-    try std.testing.expect(state_cell.style.bold);
+    // Right side: 90% should be in error color (>90%)
+    // Find the '%' sign from right
+    var pct_col: usize = 71;
+    while (pct_col > 0) : (pct_col -= 1) {
+        const c = try frm.cell(pct_col, 0);
+        if (c.cp == '%') break;
+    }
+    // The digit before '%' should be err color (90% > 90)
+    if (pct_col > 0) {
+        const digit = try frm.cell(pct_col - 1, 0);
+        try std.testing.expect(frame.Color.eql(digit.style.fg, theme.get().err));
+    }
+}
+
+test "panels render status bar with cwd and branch" {
+    var ps = try Panels.initFull(std.testing.allocator, "gpt-4", "prov", "myproj", "main");
+    defer ps.deinit();
+
+    var frm = try frame.Frame.init(std.testing.allocator, 60, 1);
+    defer frm.deinit(std.testing.allocator);
+
+    try ps.renderStatus(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 1 });
+
+    // "myproj" at col 0 with accent color
+    try expectPrefix(&frm, 0, "myproj");
+    const cwd_cell = try frm.cell(0, 0);
+    try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().accent));
+
+    // ":" separator at col 6 with dim color
+    const sep_cell = try frm.cell(6, 0);
+    try std.testing.expectEqual(@as(u21, ':'), sep_cell.cp);
+    try std.testing.expect(frame.Color.eql(sep_cell.style.fg, theme.get().dim));
+
+    // "main" at col 7 with muted color
+    const br_cell = try frm.cell(7, 0);
+    try std.testing.expectEqual(@as(u21, 'm'), br_cell.cp);
+    try std.testing.expect(frame.Color.eql(br_cell.style.fg, theme.get().muted));
+
+    // " . " dot separator at col 11, then model "gpt-4" at col 14
+    // col 11=' ', col 12='•'(3-byte), col 13=' ', col 14='g'
+    const model_cell = try frm.cell(14, 0);
+    try std.testing.expectEqual(@as(u21, 'g'), model_cell.cp);
+    try std.testing.expect(frame.Color.eql(model_cell.style.fg, theme.get().border_accent));
+}
+
+test "panels render status bar cwd only no branch" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "proj", "");
+    defer ps.deinit();
+
+    var frm = try frame.Frame.init(std.testing.allocator, 40, 1);
+    defer frm.deinit(std.testing.allocator);
+
+    try ps.renderStatus(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 1 });
+
+    // "proj" at col 0, no colon
+    try expectPrefix(&frm, 0, "proj");
+    const cwd_cell = try frm.cell(0, 0);
+    try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().accent));
+
+    // No colon at col 4 - should be space (start of " • ")
+    const after = try frm.cell(4, 0);
+    try std.testing.expectEqual(@as(u21, ' '), after.cp);
 }
 
 test "panels validate utf8 model and event fields" {

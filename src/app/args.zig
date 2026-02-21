@@ -234,10 +234,10 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         if (!isOpt(tok)) {
             if (i == 0 and !mode_seen and
                 (std.mem.eql(u8, tok, "tui") or
-                std.mem.eql(u8, tok, "interactive") or
-                std.mem.eql(u8, tok, "print") or
-                std.mem.eql(u8, tok, "json") or
-                std.mem.eql(u8, tok, "rpc")))
+                    std.mem.eql(u8, tok, "interactive") or
+                    std.mem.eql(u8, tok, "print") or
+                    std.mem.eql(u8, tok, "json") or
+                    std.mem.eql(u8, tok, "rpc")))
             {
                 try setMode(&out, &mode_seen, try parseMode(tok));
                 continue;
