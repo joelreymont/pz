@@ -67,6 +67,11 @@ pub const Reader = struct {
             }
             if (data[1] == '[') return self.parseCsi(data);
             if (data[1] == 'O') return self.parseSS3(data);
+            // Alt+Enter: ESC CR or ESC LF
+            if (data[1] == '\r' or data[1] == '\n') {
+                self.pos += 2;
+                return .{ .key = .alt_enter };
+            }
             // ESC + other: treat ESC as standalone (alt-key, ignore for now)
             self.pos += 1;
             return .none;
@@ -82,6 +87,24 @@ pub const Reader = struct {
         if (data[0] == 0x04) {
             self.pos += 1;
             return .{ .key = .ctrl_d };
+        }
+
+        // Ctrl-G
+        if (data[0] == 0x07) {
+            self.pos += 1;
+            return .{ .key = .ctrl_g };
+        }
+
+        // Ctrl-K
+        if (data[0] == 0x0b) {
+            self.pos += 1;
+            return .{ .key = .ctrl_k };
+        }
+
+        // Ctrl-L
+        if (data[0] == 0x0c) {
+            self.pos += 1;
+            return .{ .key = .ctrl_l };
         }
 
         // Ctrl-O
@@ -100,6 +123,18 @@ pub const Reader = struct {
         if (data[0] == 0x14) {
             self.pos += 1;
             return .{ .key = .ctrl_t };
+        }
+
+        // Ctrl-V (paste image)
+        if (data[0] == 0x16) {
+            self.pos += 1;
+            return .{ .key = .ctrl_v };
+        }
+
+        // Ctrl-Z
+        if (data[0] == 0x1a) {
+            self.pos += 1;
+            return .{ .key = .ctrl_z };
         }
 
         // Enter (CR or LF)
@@ -225,6 +260,10 @@ fn mapCsiParam(seq: []const u8) Ev {
             '4', '8' => .{ .key = .end },
             else => .none,
         };
+    }
+    // "1;3A" = Alt+Up
+    if (seq.len == 4 and std.mem.eql(u8, seq, "1;3A")) {
+        return .{ .key = .alt_up };
     }
     return .none;
 }
@@ -358,4 +397,55 @@ test "parse shift-tab" {
     @memcpy(r.buf[0..3], "\x1b[Z");
     r.len = 3;
     try expectKey(r.parseOne().?, .shift_tab);
+}
+
+test "parse ctrl-g" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x07;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_g);
+}
+
+test "parse ctrl-k" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x0b;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_k);
+}
+
+test "parse ctrl-l" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x0c;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_l);
+}
+
+test "parse ctrl-v" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x16;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_v);
+}
+
+test "parse ctrl-z" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x1a;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_z);
+}
+
+test "parse alt-enter" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x1b;
+    r.buf[1] = '\r';
+    r.len = 2;
+    try expectKey(r.parseOne().?, .alt_enter);
+}
+
+test "parse alt-up" {
+    var r = Reader.init(-1);
+    const seq = "\x1b[1;3A";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    try expectKey(r.parseOne().?, .alt_up);
 }

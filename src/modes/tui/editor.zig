@@ -11,11 +11,18 @@ pub const Key = union(enum) {
     enter: void,
     ctrl_c: void,
     ctrl_d: void,
+    ctrl_g: void,
+    ctrl_k: void,
+    ctrl_l: void,
     ctrl_o: void,
     ctrl_p: void,
     ctrl_t: void,
+    ctrl_v: void,
+    ctrl_z: void,
     esc: void,
     shift_tab: void,
+    alt_enter: void,
+    alt_up: void,
 };
 
 pub const Action = enum {
@@ -27,6 +34,13 @@ pub const Action = enum {
     cycle_model,
     toggle_tools,
     toggle_thinking,
+    kill_to_eol,
+    @"suspend",
+    select_model,
+    ext_editor,
+    queue_followup,
+    edit_queued,
+    paste_image,
 };
 
 pub const Editor = struct {
@@ -51,6 +65,12 @@ pub const Editor = struct {
 
     pub fn cursor(self: *const Editor) usize {
         return self.cur;
+    }
+
+    pub fn setText(self: *Editor, t: []const u8) !void {
+        self.buf.items.len = 0;
+        try self.buf.appendSlice(self.alloc, t);
+        self.cur = self.buf.items.len;
     }
 
     pub fn clear(self: *Editor) void {
@@ -94,9 +114,19 @@ pub const Editor = struct {
                 break :blk .interrupt;
             } else .cancel,
             .ctrl_d => if (self.buf.items.len == 0) Action.cancel else .none,
+            .ctrl_g => .ext_editor,
+            .ctrl_k => blk: {
+                self.killToEol();
+                break :blk .kill_to_eol;
+            },
+            .ctrl_l => .select_model,
             .ctrl_o => .toggle_tools,
             .ctrl_p => .cycle_model,
             .ctrl_t => .toggle_thinking,
+            .ctrl_v => .paste_image,
+            .ctrl_z => .@"suspend",
+            .alt_enter => .queue_followup,
+            .alt_up => .edit_queued,
             .esc => blk: {
                 if (self.buf.items.len > 0) self.clear();
                 break :blk .interrupt;
@@ -138,6 +168,10 @@ pub const Editor = struct {
         const n = utf8SeqLen(self.buf.items[self.cur]);
         const end = @min(self.buf.items.len, self.cur + n);
         deleteRange(self, self.cur, end);
+    }
+
+    fn killToEol(self: *Editor) void {
+        self.buf.items.len = self.cur;
     }
 
     fn deleteRange(self: *Editor, start: usize, end: usize) void {
@@ -231,4 +265,48 @@ test "ctrl-p cycles model" {
     defer ed.deinit();
 
     try std.testing.expect((try ed.apply(.{ .ctrl_p = {} })) == .cycle_model);
+}
+
+test "ctrl-k kills to end of line" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    _ = try ed.apply(.{ .char = 'a' });
+    _ = try ed.apply(.{ .char = 'b' });
+    _ = try ed.apply(.{ .char = 'c' });
+    _ = try ed.apply(.{ .left = {} });
+    // cursor after 'b', kill 'c'
+    try std.testing.expect((try ed.apply(.{ .ctrl_k = {} })) == .kill_to_eol);
+    try std.testing.expectEqualStrings("ab", ed.text());
+}
+
+test "ctrl-k at end is no-op" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    _ = try ed.apply(.{ .char = 'x' });
+    try std.testing.expect((try ed.apply(.{ .ctrl_k = {} })) == .kill_to_eol);
+    try std.testing.expectEqualStrings("x", ed.text());
+}
+
+test "setText replaces editor content" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    _ = try ed.apply(.{ .char = 'a' });
+    try ed.setText("hello world");
+    try std.testing.expectEqualStrings("hello world", ed.text());
+    try std.testing.expectEqual(ed.buf.items.len, ed.cur);
+}
+
+test "new keys produce correct actions" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    try std.testing.expect((try ed.apply(.{ .ctrl_z = {} })) == .@"suspend");
+    try std.testing.expect((try ed.apply(.{ .ctrl_l = {} })) == .select_model);
+    try std.testing.expect((try ed.apply(.{ .ctrl_g = {} })) == .ext_editor);
+    try std.testing.expect((try ed.apply(.{ .ctrl_v = {} })) == .paste_image);
+    try std.testing.expect((try ed.apply(.{ .alt_enter = {} })) == .queue_followup);
+    try std.testing.expect((try ed.apply(.{ .alt_up = {} })) == .edit_queued);
 }

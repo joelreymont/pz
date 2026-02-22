@@ -449,7 +449,7 @@ fn runTui(
     out: std.Io.AnyWriter,
     session_dir_path: ?[]const u8,
     no_session: bool,
-    sys_prompt: ?[]const u8,
+    sys_prompt_arg: ?[]const u8,
 ) !void {
     var model: []const u8 = run_cmd.cfg.model;
     var model_owned: ?[]u8 = null;
@@ -457,6 +457,9 @@ fn runTui(
     var provider_label: []const u8 = run_cmd.cfg.provider;
     var provider_owned: ?[]u8 = null;
     defer if (provider_owned) |p| alloc.free(p);
+    var sys_prompt: ?[]const u8 = sys_prompt_arg;
+    var sys_prompt_owned: ?[]u8 = null;
+    defer if (sys_prompt_owned) |s| alloc.free(s);
 
     const cwd_path = getCwd(alloc) catch "";
     defer if (cwd_path.len > 0) alloc.free(cwd_path);
@@ -562,6 +565,11 @@ fn runTui(
         defer tui_term.restore(stdin_fd);
 
         var reader = tui_input.Reader.init(stdin_fd);
+        var followup_queue: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (followup_queue.items) |q| alloc.free(q);
+            followup_queue.deinit(alloc);
+        }
 
         while (true) {
             if (tui_term.pollResize()) {
@@ -619,6 +627,22 @@ fn runTui(
                                 try ui.draw(out);
                                 continue;
                             }
+                            if (cmd == .reload) {
+                                // Reload context files
+                                if (try core.context.load(alloc)) |new_ctx| {
+                                    if (sys_prompt_owned) |old| alloc.free(old);
+                                    sys_prompt_owned = new_ctx;
+                                    sys_prompt = new_ctx;
+                                    try ui.tr.infoText("[context reloaded]");
+                                } else {
+                                    if (sys_prompt_owned) |old| alloc.free(old);
+                                    sys_prompt_owned = null;
+                                    sys_prompt = null;
+                                    try ui.tr.infoText("[context reloaded (no files)]");
+                                }
+                                try ui.draw(out);
+                                continue;
+                            }
                             if (cmd == .handled) {
                                 const cmd_text = cmd_fbs.getWritten();
                                 if (cmd_text.len > 0) {
@@ -653,6 +677,28 @@ fn runTui(
                             );
                             try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
                             try ui.draw(out);
+
+                            // Process queued follow-ups
+                            while (followup_queue.items.len > 0) {
+                                const fq = followup_queue.orderedRemove(0);
+                                defer alloc.free(fq);
+                                try ui.tr.userText(fq);
+                                try runTuiTurn(
+                                    alloc,
+                                    sid.*,
+                                    fq,
+                                    model,
+                                    provider_label,
+                                    provider,
+                                    store,
+                                    tools_rt.registry(),
+                                    mode,
+                                    popts,
+                                    sys_prompt,
+                                );
+                                try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
+                                try ui.draw(out);
+                            }
                         },
                         .cancel => {
                             if (pre) |p| alloc.free(p);
@@ -685,6 +731,82 @@ fn runTui(
                         .toggle_thinking => {
                             if (pre) |p| alloc.free(p);
                             ui.tr.show_thinking = !ui.tr.show_thinking;
+                            try ui.draw(out);
+                        },
+                        .kill_to_eol => {
+                            if (pre) |p| alloc.free(p);
+                            try ui.draw(out);
+                        },
+                        .@"suspend" => {
+                            if (pre) |p| alloc.free(p);
+                            tui_term.restore(stdin_fd);
+                            std.posix.raise(std.posix.SIG.TSTP) catch {};
+                            // After resume, re-enable raw mode
+                            _ = tui_term.enableRaw(stdin_fd);
+                            try ui.draw(out);
+                        },
+                        .select_model => {
+                            // Same as cycle_model for now (overlay TODO)
+                            if (pre) |p| alloc.free(p);
+                            model = try cycleModel(alloc, model, &model_owned);
+                            ui.pn.ctx_limit = modelCtxWindow(model);
+                            try ui.setModel(model);
+                            try ui.draw(out);
+                        },
+                        .ext_editor => {
+                            if (pre) |p| alloc.free(p);
+                            tui_term.restore(stdin_fd);
+                            if (openExtEditor(alloc, ui.editorText())) |txt| {
+                                defer alloc.free(txt);
+                                _ = tui_term.enableRaw(stdin_fd);
+                                try ui.ed.setText(txt);
+                            } else {
+                                _ = tui_term.enableRaw(stdin_fd);
+                            }
+                            try ui.draw(out);
+                        },
+                        .queue_followup => {
+                            if (pre) |p| alloc.free(p);
+                            // Queue current text as follow-up, clear editor
+                            const snap2 = ui.editorText();
+                            if (snap2.len > 0) {
+                                const queued = alloc.dupe(u8, snap2) catch null;
+                                if (queued) |q| {
+                                    followup_queue.append(alloc, q) catch {
+                                        alloc.free(q);
+                                    };
+                                }
+                                ui.ed.clear();
+                                try ui.tr.infoText("(queued follow-up)");
+                            }
+                            try ui.draw(out);
+                        },
+                        .edit_queued => {
+                            if (pre) |p| alloc.free(p);
+                            // Show queued messages in editor (join with newlines)
+                            if (followup_queue.items.len > 0) {
+                                var total: usize = 0;
+                                for (followup_queue.items) |q| total += q.len + 1;
+                                const joined = alloc.alloc(u8, total) catch null;
+                                if (joined) |buf| {
+                                    var off: usize = 0;
+                                    for (followup_queue.items) |q| {
+                                        @memcpy(buf[off .. off + q.len], q);
+                                        buf[off + q.len] = '\n';
+                                        off += q.len + 1;
+                                    }
+                                    // Clear queue, set editor
+                                    for (followup_queue.items) |q| alloc.free(q);
+                                    followup_queue.items.len = 0;
+                                    try ui.ed.setText(buf[0 .. if (total > 0) total - 1 else 0]);
+                                    alloc.free(buf);
+                                }
+                            }
+                            try ui.draw(out);
+                        },
+                        .paste_image => {
+                            if (pre) |p| alloc.free(p);
+                            pasteImage(alloc, &ui);
                             try ui.draw(out);
                         },
                         .none => {
@@ -753,6 +875,20 @@ fn runTui(
             }
             if (cmd == .cost) {
                 showCost(alloc, &ui);
+                try ui.draw(out);
+                cmd_ct += 1;
+                continue;
+            }
+            if (cmd == .reload) {
+                if (try core.context.load(alloc)) |new_ctx| {
+                    if (sys_prompt_owned) |old| alloc.free(old);
+                    sys_prompt_owned = new_ctx;
+                    sys_prompt = new_ctx;
+                } else {
+                    if (sys_prompt_owned) |old| alloc.free(old);
+                    sys_prompt_owned = null;
+                    sys_prompt = null;
+                }
                 try ui.draw(out);
                 cmd_ct += 1;
                 continue;
@@ -1148,6 +1284,7 @@ const CmdRes = enum {
     clear,
     copy,
     cost,
+    reload,
 };
 
 fn handleSlashCommand(
@@ -1172,7 +1309,7 @@ fn handleSlashCommand(
     const cmd = if (sp) |i| body[0..i] else body;
     const arg = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
 
-    const Cmd = enum { help, quit, exit, session, model, provider, tools, new, @"resume", tree, fork, compact, settings, hotkeys, login, logout, clear, cost, copy, name };
+    const Cmd = enum { help, quit, exit, session, model, provider, tools, new, @"resume", tree, fork, compact, settings, hotkeys, login, logout, clear, cost, copy, name, reload };
     const cmd_map = std.StaticStringMap(Cmd).initComptime(.{
         .{ "help", .help },
         .{ "quit", .quit },
@@ -1194,6 +1331,7 @@ fn handleSlashCommand(
         .{ "cost", .cost },
         .{ "copy", .copy },
         .{ "name", .name },
+        .{ "reload", .reload },
     });
 
     const resolved = cmd_map.get(cmd) orelse {
@@ -1219,6 +1357,7 @@ fn handleSlashCommand(
                 \\  /tree              List sessions
                 \\  /fork [id]         Fork session
                 \\  /compact           Compact session
+                \\  /reload            Reload context files
                 \\  /login             Login (OAuth)
                 \\  /logout            Logout
                 \\  /hotkeys           Keyboard shortcuts
@@ -1347,11 +1486,21 @@ fn handleSlashCommand(
                 \\  ESC            Clear input / Cancel
                 \\  Ctrl+C         Clear input / Quit
                 \\  Ctrl+D         Quit (when input empty)
+                \\  Ctrl+Z         Suspend
+                \\  Ctrl+K         Delete to end of line
                 \\  Shift+Tab      Cycle thinking level
                 \\  Ctrl+P         Cycle model
+                \\  Ctrl+L         Select model
                 \\  Ctrl+O         Toggle tool output
                 \\  Ctrl+T         Toggle thinking blocks
+                \\  Ctrl+G         External editor
+                \\  Ctrl+V         Paste image
+                \\  Alt+Enter      Queue follow-up
+                \\  Alt+Up         Edit queued messages
                 \\  Scroll Up/Down Scroll transcript
+                \\  !cmd           Run bash (include)
+                \\  !!cmd          Run bash (exclude)
+                \\  /              Commands
                 \\
             );
         },
@@ -1372,6 +1521,7 @@ fn handleSlashCommand(
         },
         .login => try out.writeAll("Login via: ~/.pi/agent/auth.json (OAuth or API key)\n"),
         .logout => try out.writeAll("Remove auth: rm ~/.pi/agent/auth.json\n"),
+        .reload => return .reload,
     }
     return .handled;
 }
@@ -1870,6 +2020,108 @@ fn runBashMode(
             .out = if (output.len > 0) output else "(no output)",
             .is_err = is_err,
         } } });
+    }
+}
+
+fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
+    const ed = std.posix.getenv("EDITOR") orelse std.posix.getenv("VISUAL") orelse "vi";
+
+    // Write current text to temp file
+    const tmp = "/tmp/pz-edit.txt";
+    {
+        const f = std.fs.createFileAbsolute(tmp, .{}) catch return null;
+        defer f.close();
+        f.writeAll(current) catch return null;
+    }
+
+    const argv = [_][]const u8{ ed, tmp };
+    var child = std.process.Child.init(argv[0..], alloc);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+    child.spawn() catch return null;
+    _ = child.wait() catch return null;
+
+    // Read back
+    const f = std.fs.openFileAbsolute(tmp, .{}) catch return null;
+    defer f.close();
+    const content = f.readToEndAlloc(alloc, 1024 * 1024) catch return null;
+    // Trim trailing newline
+    var len = content.len;
+    while (len > 0 and (content[len - 1] == '\n' or content[len - 1] == '\r')) len -= 1;
+    if (len == 0) {
+        alloc.free(content);
+        return null;
+    }
+    if (len < content.len) {
+        const trimmed = alloc.dupe(u8, content[0..len]) catch {
+            alloc.free(content);
+            return null;
+        };
+        alloc.free(content);
+        return trimmed;
+    }
+    return content;
+}
+
+fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
+    // macOS: check clipboard for image via osascript
+    const argv = [_][]const u8{
+        "osascript", "-e",
+        "try\nset theType to (clipboard info for «class PNGf»)\nreturn \"image\"\non error\nreturn \"none\"\nend try",
+    };
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = argv[0..],
+        .max_output_bytes = 256,
+    }) catch {
+        ui.tr.infoText("[paste: clipboard check failed]") catch {};
+        return;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    const out = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (!std.mem.eql(u8, out, "image")) {
+        // Try text paste instead
+        pasteText(alloc, ui);
+        return;
+    }
+
+    // Save clipboard image to temp file
+    const save_argv = [_][]const u8{
+        "osascript", "-e",
+        "set imgData to the clipboard as «class PNGf»\nset fp to open for access POSIX file \"/tmp/pz-paste.png\" with write permission\nwrite imgData to fp\nclose access fp",
+    };
+    const save_result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = save_argv[0..],
+        .max_output_bytes = 256,
+    }) catch {
+        ui.tr.infoText("[paste: save failed]") catch {};
+        return;
+    };
+    defer alloc.free(save_result.stdout);
+    defer alloc.free(save_result.stderr);
+
+    ui.tr.infoText("[pasted image: /tmp/pz-paste.png]") catch {};
+}
+
+fn pasteText(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
+    const argv = [_][]const u8{"pbpaste"};
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = argv[0..],
+        .max_output_bytes = 256 * 1024,
+    }) catch {
+        ui.tr.infoText("[paste failed]") catch {};
+        return;
+    };
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+
+    if (result.stdout.len > 0) {
+        ui.ed.setText(result.stdout) catch {};
     }
 }
 
