@@ -17,6 +17,7 @@ pub const Run = struct {
     verbose: bool = false,
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
+    max_turns: u16 = 0,
 };
 
 pub const Command = union(enum) {
@@ -48,7 +49,6 @@ pub fn parse(
     errdefer cfg.deinit(alloc);
     const mode = selectMode(parsed, cfg);
     if (mode == .print and parsed.prompt == null) return error.MissingPrintPrompt;
-    if ((mode == .tui or mode == .rpc) and parsed.prompt != null) return error.PromptOnlyForPrint;
 
     return .{
         .run = .{
@@ -62,6 +62,7 @@ pub fn parse(
             .verbose = parsed.verbose,
             .system_prompt = parsed.system_prompt,
             .append_system_prompt = parsed.append_system_prompt,
+            .max_turns = parsed.max_turns,
         },
     };
 }
@@ -98,6 +99,7 @@ pub const help_text =
     \\      --tools <LIST>          Enable tool subset (read,write,bash,edit,grep,find,ls)
     \\      --no-tools              Disable all built-in tools
     \\      --thinking <LEVEL>      Thinking mode (off,minimal,low,medium,high,xhigh,adaptive)
+    \\      --max-turns <N>          Limit agent loop turns (0=unlimited)
     \\      --verbose               Show metadata in print mode
     \\      --system-prompt <TEXT>   Override system prompt
     \\      --append-system-prompt <TEXT>

@@ -10,6 +10,8 @@ const tui_input = @import("../modes/tui/input.zig");
 const tui_editor = @import("../modes/tui/editor.zig");
 const tui_frame = @import("../modes/tui/frame.zig");
 const tui_theme = @import("../modes/tui/theme.zig");
+const tui_overlay = @import("../modes/tui/overlay.zig");
+const tui_pathcomp = @import("../modes/tui/pathcomp.zig");
 const args_mod = @import("args.zig");
 
 pub const Err = error{
@@ -166,6 +168,78 @@ const TuiSink = struct {
     }
 };
 
+/// Reads stdin on a dedicated thread during streaming. Sets an atomic
+/// flag when ESC is pressed, allowing the core loop's CancelSrc to
+/// detect cancellation without platform-specific non-blocking hacks.
+/// Mirrors pi's CancellableLoader + AbortController pattern.
+const InputWatcher = struct {
+    canceled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    fd: std.posix.fd_t,
+    /// Buffer for non-ESC bytes consumed during streaming, replayed after join().
+    stash: [64]u8 = undefined,
+    stash_len: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
+
+    fn init(fd: std.posix.fd_t) InputWatcher {
+        return .{ .fd = fd };
+    }
+
+    /// Start watching stdin for ESC on a background thread.
+    /// Returns false if thread spawn failed (cancel unavailable).
+    fn start(self: *InputWatcher) bool {
+        self.canceled.store(false, .release);
+        self.stop.store(false, .release);
+        self.stash_len.store(0, .release);
+        self.thread = std.Thread.spawn(.{}, watchFn, .{self}) catch return false;
+        return true;
+    }
+
+    /// Stop the watcher, join the thread, replay stashed bytes into reader.
+    fn join(self: *InputWatcher, reader: ?*tui_input.Reader) void {
+        self.stop.store(true, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        const n = self.stash_len.load(.acquire);
+        if (n > 0) {
+            if (reader) |r| r.inject(self.stash[0..n]);
+        }
+    }
+
+    fn isCanceled(self: *InputWatcher) bool {
+        return self.canceled.load(.acquire);
+    }
+
+    fn watchFn(self: *InputWatcher) void {
+        while (!self.stop.load(.acquire)) {
+            // poll with 100ms timeout so join() can stop us promptly.
+            var fds = [1]std.posix.pollfd{.{
+                .fd = self.fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            }};
+            const n = std.posix.poll(&fds, 100) catch break;
+            if (n == 0) continue; // timeout — recheck stop flag
+            var buf: [1]u8 = undefined;
+            const r = std.posix.read(self.fd, &buf) catch break;
+            if (r == 1 and buf[0] == 0x1b) {
+                self.canceled.store(true, .release);
+                return;
+            }
+            // Stash non-ESC byte for replay
+            if (r == 1) {
+                const cur = self.stash_len.load(.acquire);
+                if (cur < self.stash.len) {
+                    self.stash[cur] = buf[0];
+                    self.stash_len.store(cur + 1, .release);
+                }
+            }
+        }
+    }
+};
+
 const JsonSink = struct {
     alloc: std.mem.Allocator,
     out: std.Io.AnyWriter,
@@ -251,12 +325,12 @@ pub fn execWithIo(
         .tool_mask = run_cmd.tool_mask,
     });
 
-    var sid: []u8 = undefined;
+    var sid: []u8 = &.{};
     var session_dir_path: ?[]u8 = null;
     defer if (session_dir_path) |path| alloc.free(path);
-    errdefer alloc.free(sid);
+    errdefer if (sid.len > 0) alloc.free(sid);
 
-    var store: core.session.SessionStore = undefined;
+    var store: ?core.session.SessionStore = null;
     var fs_store_impl: core.session.fs_store.Store = undefined;
     var null_store_impl = core.session.NullStore.init();
 
@@ -269,7 +343,8 @@ pub fn execWithIo(
         session_dir_path = plan.dir_path;
 
         try std.fs.cwd().makePath(plan.dir_path);
-        const session_dir = try std.fs.cwd().openDir(plan.dir_path, .{ .iterate = true });
+        var session_dir = try std.fs.cwd().openDir(plan.dir_path, .{ .iterate = true });
+        errdefer session_dir.close();
         fs_store_impl = try core.session.fs_store.Store.init(.{
             .alloc = alloc,
             .dir = session_dir,
@@ -278,7 +353,8 @@ pub fn execWithIo(
         });
         store = fs_store_impl.asSessionStore();
     }
-    defer store.deinit();
+    defer if (store) |*s| s.deinit();
+    const st = store.?;
 
     // Build system prompt: --system-prompt overrides, else load AGENTS.md/CLAUDE.md
     const sys_prompt = try buildSystemPrompt(alloc, run_cmd);
@@ -292,8 +368,8 @@ pub fn execWithIo(
             run_cmd,
             sid,
             provider,
-            store,
-            tools_rt.registry(),
+            st,
+            &tools_rt,
             writer,
             sys_prompt,
         ),
@@ -302,8 +378,8 @@ pub fn execWithIo(
             run_cmd,
             sid,
             provider,
-            store,
-            tools_rt.registry(),
+            st,
+            &tools_rt,
             reader,
             writer,
             sys_prompt,
@@ -313,20 +389,21 @@ pub fn execWithIo(
             run_cmd,
             &sid,
             provider,
-            store,
+            st,
             &tools_rt,
             reader,
             writer,
             session_dir_path,
             run_cmd.no_session,
             sys_prompt,
+            has_native_rt and native_rt.client.isSub(),
         ),
         .rpc => try runRpc(
             alloc,
             run_cmd,
             &sid,
             provider,
-            store,
+            st,
             &tools_rt,
             reader,
             writer,
@@ -345,7 +422,7 @@ fn runPrint(
     sid: []const u8,
     provider: core.providers.Provider,
     store: core.session.SessionStore,
-    reg: core.tools.Registry,
+    tools_rt: *core.tools.builtin.Runtime,
     out: std.Io.AnyWriter,
     sys_prompt: ?[]const u8,
 ) !void {
@@ -365,10 +442,11 @@ fn runPrint(
         .provider_label = run_cmd.cfg.provider,
         .provider = provider,
         .store = store,
-        .reg = reg,
+        .reg = tools_rt.registry(),
         .mode = mode,
         .system_prompt = sys_prompt,
         .provider_opts = run_cmd.thinking.toProviderOpts(),
+        .max_turns = run_cmd.max_turns,
     });
 
     try sink_impl.fmt.finish();
@@ -383,7 +461,7 @@ fn runJson(
     sid: []const u8,
     provider: core.providers.Provider,
     store: core.session.SessionStore,
-    reg: core.tools.Registry,
+    tools_rt: *core.tools.builtin.Runtime,
     in: std.Io.AnyReader,
     out: std.Io.AnyWriter,
     sys_prompt: ?[]const u8,
@@ -394,21 +472,24 @@ fn runJson(
     };
     const mode = core.loop.ModeSink.from(JsonSink, &sink_impl, JsonSink.push);
     const popts = run_cmd.thinking.toProviderOpts();
+    const tctx = TurnCtx{
+        .alloc = alloc,
+        .provider = provider,
+        .store = store,
+        .tools_rt = tools_rt,
+        .mode = mode,
+        .max_turns = run_cmd.max_turns,
+    };
 
     if (run_cmd.prompt) |prompt| {
-        try runTuiTurn(
-            alloc,
-            sid,
-            prompt,
-            run_cmd.cfg.model,
-            run_cmd.cfg.provider,
-            provider,
-            store,
-            reg,
-            mode,
-            popts,
-            sys_prompt,
-        );
+        try tctx.run(.{
+            .sid = sid,
+            .prompt = prompt,
+            .model = resolveDefault(run_cmd.cfg.model),
+            .provider_label = resolveDefaultProvider(run_cmd.cfg.provider),
+            .provider_opts = popts,
+            .system_prompt = sys_prompt,
+        });
         return;
     }
 
@@ -421,19 +502,14 @@ fn runJson(
         const trimmed = std.mem.trim(u8, line, " \t");
         if (trimmed.len == 0) continue;
 
-        try runTuiTurn(
-            alloc,
-            sid,
-            trimmed,
-            run_cmd.cfg.model,
-            run_cmd.cfg.provider,
-            provider,
-            store,
-            reg,
-            mode,
-            popts,
-            sys_prompt,
-        );
+        try tctx.run(.{
+            .sid = sid,
+            .prompt = trimmed,
+            .model = resolveDefault(run_cmd.cfg.model),
+            .provider_label = resolveDefaultProvider(run_cmd.cfg.provider),
+            .provider_opts = popts,
+            .system_prompt = sys_prompt,
+        });
         turn_ct += 1;
     }
     if (turn_ct == 0) return error.EmptyPrompt;
@@ -451,16 +527,24 @@ fn runTui(
     session_dir_path: ?[]const u8,
     no_session: bool,
     sys_prompt_arg: ?[]const u8,
+    is_sub: bool,
 ) !void {
-    var model: []const u8 = run_cmd.cfg.model;
+    var model: []const u8 = resolveDefault(run_cmd.cfg.model);
     var model_owned: ?[]u8 = null;
     defer if (model_owned) |m| alloc.free(m);
-    var provider_label: []const u8 = run_cmd.cfg.provider;
+    var provider_label: []const u8 = resolveDefaultProvider(run_cmd.cfg.provider);
     var provider_owned: ?[]u8 = null;
     defer if (provider_owned) |p| alloc.free(p);
     var sys_prompt: ?[]const u8 = sys_prompt_arg;
     var sys_prompt_owned: ?[]u8 = null;
     defer if (sys_prompt_owned) |s| alloc.free(s);
+
+    // Model cycle list: from config or default
+    const cfg_models = run_cmd.cfg.enabled_models;
+    const models_list: []const []const u8 = if (cfg_models) |m| blk: {
+        const ptr: [*]const []const u8 = @ptrCast(m.ptr);
+        break :blk ptr[0..m.len];
+    } else &model_cycle;
 
     const cwd_path = getCwd(alloc) catch "";
     defer if (cwd_path.len > 0) alloc.free(cwd_path);
@@ -470,25 +554,63 @@ fn runTui(
     const tsz = tui_term.size(std.posix.STDOUT_FILENO) orelse tui_term.Size{ .w = 80, .h = 24 };
     var ui = try tui_harness.Ui.initFull(alloc, tsz.w, tsz.h, model, provider_label, cwd_path, branch);
     defer ui.deinit();
+    ui.img_cap = @import("../modes/tui/imgproto.zig").detect();
     ui.pn.ctx_limit = modelCtxWindow(model);
+    ui.pn.is_sub = is_sub;
 
     _ = tui_term.installSigwinch();
     try tui_render.Renderer.setup(out);
+    try tui_render.Renderer.setTitle(out, cwd_path);
 
-    defer tui_render.Renderer.cleanup(out) catch {};
+    defer {
+        tui_render.Renderer.setTitle(out, "") catch |err| {
+            std.debug.print("warning: title reset failed: {s}\n", .{@errorName(err)});
+        };
+        tui_render.Renderer.cleanup(out) catch |err| {
+            std.debug.print("warning: terminal cleanup failed: {s}\n", .{@errorName(err)});
+        };
+    }
 
     var sink_impl = TuiSink{
         .ui = &ui,
         .out = out,
     };
     const mode = core.loop.ModeSink.from(TuiSink, &sink_impl, TuiSink.push);
+
+    const stdin_fd = std.posix.STDIN_FILENO;
+    const is_tty = std.posix.isatty(stdin_fd);
+
+    // Enable raw mode early so the InputWatcher's poll() works for -p prompts
+    if (is_tty) {
+        if (!tui_term.enableRaw(stdin_fd)) return error.TerminalSetupFailed;
+    }
+    defer if (is_tty) tui_term.restore(stdin_fd);
+
+    var watcher = InputWatcher.init(stdin_fd);
+    const cancel = core.loop.CancelSrc.from(InputWatcher, &watcher, InputWatcher.isCanceled);
+    const tctx = TurnCtx{
+        .alloc = alloc,
+        .provider = provider,
+        .store = store,
+        .tools_rt = tools_rt,
+        .mode = mode,
+        .max_turns = run_cmd.max_turns,
+        .cancel = cancel,
+    };
     var thinking = run_cmd.thinking;
     var popts = thinking.toProviderOpts();
+    var auto_compact_on: bool = true;
     ui.pn.thinking_label = thinkingLabel(thinking);
     ui.border_fg = thinkingBorderFg(thinking);
 
     // Startup info matching pi's display
     try showStartup(alloc, &ui);
+
+    // Set terminal title (OSC 0)
+    try out.writeAll("\x1b]0;pz\x07");
+    defer out.writeAll("\x1b]0;\x07") catch |err| {
+        std.debug.print("warning: title clear failed: {s}\n", .{@errorName(err)});
+    };
 
     try ui.draw(out);
     if (run_cmd.prompt) |prompt| {
@@ -505,18 +627,58 @@ fn runTui(
             tools_rt,
             session_dir_path,
             no_session,
+            sys_prompt,
             init_cmd_fbs.writer().any(),
         );
+        if (cmd == .quit) return;
         if (cmd == .clear) {
             ui.clearTranscript();
         }
         if (cmd == .copy) {
-            copyLastResponse(alloc, &ui);
+            try copyLastResponse(alloc, &ui);
         }
         if (cmd == .cost) {
-            showCost(alloc, &ui);
+            try showCost(alloc, &ui);
         }
-        if (cmd == .handled or cmd == .clear or cmd == .copy or cmd == .cost) {
+        if (cmd == .reload) {
+            // Reload context and continue to input loop
+        }
+        if (cmd == .select_model) {
+            var cur_idx: usize = 0;
+            for (models_list, 0..) |m, i| {
+                if (std.mem.eql(u8, model, m)) {
+                    cur_idx = i;
+                    break;
+                }
+            }
+            ui.ov = tui_overlay.Overlay.init(models_list, cur_idx);
+        }
+        if (cmd == .select_session) {
+            if (session_dir_path) |sdp| {
+                if (listSessionSids(alloc, sdp)) |sids| {
+                    if (sids.len > 0) {
+                        ui.ov = tui_overlay.Overlay.initDyn(alloc, sids, "Resume Session", .session);
+                    }
+                } else |_| {}
+            }
+        }
+        if (cmd == .select_settings) {
+            ui.ov = try buildSettingsOverlay(alloc, &ui, auto_compact_on);
+        }
+        if (cmd == .select_fork) {
+            if (session_dir_path) |sdp| {
+                if (listUserMessages(alloc, sdp, sid.*)) |msgs| {
+                    if (msgs.len > 0) {
+                        var ov = tui_overlay.Overlay.initDyn(alloc, msgs, "Fork from message", .session);
+                        ov.sel = msgs.len - 1;
+                        ov.fixScroll();
+                        ov.kind = .fork;
+                        ui.ov = ov;
+                    }
+                } else |_| {}
+            }
+        }
+        if (cmd == .handled or cmd == .clear or cmd == .copy or cmd == .cost or cmd == .reload or cmd == .select_model or cmd == .select_session or cmd == .select_settings or cmd == .select_fork) {
             const cmd_text = init_cmd_fbs.getWritten();
             if (cmd_text.len > 0) {
                 try ui.tr.infoText(cmd_text);
@@ -526,34 +688,31 @@ fn runTui(
             try ui.setProvider(provider_label);
         }
         if (cmd == .unhandled) {
-            try runTuiTurn(
-                alloc,
-                sid.*,
-                prompt,
-                model,
-                provider_label,
-                provider,
-                store,
-                tools_rt.registry(),
-                mode,
-                popts,
-                sys_prompt,
-            );
+            try ui.tr.userText(prompt);
+            ui.tr.scrollToBottom();
+            try ui.draw(out);
+            if (is_tty and !watcher.start()) try ui.tr.infoText("[ESC cancel unavailable]");
+            defer if (is_tty) watcher.join(null);
+            try tctx.run(.{
+                .sid = sid.*,
+                .prompt = prompt,
+                .model = model,
+                .provider_label = provider_label,
+                .provider_opts = popts,
+                .system_prompt = sys_prompt,
+            });
+            if (is_tty and watcher.isCanceled()) try ui.tr.infoText("[canceled]");
+            ui.pn.run_state = .idle;
         } else {
             try ui.setModel(model);
             try ui.setProvider(provider_label);
             try ui.draw(out);
         }
-        return;
+        // Fall through to input loop (stay in TUI like pi does)
     }
 
-    const stdin_fd = std.posix.STDIN_FILENO;
-    const is_tty = std.posix.isatty(stdin_fd);
-
     if (is_tty) {
-        if (!tui_term.enableRaw(stdin_fd)) return error.TerminalSetupFailed;
-        defer tui_term.restore(stdin_fd);
-
+        // Raw mode already enabled above (before -p prompt path)
         var reader = tui_input.Reader.init(stdin_fd);
         var followup_queue: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
@@ -572,9 +731,170 @@ fn runTui(
             const ev = reader.next();
             switch (ev) {
                 .key => |key| {
+                    // Overlay intercepts keys when open
+                    if (ui.ov != null) {
+                        switch (key) {
+                            .up => ui.ov.?.up(),
+                            .down => ui.ov.?.down(),
+                            .enter => {
+                                const sel = ui.ov.?.selected() orelse {
+                                    ui.ov.?.deinit(alloc);
+                                    ui.ov = null;
+                                    continue;
+                                };
+                                switch (ui.ov.?.kind) {
+                                    .model => {
+                                        const new = try alloc.dupe(u8, sel);
+                                        if (model_owned) |old| alloc.free(old);
+                                        model_owned = new;
+                                        model = new;
+                                        ui.pn.ctx_limit = modelCtxWindow(model);
+                                        try ui.setModel(model);
+                                        ui.ov.?.deinit(alloc);
+                                        ui.ov = null;
+                                    },
+                                    .session => {
+                                        const next_sid = try alloc.dupe(u8, sel);
+                                        alloc.free(sid.*);
+                                        sid.* = next_sid;
+                                        try ui.tr.infoText(sel);
+                                        ui.ov.?.deinit(alloc);
+                                        ui.ov = null;
+                                    },
+                                    .settings => {
+                                        // Toggle the selected setting
+                                        ui.ov.?.toggle();
+                                        applySettingsToggle(&ui, ui.ov.?.sel, ui.ov.?.getToggle(ui.ov.?.sel) orelse false, &auto_compact_on);
+                                    },
+                                    .fork => {
+                                        const next_sid = try newSid(alloc);
+                                        errdefer alloc.free(next_sid);
+                                        if (session_dir_path) |sdp| {
+                                            try forkSessionFile(sdp, sid.*, next_sid);
+                                        }
+                                        alloc.free(sid.*);
+                                        sid.* = next_sid;
+                                        try ui.ed.setText(sel);
+                                        try ui.tr.infoText("[forked session]");
+                                        ui.ov.?.deinit(alloc);
+                                        ui.ov = null;
+                                    },
+                                    .login => {
+                                        // Set env var hint in editor for API key entry
+                                        const env_var: []const u8 = if (std.mem.eql(u8, sel, "anthropic"))
+                                            "ANTHROPIC_API_KEY"
+                                        else if (std.mem.eql(u8, sel, "openai"))
+                                            "OPENAI_API_KEY"
+                                        else
+                                            "GOOGLE_API_KEY";
+                                        const msg = try std.fmt.allocPrint(alloc, "Paste {s} API key (or set {s} env var):", .{ sel, env_var });
+                                        defer alloc.free(msg);
+                                        try ui.tr.infoText(msg);
+                                        // Set editor to /login <provider> so user can paste the key
+                                        const prompt_text = try std.fmt.allocPrint(alloc, "/login {s} ", .{sel});
+                                        defer alloc.free(prompt_text);
+                                        try ui.ed.setText(prompt_text);
+                                        ui.ov.?.deinit(alloc);
+                                        ui.ov = null;
+                                    },
+                                    .logout => {
+                                        // Remove credentials for selected provider
+                                        const provider_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
+                                            .{ "anthropic", .anthropic },
+                                            .{ "openai", .openai },
+                                            .{ "google", .google },
+                                        });
+                                        if (provider_map.get(sel)) |prov| {
+                                            try core.providers.auth.logout(alloc, prov);
+                                            const msg2 = try std.fmt.allocPrint(alloc, "logged out of {s}", .{sel});
+                                            defer alloc.free(msg2);
+                                            try ui.tr.infoText(msg2);
+                                        }
+                                        ui.ov.?.deinit(alloc);
+                                        ui.ov = null;
+                                    },
+                                }
+                            },
+                            .esc, .ctrl_c, .ctrl_l => {
+                                ui.ov.?.deinit(alloc);
+                                ui.ov = null;
+                            },
+                            else => {},
+                        }
+                        try ui.draw(out);
+                        continue;
+                    }
+
+                    // Command preview intercept
+                    if (ui.cp) |*cp| {
+                        switch (key) {
+                            .up => {
+                                cp.up();
+                                try ui.draw(out);
+                                continue;
+                            },
+                            .down => {
+                                cp.down();
+                                try ui.draw(out);
+                                continue;
+                            },
+                            .tab, .enter => {
+                                if (ui.path_items != null) {
+                                    // File mode: replace last word
+                                    if (cp.selectedArg()) |path| {
+                                        const text = ui.ed.text();
+                                        const cur = ui.ed.cursor();
+                                        var ws: usize = cur;
+                                        while (ws > 0 and text[ws - 1] != ' ' and text[ws - 1] != '\n' and text[ws - 1] != '\t') ws -= 1;
+                                        const has_at = ws < cur and text[ws] == '@';
+                                        const at_s: []const u8 = if (has_at) "@" else "";
+                                        const new_text = std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
+                                            text[0..ws], at_s, path, text[cur..],
+                                        }) catch continue;
+                                        defer alloc.free(new_text);
+                                        const new_cur = ws + at_s.len + path.len;
+                                        ui.ed.buf.items.len = 0;
+                                        try ui.ed.buf.appendSlice(ui.ed.alloc, new_text);
+                                        ui.ed.cur = new_cur;
+                                    }
+                                } else if (cp.arg_src != null) {
+                                    // Arg mode: replace arg in editor
+                                    if (cp.selectedArg()) |arg| {
+                                        const text = ui.ed.text();
+                                        const sp = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+                                        ui.ed.buf.items.len = sp;
+                                        try ui.ed.buf.appendSlice(ui.ed.alloc, " ");
+                                        try ui.ed.buf.appendSlice(ui.ed.alloc, arg);
+                                        ui.ed.cur = ui.ed.buf.items.len;
+                                    }
+                                } else {
+                                    // Cmd mode: fill command name
+                                    const cmd = cp.selected();
+                                    ui.ed.buf.items.len = 0;
+                                    try ui.ed.buf.appendSlice(ui.ed.alloc, "/");
+                                    try ui.ed.buf.appendSlice(ui.ed.alloc, cmd.name);
+                                    try ui.ed.buf.appendSlice(ui.ed.alloc, " ");
+                                    ui.ed.cur = ui.ed.buf.items.len;
+                                }
+                                ui.cp = null;
+                                ui.arg_src = resolveArgSrc(ui.ed.text(), models_list);
+                                ui.updatePreview();
+                                try ui.draw(out);
+                                continue;
+                            },
+                            .esc => {
+                                ui.cp = null;
+                                ui.clearPathItems();
+                                try ui.draw(out);
+                                continue;
+                            },
+                            else => {},
+                        }
+                    }
+
                     // Capture editor text before onKey clears it on submit
                     const snap = ui.editorText();
-                    var pre: ?[]u8 = if (snap.len > 0) alloc.dupe(u8, snap) catch null else null;
+                    var pre: ?[]u8 = if (snap.len > 0) try alloc.dupe(u8, snap) else null;
 
                     const act = try ui.onKey(key);
                     switch (act) {
@@ -599,6 +919,7 @@ fn runTui(
                                 tools_rt,
                                 session_dir_path,
                                 no_session,
+                                sys_prompt,
                                 cmd_fbs.writer().any(),
                             );
                             if (cmd == .quit) return;
@@ -608,12 +929,12 @@ fn runTui(
                                 continue;
                             }
                             if (cmd == .copy) {
-                                copyLastResponse(alloc, &ui);
+                                try copyLastResponse(alloc, &ui);
                                 try ui.draw(out);
                                 continue;
                             }
                             if (cmd == .cost) {
-                                showCost(alloc, &ui);
+                                try showCost(alloc, &ui);
                                 try ui.draw(out);
                                 continue;
                             }
@@ -629,6 +950,76 @@ fn runTui(
                                     sys_prompt_owned = null;
                                     sys_prompt = null;
                                     try ui.tr.infoText("[context reloaded (no files)]");
+                                }
+                                try ui.draw(out);
+                                continue;
+                            }
+                            if (cmd == .select_model) {
+                                var cur_idx: usize = 0;
+                                for (models_list, 0..) |m, i| {
+                                    if (std.mem.eql(u8, model, m)) {
+                                        cur_idx = i;
+                                        break;
+                                    }
+                                }
+                                ui.ov = tui_overlay.Overlay.init(models_list, cur_idx);
+                                try ui.draw(out);
+                                continue;
+                            }
+                            if (cmd == .select_session) {
+                                if (session_dir_path) |sdp| {
+                                    if (listSessionSids(alloc, sdp)) |sids| {
+                                        if (sids.len > 0) {
+                                            ui.ov = tui_overlay.Overlay.initDyn(alloc, sids, "Resume Session", .session);
+                                        }
+                                    } else |_| {}
+                                }
+                                try ui.draw(out);
+                                continue;
+                            }
+                            if (cmd == .select_settings) {
+                                ui.ov = try buildSettingsOverlay(alloc, &ui, auto_compact_on);
+                                try ui.draw(out);
+                                continue;
+                            }
+                            if (cmd == .select_fork) {
+                                if (session_dir_path) |sdp| {
+                                    if (listUserMessages(alloc, sdp, sid.*)) |msgs| {
+                                        if (msgs.len > 0) {
+                                            var ov = tui_overlay.Overlay.initDyn(alloc, msgs, "Fork from message", .session);
+                                            ov.sel = msgs.len - 1; // select last message
+                                            ov.fixScroll();
+                                            ov.kind = .fork;
+                                            ui.ov = ov;
+                                        }
+                                    } else |_| {}
+                                }
+                                try ui.draw(out);
+                                continue;
+                            }
+                            if (cmd == .select_login) {
+                                const login_items = [_][]const u8{ "anthropic", "openai", "google" };
+                                var ov = tui_overlay.Overlay.init(&login_items, 0);
+                                ov.title = "Login (set API key)";
+                                ov.kind = .login;
+                                ui.ov = ov;
+                                try ui.draw(out);
+                                continue;
+                            }
+                            if (cmd == .select_logout) {
+                                const providers = core.providers.auth.listLoggedIn(alloc) catch try alloc.alloc(core.providers.auth.Provider, 0);
+                                if (providers.len == 0) {
+                                    alloc.free(providers);
+                                    try ui.tr.infoText("no providers logged in");
+                                } else {
+                                    const names = try alloc.alloc([]u8, providers.len);
+                                    for (providers, 0..) |p, i| {
+                                        names[i] = try alloc.dupe(u8, core.providers.auth.providerName(p));
+                                    }
+                                    alloc.free(providers);
+                                    var ov = tui_overlay.Overlay.initDyn(alloc, names, "Logout", .logout);
+                                    ui.ov = ov;
+                                    _ = &ov;
                                 }
                                 try ui.draw(out);
                                 continue;
@@ -652,41 +1043,43 @@ fn runTui(
                                 continue;
                             }
 
-                            try runTuiTurn(
-                                alloc,
-                                sid.*,
-                                prompt,
-                                model,
-                                provider_label,
-                                provider,
-                                store,
-                                tools_rt.registry(),
-                                mode,
-                                popts,
-                                sys_prompt,
-                            );
-                            try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
+                            try ui.draw(out);
+                            if (!watcher.start()) try ui.tr.infoText("[ESC cancel unavailable]");
+                            const run_err = tctx.run(.{
+                                .sid = sid.*,
+                                .prompt = prompt,
+                                .model = model,
+                                .provider_label = provider_label,
+                                .provider_opts = popts,
+                                .system_prompt = sys_prompt,
+                            });
+                            watcher.join(&reader);
+                            if (watcher.isCanceled()) try ui.tr.infoText("[canceled]");
+                            ui.pn.run_state = .idle;
+                            try run_err;
+                            if (auto_compact_on) try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
                             try ui.draw(out);
 
                             // Process queued follow-ups
                             while (followup_queue.items.len > 0) {
+                                if (watcher.isCanceled()) break;
                                 const fq = followup_queue.orderedRemove(0);
                                 defer alloc.free(fq);
                                 try ui.tr.userText(fq);
-                                try runTuiTurn(
-                                    alloc,
-                                    sid.*,
-                                    fq,
-                                    model,
-                                    provider_label,
-                                    provider,
-                                    store,
-                                    tools_rt.registry(),
-                                    mode,
-                                    popts,
-                                    sys_prompt,
-                                );
-                                try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
+                                if (!watcher.start()) try ui.tr.infoText("[ESC cancel unavailable]");
+                                const fq_err = tctx.run(.{
+                                    .sid = sid.*,
+                                    .prompt = fq,
+                                    .model = model,
+                                    .provider_label = provider_label,
+                                    .provider_opts = popts,
+                                    .system_prompt = sys_prompt,
+                                });
+                                watcher.join(&reader);
+                                if (watcher.isCanceled()) try ui.tr.infoText("[canceled]");
+                                ui.pn.run_state = .idle;
+                                try fq_err;
+                                if (auto_compact_on) try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
                                 try ui.draw(out);
                             }
                         },
@@ -708,7 +1101,7 @@ fn runTui(
                         },
                         .cycle_model => {
                             if (pre) |p| alloc.free(p);
-                            model = try cycleModel(alloc, model, &model_owned);
+                            model = try cycleModel(alloc, model, &model_owned, models_list);
                             ui.pn.ctx_limit = modelCtxWindow(model);
                             try ui.setModel(model);
                             try ui.draw(out);
@@ -729,18 +1122,20 @@ fn runTui(
                         },
                         .@"suspend" => {
                             if (pre) |p| alloc.free(p);
-                            tui_term.restore(stdin_fd);
-                            std.posix.raise(std.posix.SIG.TSTP) catch {};
-                            // After resume, re-enable raw mode
-                            _ = tui_term.enableRaw(stdin_fd);
+                            // No-op: Ctrl+Z is now undo (handled by editor)
                             try ui.draw(out);
                         },
                         .select_model => {
-                            // Same as cycle_model for now (overlay TODO)
                             if (pre) |p| alloc.free(p);
-                            model = try cycleModel(alloc, model, &model_owned);
-                            ui.pn.ctx_limit = modelCtxWindow(model);
-                            try ui.setModel(model);
+                            // Find current model index
+                            var cur_idx: usize = 0;
+                            for (models_list, 0..) |m, i| {
+                                if (std.mem.eql(u8, model, m)) {
+                                    cur_idx = i;
+                                    break;
+                                }
+                            }
+                            ui.ov = tui_overlay.Overlay.init(models_list, cur_idx);
                             try ui.draw(out);
                         },
                         .ext_editor => {
@@ -760,12 +1155,11 @@ fn runTui(
                             // Queue current text as follow-up, clear editor
                             const snap2 = ui.editorText();
                             if (snap2.len > 0) {
-                                const queued = alloc.dupe(u8, snap2) catch null;
-                                if (queued) |q| {
-                                    followup_queue.append(alloc, q) catch {
-                                        alloc.free(q);
-                                    };
-                                }
+                                const queued = try alloc.dupe(u8, snap2);
+                                followup_queue.append(alloc, queued) catch |err| {
+                                    alloc.free(queued);
+                                    return err;
+                                };
                                 ui.ed.clear();
                                 try ui.tr.infoText("(queued follow-up)");
                             }
@@ -777,37 +1171,59 @@ fn runTui(
                             if (followup_queue.items.len > 0) {
                                 var total: usize = 0;
                                 for (followup_queue.items) |q| total += q.len + 1;
-                                const joined = alloc.alloc(u8, total) catch null;
-                                if (joined) |buf| {
-                                    var off: usize = 0;
-                                    for (followup_queue.items) |q| {
-                                        @memcpy(buf[off .. off + q.len], q);
-                                        buf[off + q.len] = '\n';
-                                        off += q.len + 1;
-                                    }
-                                    // Clear queue, set editor
-                                    for (followup_queue.items) |q| alloc.free(q);
-                                    followup_queue.items.len = 0;
-                                    try ui.ed.setText(buf[0 .. if (total > 0) total - 1 else 0]);
-                                    alloc.free(buf);
+                                const joined = try alloc.alloc(u8, total);
+                                var off: usize = 0;
+                                for (followup_queue.items) |q| {
+                                    @memcpy(joined[off .. off + q.len], q);
+                                    joined[off + q.len] = '\n';
+                                    off += q.len + 1;
                                 }
+                                // Clear queue, set editor
+                                for (followup_queue.items) |q| alloc.free(q);
+                                followup_queue.items.len = 0;
+                                try ui.ed.setText(joined[0..if (total > 0) total - 1 else 0]);
+                                alloc.free(joined);
                             }
                             try ui.draw(out);
                         },
                         .paste_image => {
                             if (pre) |p| alloc.free(p);
-                            pasteImage(alloc, &ui);
+                            try pasteImage(alloc, &ui);
                             try ui.draw(out);
                         },
                         .reverse_cycle_model => {
                             if (pre) |p| alloc.free(p);
-                            model = try reverseCycleModel(alloc, model, &model_owned);
+                            model = try reverseCycleModel(alloc, model, &model_owned, models_list);
                             ui.pn.ctx_limit = modelCtxWindow(model);
                             try ui.setModel(model);
                             try ui.draw(out);
                         },
+                        .tab_complete => {
+                            if (pre) |p| alloc.free(p);
+                            const tab_text = ui.ed.text();
+                            if (tab_text.len > 0 and tab_text[0] == '/') {
+                                completeSlashCmd(&ui.ed);
+                            } else if (tab_text.len > 0) {
+                                try completeFilePath(alloc, &ui);
+                            }
+                            ui.arg_src = resolveArgSrc(ui.ed.text(), models_list);
+                            ui.updatePreview();
+                            try ui.draw(out);
+                        },
+                        .scroll_up => {
+                            if (pre) |p| alloc.free(p);
+                            ui.tr.scrollUp(ui.frm.h / 2);
+                            try ui.draw(out);
+                        },
+                        .scroll_down => {
+                            if (pre) |p| alloc.free(p);
+                            ui.tr.scrollDown(ui.frm.h / 2);
+                            try ui.draw(out);
+                        },
                         .none => {
                             if (pre) |p| alloc.free(p);
+                            ui.arg_src = resolveArgSrc(ui.ed.text(), models_list);
+                            ui.updatePreview();
                             try ui.draw(out);
                         },
                     }
@@ -816,6 +1232,16 @@ fn runTui(
                     ui.onMouse(mev);
                     try ui.draw(out);
                 },
+                .paste => |text| {
+                    if (text.len > 0) {
+                        ui.ed.insertSlice(text) catch {
+                            try ui.tr.infoText("[paste: invalid UTF-8]");
+                        };
+                        ui.arg_src = resolveArgSrc(ui.ed.text(), models_list);
+                        ui.updatePreview();
+                        try ui.draw(out);
+                    }
+                },
                 .resize => {
                     if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
                         try ui.resize(sz.w, sz.h);
@@ -823,6 +1249,11 @@ fn runTui(
                     }
                 },
                 .none => {},
+                .err => {
+                    try ui.tr.infoText("[stdin read error — exiting]");
+                    try ui.draw(out);
+                    return;
+                },
             }
         }
     } else {
@@ -855,6 +1286,7 @@ fn runTui(
                 tools_rt,
                 session_dir_path,
                 no_session,
+                sys_prompt,
                 out,
             );
             if (cmd == .quit) return;
@@ -865,13 +1297,13 @@ fn runTui(
                 continue;
             }
             if (cmd == .copy) {
-                copyLastResponse(alloc, &ui);
+                try copyLastResponse(alloc, &ui);
                 try ui.draw(out);
                 cmd_ct += 1;
                 continue;
             }
             if (cmd == .cost) {
-                showCost(alloc, &ui);
+                try showCost(alloc, &ui);
                 try ui.draw(out);
                 cmd_ct += 1;
                 continue;
@@ -906,23 +1338,18 @@ fn runTui(
                 continue;
             }
 
-            try runTuiTurn(
-                alloc,
-                sid.*,
-                trimmed,
-                model,
-                provider_label,
-                provider,
-                store,
-                tools_rt.registry(),
-                mode,
-                popts,
-                sys_prompt,
-            );
-            try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
+            try tctx.run(.{
+                .sid = sid.*,
+                .prompt = trimmed,
+                .model = model,
+                .provider_label = provider_label,
+                .provider_opts = popts,
+                .system_prompt = sys_prompt,
+            });
+            if (auto_compact_on) try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
             turn_ct += 1;
         }
-        if (turn_ct == 0 and cmd_ct == 0) return error.EmptyPrompt;
+        if (turn_ct == 0 and cmd_ct == 0 and run_cmd.prompt == null) return error.EmptyPrompt;
     }
 }
 
@@ -939,10 +1366,10 @@ fn runRpc(
     no_session: bool,
     sys_prompt: ?[]const u8,
 ) !void {
-    var model: []const u8 = run_cmd.cfg.model;
+    var model: []const u8 = resolveDefault(run_cmd.cfg.model);
     var model_owned: ?[]u8 = null;
     defer if (model_owned) |m| alloc.free(m);
-    var provider_label: []const u8 = run_cmd.cfg.provider;
+    var provider_label: []const u8 = resolveDefaultProvider(run_cmd.cfg.provider);
     var provider_owned: ?[]u8 = null;
     defer if (provider_owned) |p| alloc.free(p);
 
@@ -952,6 +1379,14 @@ fn runRpc(
     };
     const mode = core.loop.ModeSink.from(JsonSink, &sink_impl, JsonSink.push);
     const popts = run_cmd.thinking.toProviderOpts();
+    const tctx = TurnCtx{
+        .alloc = alloc,
+        .provider = provider,
+        .store = store,
+        .tools_rt = tools_rt,
+        .mode = mode,
+        .max_turns = run_cmd.max_turns,
+    };
 
     while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 128 * 1024)) |raw_line| {
         defer alloc.free(raw_line);
@@ -1022,19 +1457,14 @@ fn runRpc(
                     });
                     continue;
                 }
-                try runTuiTurn(
-                    alloc,
-                    sid.*,
-                    prompt,
-                    model,
-                    provider_label,
-                    provider,
-                    store,
-                    tools_rt.registry(),
-                    mode,
-                    popts,
-                    sys_prompt,
-                );
+                try tctx.run(.{
+                    .sid = sid.*,
+                    .prompt = prompt,
+                    .model = model,
+                    .provider_label = provider_label,
+                    .provider_opts = popts,
+                    .system_prompt = sys_prompt,
+                });
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_ack",
                     .id = req.id,
@@ -1282,6 +1712,12 @@ const CmdRes = enum {
     copy,
     cost,
     reload,
+    select_model,
+    select_session,
+    select_settings,
+    select_fork,
+    select_login,
+    select_logout,
 };
 
 fn handleSlashCommand(
@@ -1295,6 +1731,7 @@ fn handleSlashCommand(
     tools_rt: *core.tools.builtin.Runtime,
     session_dir_path: ?[]const u8,
     no_session: bool,
+    _: ?[]const u8, // sys_prompt (unused after settings became interactive)
     out: std.Io.AnyWriter,
 ) !CmdRes {
     if (line.len == 0 or line[0] != '/') return .unhandled;
@@ -1306,7 +1743,7 @@ fn handleSlashCommand(
     const cmd = if (sp) |i| body[0..i] else body;
     const arg = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
 
-    const Cmd = enum { help, quit, exit, session, model, provider, tools, new, @"resume", tree, fork, compact, settings, hotkeys, login, logout, clear, cost, copy, name, reload };
+    const Cmd = enum { help, quit, exit, session, model, provider, tools, new, @"resume", tree, fork, compact, @"export", settings, hotkeys, login, logout, clear, cost, copy, name, reload, share, changelog };
     const cmd_map = std.StaticStringMap(Cmd).initComptime(.{
         .{ "help", .help },
         .{ "quit", .quit },
@@ -1320,6 +1757,7 @@ fn handleSlashCommand(
         .{ "tree", .tree },
         .{ "fork", .fork },
         .{ "compact", .compact },
+        .{ "export", .@"export" },
         .{ "settings", .settings },
         .{ "hotkeys", .hotkeys },
         .{ "login", .login },
@@ -1329,6 +1767,8 @@ fn handleSlashCommand(
         .{ "copy", .copy },
         .{ "name", .name },
         .{ "reload", .reload },
+        .{ "share", .share },
+        .{ "changelog", .changelog },
     });
 
     const resolved = cmd_map.get(cmd) orelse {
@@ -1343,11 +1783,13 @@ fn handleSlashCommand(
                 \\  /help              Show this help
                 \\  /session           Session info
                 \\  /settings          Current settings
-                \\  /model <id>        Set model
+                \\  /model [id]        Set/select model
                 \\  /provider <id>     Set/show provider
                 \\  /tools [list|all]  Set/show tools
                 \\  /clear             Clear transcript
                 \\  /copy              Copy last response
+                \\  /export [path]     Export to markdown
+                \\  /share             Share as gist
                 \\  /name <name>       Name session
                 \\  /new               New session
                 \\  /resume [id]       Resume session
@@ -1357,6 +1799,7 @@ fn handleSlashCommand(
                 \\  /reload            Reload context files
                 \\  /login             Login (OAuth)
                 \\  /logout            Logout
+                \\  /changelog         What's new
                 \\  /hotkeys           Keyboard shortcuts
                 \\  /quit              Exit
                 \\
@@ -1366,18 +1809,18 @@ fn handleSlashCommand(
         .session => {
             const stats = try sessionStats(alloc, session_dir_path, sid.*, no_session);
             defer if (stats.path_owned) |path| alloc.free(path);
-            try writeTextLine(
-                alloc,
-                out,
-                "session sid={s} model={s} provider={s} file={s} bytes={d} lines={d}\n",
-                .{ sid.*, model.*, provider.*, stats.path, stats.bytes, stats.lines },
+            const total = stats.user_msgs + stats.asst_msgs + stats.tool_calls + stats.tool_results;
+            const info = try std.fmt.allocPrint(alloc,
+                "Session Info\n\nFile: {s}\nID:   {s}\n\nMessages\n" ++
+                "  User:         {d}\n  Assistant:    {d}\n  Tool Calls:   {d}\n" ++
+                "  Tool Results: {d}\n  Total:        {d}\n",
+                .{ stats.path, sid.*, stats.user_msgs, stats.asst_msgs, stats.tool_calls, stats.tool_results, total },
             );
+            defer alloc.free(info);
+            try out.writeAll(info);
         },
         .model => {
-            if (arg.len == 0) {
-                try out.writeAll("error: missing model value\n");
-                return .handled;
-            }
+            if (arg.len == 0) return .select_model;
             const dup = try alloc.dupe(u8, arg);
             if (model_owned.*) |curr| alloc.free(curr);
             model_owned.* = dup;
@@ -1422,8 +1865,8 @@ fn handleSlashCommand(
                 try out.writeAll("error: session disabled\n");
                 return .handled;
             }
-            const tok = if (arg.len == 0) null else arg;
-            const next_sid = resolveResumeSid(alloc, session_dir_path.?, tok) catch |err| {
+            if (arg.len == 0) return .select_session;
+            const next_sid = resolveResumeSid(alloc, session_dir_path.?, arg) catch |err| {
                 try writeTextLine(alloc, out, "error: resume failed ({s})\n", .{@errorName(err)});
                 return .handled;
             };
@@ -1446,10 +1889,11 @@ fn handleSlashCommand(
                 try out.writeAll("error: session disabled\n");
                 return .handled;
             }
-            const next_sid = if (arg.len != 0) blk: {
+            if (arg.len == 0) return .select_fork;
+            const next_sid = blk: {
                 try core.session.path.validateSid(arg);
                 break :blk try alloc.dupe(u8, arg);
-            } else try newSid(alloc);
+            };
             errdefer alloc.free(next_sid);
             try forkSessionFile(session_dir_path.?, sid.*, next_sid);
             alloc.free(sid.*);
@@ -1466,16 +1910,22 @@ fn handleSlashCommand(
             const ck = try core.session.compactSession(alloc, dir, sid.*, std.time.milliTimestamp());
             try writeTextLine(alloc, out, "compacted in={d} out={d}\n", .{ ck.in_lines, ck.out_lines });
         },
-        .settings => {
-            const tool_csv = try toolMaskCsvAlloc(alloc, tools_rt.tool_mask);
-            defer alloc.free(tool_csv);
-            try writeTextLine(
-                alloc,
-                out,
-                "settings model={s} provider={s} tools={s} sid={s} session_dir={s} no_session={any}\n",
-                .{ model.*, provider.*, tool_csv, sid.*, session_dir_path orelse "", no_session },
-            );
+        .@"export" => {
+            if (no_session or session_dir_path == null) {
+                try out.writeAll("error: session disabled\n");
+                return .handled;
+            }
+            var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
+            defer dir.close();
+            const out_path = if (arg.len > 0) arg else null;
+            const path = core.session.exportMarkdown(alloc, dir, sid.*, out_path) catch |err| {
+                try writeTextLine(alloc, out, "export failed: {s}\n", .{@errorName(err)});
+                return .handled;
+            };
+            defer alloc.free(path);
+            try writeTextLine(alloc, out, "exported to {s}\n", .{path});
         },
+        .settings => return .select_settings,
         .hotkeys => {
             try out.writeAll(
                 \\Keyboard shortcuts:
@@ -1483,10 +1933,23 @@ fn handleSlashCommand(
                 \\  ESC            Clear input / Cancel
                 \\  Ctrl+C         Clear input / Quit
                 \\  Ctrl+D         Quit (when input empty)
-                \\  Ctrl+Z         Suspend
+                \\  Ctrl+Z         Undo
+                \\  Ctrl+Shift+Z   Redo
+                \\  Up/Down        Input history
+                \\  Ctrl+A         Move to start
+                \\  Ctrl+E         Move to end
                 \\  Ctrl+K         Delete to end of line
+                \\  Ctrl+U         Delete whole line
+                \\  Ctrl+W         Delete word backward
+                \\  Alt+D          Delete word forward
+                \\  Ctrl+Y         Yank (paste from kill ring)
+                \\  Alt+Y          Yank-pop (cycle kill ring)
+                \\  Ctrl+]         Jump to character
+                \\  Alt+B/Ctrl+←   Move word left
+                \\  Alt+F/Ctrl+→   Move word right
                 \\  Shift+Tab      Cycle thinking level
                 \\  Ctrl+P         Cycle model
+                \\  Shift+Ctrl+P   Reverse cycle model
                 \\  Ctrl+L         Select model
                 \\  Ctrl+O         Toggle tool output
                 \\  Ctrl+T         Toggle thinking blocks
@@ -1494,6 +1957,7 @@ fn handleSlashCommand(
                 \\  Ctrl+V         Paste image
                 \\  Alt+Enter      Queue follow-up
                 \\  Alt+Up         Edit queued messages
+                \\  Page Up/Down   Scroll transcript (half page)
                 \\  Scroll Up/Down Scroll transcript
                 \\  !cmd           Run bash (include)
                 \\  !!cmd          Run bash (exclude)
@@ -1516,11 +1980,71 @@ fn handleSlashCommand(
                 try out.writeAll("error: session disabled\n");
             }
         },
-        .login => try out.writeAll("Login via: ~/.pi/agent/auth.json (OAuth or API key)\n"),
-        .logout => try out.writeAll("Remove auth: rm ~/.pi/agent/auth.json\n"),
+        .login => {
+            if (arg.len == 0) return .select_login;
+            // /login <provider> <key> — save API key
+            const sp2 = std.mem.indexOfAny(u8, arg, " \t");
+            if (sp2) |i| {
+                const prov_name = arg[0..i];
+                const key = std.mem.trim(u8, arg[i + 1 ..], " \t");
+                if (key.len == 0) {
+                    try out.writeAll("usage: /login <provider> <key>\n");
+                    return .handled;
+                }
+                const prov_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
+                    .{ "anthropic", .anthropic },
+                    .{ "openai", .openai },
+                    .{ "google", .google },
+                });
+                const prov = prov_map.get(prov_name) orelse {
+                    try writeTextLine(alloc, out, "unknown provider: {s}\n", .{prov_name});
+                    return .handled;
+                };
+                try core.providers.auth.saveApiKey(alloc, prov, key);
+                try writeTextLine(alloc, out, "API key saved for {s}\n", .{prov_name});
+            } else {
+                try out.writeAll("usage: /login <provider> <key>\n");
+            }
+        },
+        .logout => return .select_logout,
         .reload => return .reload,
+        .share => {
+            if (no_session or session_dir_path == null) {
+                try out.writeAll("error: session disabled\n");
+                return .handled;
+            }
+            var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
+            defer dir.close();
+            const md_path = core.session.exportMarkdown(alloc, dir, sid.*, null) catch |err| {
+                try writeTextLine(alloc, out, "export failed: {s}\n", .{@errorName(err)});
+                return .handled;
+            };
+            defer alloc.free(md_path);
+            const gist_url = shareGist(alloc, md_path) catch |err| {
+                try writeTextLine(alloc, out, "gist failed: {s}\n", .{@errorName(err)});
+                return .handled;
+            };
+            defer alloc.free(gist_url);
+            try writeTextLine(alloc, out, "shared: {s}\n", .{gist_url});
+        },
+        .changelog => {
+            try out.writeAll("pz — no changelog yet\n");
+        },
     }
     return .handled;
+}
+
+fn shareGist(alloc: std.mem.Allocator, md_path: []const u8) ![]u8 {
+    const result = try std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = &.{ "gh", "gist", "create", "--public=false", md_path },
+    });
+    defer alloc.free(result.stdout);
+    defer alloc.free(result.stderr);
+    if (result.term.Exited != 0) return error.GistFailed;
+    const url = std.mem.trim(u8, result.stdout, " \t\n\r");
+    if (url.len == 0) return error.GistFailed;
+    return try alloc.dupe(u8, url);
 }
 
 fn writeJsonLine(
@@ -1545,6 +2069,69 @@ fn writeTextLine(
     try out.writeAll(raw);
 }
 
+fn listUserMessages(alloc: std.mem.Allocator, session_dir: []const u8, sid: []const u8) ![][]u8 {
+    var dir = try std.fs.cwd().openDir(session_dir, .{});
+    defer dir.close();
+
+    var rdr = core.session.reader.ReplayReader.init(alloc, dir, sid, .{}) catch return try alloc.alloc([]u8, 0);
+    defer rdr.deinit();
+
+    var msgs = std.ArrayList([]u8).empty;
+    errdefer {
+        for (msgs.items) |m| alloc.free(m);
+        msgs.deinit(alloc);
+    }
+
+    while (rdr.next() catch null) |ev| {
+        if (ev.data == .prompt) {
+            const text = ev.data.prompt.text;
+            // Truncate to single line, max 80 chars for display
+            const nl = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+            const end = @min(nl, 80);
+            const display = if (end < text.len) blk: {
+                const trimmed = try std.fmt.allocPrint(alloc, "{s}...", .{text[0..end]});
+                break :blk trimmed;
+            } else try alloc.dupe(u8, text);
+            errdefer alloc.free(display);
+            try msgs.append(alloc, display);
+        }
+    }
+    return try msgs.toOwnedSlice(alloc);
+}
+
+fn applySettingsToggle(ui: *tui_harness.Ui, idx: usize, val: bool, auto_compact_on: *bool) void {
+    const si: SettingIdx = @enumFromInt(idx);
+    switch (si) {
+        .show_tools => ui.tr.show_tools = val,
+        .show_thinking => ui.tr.show_thinking = val,
+        .auto_compact => auto_compact_on.* = val,
+    }
+}
+
+const SettingIdx = enum(u8) {
+    show_tools = 0,
+    show_thinking = 1,
+    auto_compact = 2,
+};
+const setting_labels = [_][]const u8{
+    "Show tool output",
+    "Show thinking",
+    "Auto-compact",
+};
+
+fn buildSettingsOverlay(alloc: std.mem.Allocator, ui: *const tui_harness.Ui, auto_compact_on: bool) !tui_overlay.Overlay {
+    const toggles = try alloc.alloc(bool, setting_labels.len);
+    toggles[@intFromEnum(SettingIdx.show_tools)] = ui.tr.show_tools;
+    toggles[@intFromEnum(SettingIdx.show_thinking)] = ui.tr.show_thinking;
+    toggles[@intFromEnum(SettingIdx.auto_compact)] = auto_compact_on;
+    return .{
+        .items = &setting_labels,
+        .title = "Settings",
+        .kind = .settings,
+        .toggles = toggles,
+    };
+}
+
 fn normalizeRpcCmd(raw: []const u8) []const u8 {
     const map = std.StaticStringMap([]const u8).initComptime(.{
         .{ "new_session", "new" },
@@ -1563,6 +2150,10 @@ const SessStats = struct {
     path_owned: ?[]u8 = null,
     bytes: u64,
     lines: usize,
+    user_msgs: u32 = 0,
+    asst_msgs: u32 = 0,
+    tool_calls: u32 = 0,
+    tool_results: u32 = 0,
 };
 
 fn sessionStats(
@@ -1582,6 +2173,7 @@ fn sessionStats(
     const rel = try core.session.path.sidJsonlAlloc(alloc, sid);
     defer alloc.free(rel);
     const abs = try std.fs.path.join(alloc, &.{ session_dir_path.?, rel });
+    errdefer alloc.free(abs);
 
     const f = std.fs.openFileAbsolute(abs, .{ .mode = .read_only }) catch |err| switch (err) {
         error.FileNotFound => {
@@ -1598,11 +2190,46 @@ fn sessionStats(
 
     const st = try f.stat();
     var lines: usize = 0;
+    var user_msgs: u32 = 0;
+    var asst_msgs: u32 = 0;
+    var tool_calls: u32 = 0;
+    var tool_results: u32 = 0;
     var buf: [8192]u8 = undefined;
+
+    // Count lines and try to count message types from the replay reader
     while (true) {
         const n = try f.read(&buf);
         if (n == 0) break;
         lines += std.mem.count(u8, buf[0..n], "\n");
+    }
+
+    // Replay to count message types
+    if (session_dir_path) |sdp| {
+        var dir = std.fs.cwd().openDir(sdp, .{}) catch return .{
+            .path = abs,
+            .path_owned = abs,
+            .bytes = st.size,
+            .lines = lines,
+        };
+        defer dir.close();
+        var rdr = core.session.ReplayReader.init(alloc, dir, sid, .{}) catch return .{
+            .path = abs,
+            .path_owned = abs,
+            .bytes = st.size,
+            .lines = lines,
+        };
+        defer rdr.deinit();
+        while (true) {
+            const ev = rdr.next() catch break;
+            const item = ev orelse break;
+            switch (item.data) {
+                .prompt => user_msgs += 1,
+                .text => asst_msgs += 1,
+                .tool_call => tool_calls += 1,
+                .tool_result => tool_results += 1,
+                else => {},
+            }
+        }
     }
 
     return .{
@@ -1610,6 +2237,10 @@ fn sessionStats(
         .path_owned = abs,
         .bytes = st.size,
         .lines = lines,
+        .user_msgs = user_msgs,
+        .asst_msgs = asst_msgs,
+        .tool_calls = tool_calls,
+        .tool_results = tool_results,
     };
 }
 
@@ -1632,6 +2263,84 @@ fn parseCmdToolMask(raw: []const u8) !u8 {
         mask |= bit;
     }
     return mask;
+}
+
+const tui_cmdprev = @import("../modes/tui/cmdprev.zig");
+
+fn completeSlashCmd(ed: *tui_harness.editor.Editor) void {
+    const text = ed.text();
+    if (text.len == 0 or text[0] != '/') return;
+    const prefix = text[1..];
+    var match: ?[]const u8 = null;
+    var count: usize = 0;
+    for (tui_cmdprev.cmds) |cmd| {
+        if (prefix.len <= cmd.name.len and std.mem.startsWith(u8, cmd.name, prefix)) {
+            if (match == null) match = cmd.name;
+            count += 1;
+        }
+    }
+    if (count == 1) {
+        if (match) |m| {
+            const old_len = ed.buf.items.len;
+            const old_cur = ed.cur;
+            ed.buf.items.len = 0;
+            ed.buf.appendSlice(ed.alloc, "/") catch {
+                ed.buf.items.len = old_len;
+                ed.cur = old_cur;
+                return;
+            };
+            ed.buf.appendSlice(ed.alloc, m) catch {
+                ed.buf.items.len = old_len;
+                ed.cur = old_cur;
+                return;
+            };
+            ed.buf.appendSlice(ed.alloc, " ") catch {
+                ed.buf.items.len = old_len;
+                ed.cur = old_cur;
+                return;
+            };
+            ed.cur = ed.buf.items.len;
+        }
+    }
+}
+
+fn completeFilePath(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
+    const text = ui.ed.text();
+    const cur = ui.ed.cursor();
+    if (cur == 0) return;
+
+    // Find last word
+    var ws: usize = cur;
+    while (ws > 0 and text[ws - 1] != ' ' and text[ws - 1] != '\n' and text[ws - 1] != '\t') ws -= 1;
+    const word = text[ws..cur];
+    if (word.len == 0) return;
+
+    // Strip @ prefix
+    const has_at = word[0] == '@';
+    const prefix = if (has_at) word[1..] else word;
+
+    const items = tui_pathcomp.list(alloc, prefix) orelse return;
+    defer tui_pathcomp.freeList(alloc, items);
+
+    const repl: []const u8 = if (items.len == 1)
+        items[0]
+    else blk: {
+        const cp = tui_pathcomp.commonPrefix(tui_pathcomp.asConst(items));
+        if (cp.len <= prefix.len) return; // no progress
+        break :blk cp;
+    };
+
+    // Build new text: before + [@] + replacement + after
+    const at_s: []const u8 = if (has_at) "@" else "";
+    const new_text = try std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
+        text[0..ws], at_s, repl, text[cur..],
+    });
+    defer alloc.free(new_text);
+
+    const new_cur = ws + at_s.len + repl.len;
+    ui.ed.buf.items.len = 0;
+    try ui.ed.buf.appendSlice(ui.ed.alloc, new_text);
+    ui.ed.cur = new_cur;
 }
 
 fn toolMaskCsvAlloc(alloc: std.mem.Allocator, mask: u8) ![]u8 {
@@ -1713,6 +2422,29 @@ fn listSessionsAlloc(alloc: std.mem.Allocator, session_dir: []const u8) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
+fn listSessionSids(alloc: std.mem.Allocator, session_dir: []const u8) ![][]u8 {
+    var dir = try std.fs.cwd().openDir(session_dir, .{ .iterate = true });
+    defer dir.close();
+
+    var names = std.ArrayList([]u8).empty;
+    errdefer {
+        for (names.items) |n| alloc.free(n);
+        names.deinit(alloc);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |ent| {
+        if (ent.kind != .file) continue;
+        const sid = fileSidFromName(ent.name) orelse continue;
+        const dup = try alloc.dupe(u8, sid);
+        errdefer alloc.free(dup);
+        try names.append(alloc, dup);
+    }
+
+    std.sort.pdq([]u8, names.items, {}, lessSid);
+    return try names.toOwnedSlice(alloc);
+}
+
 fn lessSid(_: void, a: []u8, b: []u8) bool {
     return std.mem.order(u8, a, b) == .lt;
 }
@@ -1727,10 +2459,10 @@ fn forkSessionFile(session_dir: []const u8, src_sid: []const u8, dst_sid: []cons
     var dir = try std.fs.cwd().openDir(session_dir, .{});
     defer dir.close();
 
-    const src_path = try core.session.path.sidJsonlAlloc(std.heap.page_allocator, src_sid);
-    defer std.heap.page_allocator.free(src_path);
-    const dst_path = try core.session.path.sidJsonlAlloc(std.heap.page_allocator, dst_sid);
-    defer std.heap.page_allocator.free(dst_path);
+    var src_buf: [256]u8 = undefined;
+    const src_path = std.fmt.bufPrint(&src_buf, "{s}.jsonl", .{src_sid}) catch return error.NameTooLong;
+    var dst_buf: [256]u8 = undefined;
+    const dst_path = std.fmt.bufPrint(&dst_buf, "{s}.jsonl", .{dst_sid}) catch return error.NameTooLong;
 
     var dst = try dir.createFile(dst_path, .{
         .truncate = true,
@@ -1772,16 +2504,20 @@ fn resolveSessionPlan(alloc: std.mem.Allocator, run_cmd: cli.Run) !core.session.
 
 fn getCwd(alloc: std.mem.Allocator) ![]u8 {
     const full = try std.fs.cwd().realpathAlloc(alloc, ".");
-    // Return basename only
-    if (std.mem.lastIndexOfScalar(u8, full, '/')) |i| {
-        const base = try alloc.dupe(u8, full[i + 1 ..]);
+    // Shorten home prefix to ~/ (matching pi)
+    const home = std.posix.getenv("HOME") orelse "";
+    if (home.len > 0 and std.mem.startsWith(u8, full, home)) {
+        const short = try std.fmt.allocPrint(alloc, "~{s}", .{full[home.len..]});
         alloc.free(full);
-        return base;
+        return short;
     }
     return full;
 }
 
 fn getGitBranch(alloc: std.mem.Allocator) ![]u8 {
+    // Try jj bookmark first (jj always detaches HEAD)
+    if (getJjBookmark(alloc)) |b| return b;
+
     const head = std.fs.cwd().readFileAlloc(alloc, ".git/HEAD", 256) catch return error.NotFound;
     defer alloc.free(head);
     const prefix = "ref: refs/heads/";
@@ -1789,24 +2525,76 @@ fn getGitBranch(alloc: std.mem.Allocator) ![]u8 {
         const rest = std.mem.trimRight(u8, head[prefix.len..], "\n\r ");
         return try alloc.dupe(u8, rest);
     }
-    // Detached HEAD — return short hash
-    const trimmed = std.mem.trimRight(u8, head, "\n\r ");
-    if (trimmed.len >= 8) return try alloc.dupe(u8, trimmed[0..8]);
-    return error.NotFound;
+    // Detached HEAD — show "detached" like pi
+    return try alloc.dupe(u8, "detached");
+}
+
+fn getJjBookmark(alloc: std.mem.Allocator) ?[]u8 {
+    // Check if .jj/ exists (jj-managed repo)
+    std.fs.cwd().access(".jj", .{}) catch return null;
+
+    // Run jj log to get bookmarks for current change
+    const argv = [_][]const u8{ "jj", "log", "--no-graph", "-r", "@", "-T", "bookmarks" };
+    var child = std.process.Child.init(argv[0..], alloc);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Ignore;
+    child.spawn() catch return null;
+    const stdout = child.stdout.?.readToEndAlloc(alloc, 4096) catch {
+        _ = child.wait() catch |err| {
+            std.debug.print("warning: child wait failed: {s}\n", .{@errorName(err)});
+        };
+        return null;
+    };
+    _ = child.wait() catch {
+        alloc.free(stdout);
+        return null;
+    };
+
+    const trimmed = std.mem.trimRight(u8, stdout, "\n\r ");
+    if (trimmed.len == 0) {
+        alloc.free(stdout);
+        return null;
+    }
+
+    // May have multiple bookmarks separated by space; take first, strip trailing *
+    var it = std.mem.splitScalar(u8, trimmed, ' ');
+    const first = it.next() orelse {
+        alloc.free(stdout);
+        return null;
+    };
+    const name = if (first.len > 0 and first[first.len - 1] == '*')
+        first[0 .. first.len - 1]
+    else
+        first;
+
+    const result = alloc.dupe(u8, name) catch {
+        alloc.free(stdout);
+        return null;
+    };
+    alloc.free(stdout);
+    return result;
+}
+
+const default_model = "claude-opus-4-6";
+const default_provider = "anthropic";
+
+fn resolveDefault(model: []const u8) []const u8 {
+    return if (std.mem.eql(u8, model, "default")) default_model else model;
+}
+
+fn resolveDefaultProvider(provider: []const u8) []const u8 {
+    return if (std.mem.eql(u8, provider, "default")) default_provider else provider;
 }
 
 fn modelCtxWindow(model: []const u8) u64 {
     const table = .{
-        .{ "opus-4-6", 200000 },
-        .{ "opus-4.6", 200000 },
-        .{ "sonnet-4-6", 200000 },
-        .{ "sonnet-4.6", 200000 },
-        .{ "haiku-4-5", 200000 },
-        .{ "haiku-4.5", 200000 },
-        .{ "opus-4-", 200000 },
-        .{ "sonnet-4-", 200000 },
+        .{ "opus-4", 200000 },
+        .{ "sonnet-4", 200000 },
+        .{ "haiku-4", 200000 },
         .{ "claude-3-5", 200000 },
         .{ "claude-3.5", 200000 },
+        .{ "claude-3-7", 200000 },
+        .{ "claude-3.7", 200000 },
     };
     inline for (table) |entry| {
         if (std.mem.indexOf(u8, model, entry[0]) != null) return entry[1];
@@ -1841,37 +2629,54 @@ fn buildSystemPrompt(alloc: std.mem.Allocator, run_cmd: cli.Run) !?[]u8 {
 }
 
 const model_cycle = [_][]const u8{
-    "claude-opus-4-6-20250219",
-    "claude-sonnet-4-6-20250514",
+    "claude-opus-4-6",
+    "claude-sonnet-4-5",
     "claude-haiku-4-5-20251001",
 };
 
-fn cycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8) ![]const u8 {
+const provider_args = [_][]const u8{ "anthropic", "openai", "google" };
+const tool_args = [_][]const u8{ "all", "none", "read", "write", "bash", "edit", "grep", "find", "ls" };
+
+/// Resolve arg completion source based on current editor text.
+fn resolveArgSrc(text: []const u8, models: []const []const u8) ?[]const []const u8 {
+    if (text.len == 0 or text[0] != '/') return null;
+    const body = text[1..];
+    const sp = std.mem.indexOfScalar(u8, body, ' ') orelse return null;
+    const cmd = body[0..sp];
+    if (std.mem.eql(u8, cmd, "model")) return models;
+    if (std.mem.eql(u8, cmd, "provider")) return &provider_args;
+    if (std.mem.eql(u8, cmd, "tools")) return &tool_args;
+    if (std.mem.eql(u8, cmd, "login") or std.mem.eql(u8, cmd, "logout")) return &provider_args;
+    return null;
+}
+
+fn cycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8, cycle: []const []const u8) ![]const u8 {
+    if (cycle.len == 0) return cur;
     var next_idx: usize = 0;
-    for (model_cycle, 0..) |m, i| {
+    for (cycle, 0..) |m, i| {
         if (std.mem.eql(u8, cur, m)) {
-            next_idx = (i + 1) % model_cycle.len;
+            next_idx = (i + 1) % cycle.len;
             break;
         }
     } else {
-        // Current model not in list, pick first entry
         next_idx = 0;
     }
-    const new = try alloc.dupe(u8, model_cycle[next_idx]);
+    const new = try alloc.dupe(u8, cycle[next_idx]);
     if (model_owned.*) |old| alloc.free(old);
     model_owned.* = new;
     return new;
 }
 
-fn reverseCycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8) ![]const u8 {
-    var next_idx: usize = model_cycle.len - 1;
-    for (model_cycle, 0..) |m, i| {
+fn reverseCycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8, cycle: []const []const u8) ![]const u8 {
+    if (cycle.len == 0) return cur;
+    var next_idx: usize = cycle.len - 1;
+    for (cycle, 0..) |m, i| {
         if (std.mem.eql(u8, cur, m)) {
-            next_idx = if (i == 0) model_cycle.len - 1 else i - 1;
+            next_idx = if (i == 0) cycle.len - 1 else i - 1;
             break;
         }
     }
-    const new = try alloc.dupe(u8, model_cycle[next_idx]);
+    const new = try alloc.dupe(u8, cycle[next_idx]);
     if (model_owned.*) |old| alloc.free(old);
     model_owned.* = new;
     return new;
@@ -1909,9 +2714,8 @@ fn thinkingBorderFg(level: args_mod.ThinkingLevel) @import("../modes/tui/frame.z
 fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const t = tui_theme.get();
 
-    // Version line: "pz" in accent, "v0.0.0" in dim
-    try ui.tr.styledText(" pz", .{ .fg = t.accent });
-    try ui.tr.styledText(" v" ++ cli.version, .{ .fg = t.dim });
+    // Version banner (matching pi's "pi v0.52.12")
+    try ui.tr.styledText(" pz v0.0.0", .{ .fg = t.dim });
 
     // Hotkeys — key in dim, description in muted
     const keys = [_][2][]const u8{
@@ -1920,7 +2724,11 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
         .{ "ctrl+c twice", "to exit" },
         .{ "ctrl+d", "to exit (empty)" },
         .{ "ctrl+z", "to suspend" },
-        .{ "ctrl+k", "to delete to end" },
+        .{ "up/down", "for input history" },
+        .{ "ctrl+a/e", "to start/end of line" },
+        .{ "ctrl+k/u", "to delete to end/all" },
+        .{ "ctrl+w", "to delete word" },
+        .{ "alt+b/f", "to move by word" },
         .{ "shift+tab", "to cycle thinking level" },
         .{ "ctrl+p/shift+ctrl+p", "to cycle models" },
         .{ "ctrl+l", "to select model" },
@@ -1933,6 +2741,7 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
         .{ "alt+enter", "to queue follow-up" },
         .{ "alt+up", "to edit all queued messages" },
         .{ "ctrl+v", "to paste image" },
+        .{ "drop files", "to attach" },
     };
     for (keys) |kv| {
         // key in dim, description in muted (matching pi)
@@ -1949,6 +2758,7 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     }
     if (ctx_paths.len > 0) {
         try ui.tr.styledText("", .{}); // blank line
+        try ui.tr.styledText("", .{}); // blank line (pi has 2)
         try ui.tr.styledText("[Context]", .{ .fg = t.md_heading });
         const home = std.posix.getenv("HOME") orelse "";
         for (ctx_paths) |p| {
@@ -1961,36 +2771,120 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
             try ui.tr.infoText(display);
         }
     }
+
+    // Skills section
+    const skills = try discoverSkills(alloc);
+    defer {
+        for (skills) |s| alloc.free(s);
+        alloc.free(skills);
+    }
+    if (skills.len > 0) {
+        try ui.tr.styledText("", .{}); // blank line
+        try ui.tr.styledText("[Skills]", .{ .fg = t.md_heading });
+        try ui.tr.infoText("  user");
+        const home2 = std.posix.getenv("HOME") orelse "";
+        for (skills) |p| {
+            const display2 = if (home2.len > 0 and std.mem.startsWith(u8, p, home2))
+                try std.fmt.allocPrint(alloc, "    ~{s}", .{p[home2.len..]})
+            else
+                try std.fmt.allocPrint(alloc, "    {s}", .{p});
+            defer alloc.free(display2);
+            try ui.tr.infoText(display2);
+        }
+    }
+
+    // Trailing blank lines before prompt (matching pi's spacing)
+    try ui.tr.styledText("", .{});
+    try ui.tr.styledText("", .{});
 }
 
-fn showCost(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
+fn discoverSkills(alloc: std.mem.Allocator) ![][]u8 {
+    const home = std.posix.getenv("HOME") orelse return &.{};
+    const base = std.fs.path.join(alloc, &.{ home, ".claude", "skills" }) catch return &.{};
+    defer alloc.free(base);
+
+    var dir = std.fs.cwd().openDir(base, .{ .iterate = true }) catch return &.{};
+    defer dir.close();
+
+    var paths: std.ArrayListUnmanaged([]u8) = .empty;
+    errdefer {
+        for (paths.items) |p| alloc.free(p);
+        paths.deinit(alloc);
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const skill_path = std.fs.path.join(alloc, &.{ base, entry.name, "SKILL.md" }) catch continue;
+        // Check file exists
+        if (std.fs.cwd().access(skill_path, .{})) |_| {
+            try paths.append(alloc, skill_path);
+        } else |_| {
+            alloc.free(skill_path);
+        }
+    }
+
+    // Sort for stable display
+    std.mem.sort([]u8, paths.items, {}, struct {
+        fn lt(_: void, a: []u8, b: []u8) bool {
+            return std.mem.lessThan(u8, a, b);
+        }
+    }.lt);
+
+    return try paths.toOwnedSlice(alloc);
+}
+
+fn showCost(_: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const u = ui.pn.usage;
-    const msg = std.fmt.allocPrint(alloc, "tokens in={d} out={d} total={d}", .{
-        u.in_tok, u.out_tok, u.tot_tok,
-    }) catch return;
-    defer alloc.free(msg);
-    ui.tr.infoText(msg) catch {};
+    const mc = ui.pn.cost_micents;
+
+    // Format cost as $N.NNN
+    var cost_buf: [24]u8 = undefined;
+    const cost_str = if (mc > 0)
+        std.fmt.bufPrint(&cost_buf, "${d}.{d:0>3}", .{ mc / 100_000, (mc % 100_000) / 100 }) catch "?"
+    else
+        "$0.000";
+
+    var buf: [256]u8 = undefined;
+    var fbs = std.io.fixedBufferStream(&buf);
+    const w = fbs.writer();
+    try w.print("Tokens  in: {d}  out: {d}  total: {d}", .{ u.in_tok, u.out_tok, u.tot_tok });
+    if (u.cache_read > 0 or u.cache_write > 0)
+        try w.print("\nCache   read: {d}  write: {d}", .{ u.cache_read, u.cache_write });
+    try w.print("\nCost    {s}", .{cost_str});
+    try ui.tr.infoText(fbs.getWritten());
 }
 
-fn copyLastResponse(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
+fn copyLastResponse(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const text = ui.lastResponseText() orelse {
-        ui.tr.infoText("[nothing to copy]") catch {};
+        try ui.tr.infoText("[nothing to copy]");
         return;
     };
-    const argv = [_][]const u8{"pbcopy"};
+    const clip_cmds = [_][]const u8{ "pbcopy", "xclip", "xsel", "wl-copy" };
+    for (clip_cmds) |cmd| {
+        if (try pipeToCmd(alloc, cmd, text)) {
+            try ui.tr.infoText("[copied to clipboard]");
+            return;
+        }
+    }
+    try ui.tr.infoText("[copy failed: no clipboard tool found]");
+}
+
+fn pipeToCmd(alloc: std.mem.Allocator, cmd: []const u8, text: []const u8) !bool {
+    const argv = [_][]const u8{cmd};
     var child = std.process.Child.init(argv[0..], alloc);
     child.stdin_behavior = .Pipe;
-    child.spawn() catch {
-        ui.tr.infoText("[copy failed: pbcopy not found]") catch {};
-        return;
-    };
+    child.spawn() catch return false;
     if (child.stdin) |*stdin| {
-        stdin.writeAll(text) catch {};
+        try stdin.writeAll(text);
         stdin.close();
         child.stdin = null;
     }
-    _ = child.wait() catch {};
-    ui.tr.infoText("[copied to clipboard]") catch {};
+    const term = child.wait() catch return false;
+    return switch (term) {
+        .Exited => |code| code == 0,
+        else => false,
+    };
 }
 
 const compact_threshold_pct: u32 = 80;
@@ -2005,7 +2899,7 @@ fn autoCompact(
     if (no_session or session_dir_path == null) return;
     if (ui.pn.ctx_limit == 0) return;
     if (!ui.pn.has_usage) return;
-    const pct = ui.pn.usage.tot_tok * 100 / ui.pn.ctx_limit;
+    const pct = ui.pn.cum_tok *| 100 / ui.pn.ctx_limit;
     if (pct < compact_threshold_pct) return;
 
     var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
@@ -2096,9 +2990,11 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
 
     // Write current text to unique temp file
     var tmp_buf: [64]u8 = undefined;
-    const ts: u64 = @intCast(std.time.nanoTimestamp());
+    const ts: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
     const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts}) catch return null;
-    defer std.fs.deleteFileAbsolute(tmp) catch {};
+    defer std.fs.deleteFileAbsolute(tmp) catch |err| {
+        std.debug.print("warning: temp file cleanup failed: {s}\n", .{@errorName(err)});
+    };
     {
         const f = std.fs.createFileAbsolute(tmp, .{}) catch return null;
         defer f.close();
@@ -2135,10 +3031,10 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
     return content;
 }
 
-fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
+fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     // macOS: check clipboard for image via osascript
     const argv = [_][]const u8{
-        "osascript", "-e",
+        "osascript",                                                                                                     "-e",
         "try\nset theType to (clipboard info for «class PNGf»)\nreturn \"image\"\non error\nreturn \"none\"\nend try",
     };
     const result = std.process.Child.run(.{
@@ -2146,22 +3042,21 @@ fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
         .argv = argv[0..],
         .max_output_bytes = 256,
     }) catch {
-        ui.tr.infoText("[paste: clipboard check failed]") catch {};
+        try ui.tr.infoText("[paste: clipboard check failed]");
         return;
     };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
-    const out = std.mem.trim(u8, result.stdout, " \t\r\n");
-    if (!std.mem.eql(u8, out, "image")) {
-        // Try text paste instead
-        pasteText(alloc, ui);
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (!std.mem.eql(u8, trimmed, "image")) {
+        try pasteText(alloc, ui);
         return;
     }
 
     // Save clipboard image to temp file
     const save_argv = [_][]const u8{
-        "osascript", "-e",
+        "osascript",                                                                                                                                                              "-e",
         "set imgData to the clipboard as «class PNGf»\nset fp to open for access POSIX file \"/tmp/pz-paste.png\" with write permission\nwrite imgData to fp\nclose access fp",
     };
     const save_result = std.process.Child.run(.{
@@ -2169,60 +3064,73 @@ fn pasteImage(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
         .argv = save_argv[0..],
         .max_output_bytes = 256,
     }) catch {
-        ui.tr.infoText("[paste: save failed]") catch {};
+        try ui.tr.infoText("[paste: save failed]");
         return;
     };
     defer alloc.free(save_result.stdout);
     defer alloc.free(save_result.stderr);
 
-    ui.tr.infoText("[pasted image: /tmp/pz-paste.png]") catch {};
+    ui.tr.imageBlock("/tmp/pz-paste.png") catch |err| {
+        ui.tr.infoText("[pasted image: /tmp/pz-paste.png]") catch return err;
+    };
 }
 
-fn pasteText(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
+fn pasteText(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const argv = [_][]const u8{"pbpaste"};
     const result = std.process.Child.run(.{
         .allocator = alloc,
         .argv = argv[0..],
         .max_output_bytes = 256 * 1024,
     }) catch {
-        ui.tr.infoText("[paste failed]") catch {};
+        try ui.tr.infoText("[paste failed]");
         return;
     };
     defer alloc.free(result.stdout);
     defer alloc.free(result.stderr);
 
     if (result.stdout.len > 0) {
-        ui.ed.setText(result.stdout) catch {};
+        ui.ed.insertSlice(result.stdout) catch |err| {
+            ui.tr.infoText("[paste: invalid UTF-8]") catch return err;
+        };
     }
 }
 
-fn runTuiTurn(
+const TurnCtx = struct {
     alloc: std.mem.Allocator,
-    sid: []const u8,
-    prompt: []const u8,
-    model: []const u8,
-    provider_label: []const u8,
     provider: core.providers.Provider,
     store: core.session.SessionStore,
-    reg: core.tools.Registry,
+    tools_rt: *core.tools.builtin.Runtime,
     mode: core.loop.ModeSink,
-    provider_opts: core.providers.Opts,
-    system_prompt: ?[]const u8,
-) !void {
-    _ = try core.loop.run(.{
-        .alloc = alloc,
-        .sid = sid,
-        .prompt = prompt,
-        .model = model,
-        .provider_label = provider_label,
-        .provider = provider,
-        .store = store,
-        .reg = reg,
-        .mode = mode,
-        .system_prompt = system_prompt,
-        .provider_opts = provider_opts,
-    });
-}
+    max_turns: u16 = 0,
+    cancel: ?core.loop.CancelSrc = null,
+
+    const TurnOpts = struct {
+        sid: []const u8,
+        prompt: []const u8,
+        model: []const u8,
+        provider_label: []const u8 = "",
+        provider_opts: core.providers.Opts = .{},
+        system_prompt: ?[]const u8 = null,
+    };
+
+    fn run(self: *const TurnCtx, opts: TurnOpts) !void {
+        _ = try core.loop.run(.{
+            .alloc = self.alloc,
+            .sid = opts.sid,
+            .prompt = opts.prompt,
+            .model = opts.model,
+            .provider_label = opts.provider_label,
+            .provider = self.provider,
+            .store = self.store,
+            .reg = self.tools_rt.registry(),
+            .mode = self.mode,
+            .system_prompt = opts.system_prompt,
+            .provider_opts = opts.provider_opts,
+            .max_turns = self.max_turns,
+            .cancel = self.cancel,
+        });
+    }
+};
 
 test "parseBashCmd single bang" {
     const r = parseBashCmd("!ls -la").?;
@@ -2246,6 +3154,16 @@ test "parseBashCmd empty cmd returns null" {
 test "parseBashCmd no bang returns null" {
     try std.testing.expect(parseBashCmd("hello") == null);
     try std.testing.expect(parseBashCmd("/quit") == null);
+}
+
+fn eofReader() std.Io.AnyReader {
+    const S = struct {
+        fn read(_: *const anyopaque, buf: []u8) anyerror!usize {
+            _ = buf;
+            return 0; // EOF
+        }
+    };
+    return .{ .context = undefined, .readFn = &S.read };
 }
 
 test "runtime executes print mode and persists session events" {
@@ -2272,7 +3190,7 @@ test "runtime executes print mode and persists session events" {
     var out_buf: [1024]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     var session_dir = try std.fs.openDirAbsolute(sess_abs, .{});
@@ -2337,7 +3255,7 @@ test "runtime executes tool calls through loop registry in print mode" {
     var out_buf: [4096]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
@@ -2375,7 +3293,7 @@ test "runtime forwards provider label to provider request" {
     var out_buf: [2048]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
@@ -2406,7 +3324,7 @@ test "runtime executes tui mode path with provided prompt" {
     var out_buf: [16384]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
@@ -2458,7 +3376,7 @@ test "runtime tui reports error when no provider available" {
     var out_buf: [16384]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
@@ -2610,7 +3528,7 @@ test "runtime continue reuses latest session id and appends new turn" {
     var out_buf: [1024]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
     try std.testing.expectEqualStrings("200", sid);
 
@@ -2675,7 +3593,7 @@ test "runtime explicit session path resumes that session id" {
 
     var out_buf: [1024]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
     try std.testing.expectEqualStrings("sid-1", sid);
 }
@@ -2705,7 +3623,7 @@ test "runtime no session mode does not persist jsonl files" {
     var out_buf: [1024]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     var sess_dir = try std.fs.openDirAbsolute(sess_abs, .{ .iterate = true });
@@ -2786,7 +3704,7 @@ test "runtime json mode emits JSON lines for loop events" {
     var out_buf: [16384]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    const sid = try execWithIo(std.testing.allocator, cfg, null, out_fbs.writer().any());
+    const sid = try execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any());
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
@@ -2890,11 +3808,9 @@ test "runtime tui slash commands execute without prompt turns" {
     try std.testing.expect(std.mem.indexOf(u8, written, "/tools") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "provider set to p2") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "tools set to read") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "file=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "bytes=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "lines=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "settings model=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "tools=read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "File:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "ID:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "Messages") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "new session") != null);
 }
 

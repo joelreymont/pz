@@ -67,6 +67,8 @@ pub const Usage = struct {
     in_tok: u64 = 0,
     out_tok: u64 = 0,
     tot_tok: u64 = 0,
+    cache_read: u64 = 0,
+    cache_write: u64 = 0,
 };
 
 pub const Stop = struct {

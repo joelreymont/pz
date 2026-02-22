@@ -1,4 +1,5 @@
 const std = @import("std");
+const wc = @import("wcwidth.zig");
 
 /// Terminal color — default, 256-index, or 24-bit RGB.
 pub const Color = union(enum) {
@@ -150,12 +151,21 @@ pub const VScreen = struct {
             i.* += n;
             return;
         };
-        if (self.row < self.h and self.col < self.w) {
+        const cw = wc.wcwidth(cp);
+        if (self.row < self.h and self.col + cw <= self.w) {
             self.cells[self.row * self.w + self.col] = .{
                 .cp = cp,
                 .style = self.style,
             };
-            self.col += 1;
+            // Fill trailing cells for wide chars with space placeholder
+            var k: usize = 1;
+            while (k < cw) : (k += 1) {
+                self.cells[self.row * self.w + self.col + k] = .{
+                    .cp = ' ',
+                    .style = self.style,
+                };
+            }
+            self.col += cw;
         }
         i.* += n;
     }
@@ -304,7 +314,7 @@ pub const VScreen = struct {
                 });
                 return error.TestExpectedEqual;
             }
-            col += 1;
+            col += wc.wcwidth(exp_cp);
         }
     }
 

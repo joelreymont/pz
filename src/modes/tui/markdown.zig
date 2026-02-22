@@ -7,6 +7,8 @@ const wc = @import("wcwidth.zig");
 pub const MdRenderer = struct {
     in_code_block: bool = false,
     code_lang: syntax.Lang = .unknown,
+    in_table: bool = false,
+    saw_table_sep: bool = false,
 
     pub const RenderError = frame.Frame.PosError || error{InvalidUtf8};
 
@@ -19,6 +21,20 @@ pub const MdRenderer = struct {
                 self.code_lang = .unknown;
             }
             self.in_code_block = !self.in_code_block;
+            self.in_table = false;
+            return;
+        }
+        // Track table state even for skipped lines
+        if (!self.in_code_block) {
+            if (isTableLine(line)) {
+                if (isTableSep(line)) {
+                    self.saw_table_sep = true;
+                }
+                self.in_table = true;
+            } else {
+                self.in_table = false;
+                self.saw_table_sep = false;
+            }
         }
     }
 
@@ -35,6 +51,7 @@ pub const MdRenderer = struct {
                 self.code_lang = .unknown;
             }
             self.in_code_block = !self.in_code_block;
+            self.in_table = false;
             var st = base_st;
             st.fg = theme.get().md_code_border;
             const trimmed = trimFence(line);
@@ -47,17 +64,19 @@ pub const MdRenderer = struct {
 
         // Inside code block — syntax highlight
         if (self.in_code_block) {
-            var tok_buf: [512]syntax.Token = undefined;
-            const toks = syntax.tokenize(line, self.code_lang, &tok_buf);
-            var col: usize = 0;
-            for (toks) |tok| {
-                if (col >= max_w) break;
-                const text = line[tok.start..tok.end];
-                const st = tok.kind.style(base_st);
-                col += try writeStr(frm, x + col, y, text, max_w - col, st);
-            }
-            return col;
+            return try renderCodeLine(frm, x, y, line, max_w, base_st, self.code_lang);
         }
+
+        // Table line (must be checked before hrule since "|---|" looks like hrule-ish)
+        if (isTableLine(line)) {
+            const is_sep = isTableSep(line);
+            const is_header = self.in_table == false and !is_sep;
+            self.in_table = true;
+            if (is_sep) self.saw_table_sep = true;
+            return try renderTableLine(frm, x, y, line, max_w, base_st, is_sep, is_header);
+        }
+        self.in_table = false;
+        self.saw_table_sep = false;
 
         // Horizontal rule
         if (isHRule(line)) {
@@ -134,6 +153,136 @@ pub const MdRenderer = struct {
         return try renderInline(frm, x, y, line, max_w, base_st);
     }
 };
+
+// -- Table helpers --
+
+fn isTableLine(line: []const u8) bool {
+    const t = trimLeadingSpaces(line);
+    return t.len >= 1 and t[0] == '|';
+}
+
+fn isTableSep(line: []const u8) bool {
+    const t = trimLeadingSpaces(line);
+    if (t.len < 3 or t[0] != '|') return false;
+    // Must contain only |, -, :, and spaces
+    for (t) |c| {
+        switch (c) {
+            '|', '-', ':', ' ', '\t' => {},
+            else => return false,
+        }
+    }
+    // Must have at least one dash
+    return std.mem.indexOfScalar(u8, t, '-') != null;
+}
+
+/// Split "|a|b|c|" into cells ["a", "b", "c"] (trimmed).
+/// Returns count written to buf. Strips leading/trailing pipes.
+fn splitCells(line: []const u8, buf: *[64][]const u8) usize {
+    const t = trimLeadingSpaces(line);
+    // Strip leading |
+    var rest = t;
+    if (rest.len > 0 and rest[0] == '|') rest = rest[1..];
+    // Strip trailing |
+    if (rest.len > 0 and rest[rest.len - 1] == '|') rest = rest[0 .. rest.len - 1];
+
+    var n: usize = 0;
+    while (rest.len > 0 and n < buf.len) {
+        if (std.mem.indexOfScalar(u8, rest, '|')) |pipe| {
+            buf[n] = std.mem.trim(u8, rest[0..pipe], " \t");
+            n += 1;
+            rest = rest[pipe + 1 ..];
+        } else {
+            buf[n] = std.mem.trim(u8, rest, " \t");
+            n += 1;
+            break;
+        }
+    }
+    return n;
+}
+
+fn renderTableLine(
+    frm: *frame.Frame,
+    x: usize,
+    y: usize,
+    line: []const u8,
+    max_w: usize,
+    base_st: frame.Style,
+    is_sep: bool,
+    is_header: bool,
+) MdRenderer.RenderError!usize {
+    const t = theme.get();
+    const border_st = frame.Style{ .fg = t.border_muted, .bg = base_st.bg };
+
+    if (is_sep) {
+        // Render separator as ─ fill with ┼ at pipe positions
+        var col: usize = 0;
+        const trimmed = trimLeadingSpaces(line);
+        var i: usize = 0;
+        while (i < trimmed.len and col < max_w) : (i += 1) {
+            const ch: u21 = if (trimmed[i] == '|') 0x253C else 0x2500; // ┼ or ─
+            try frm.set(x + col, y, ch, border_st);
+            col += 1;
+        }
+        return col;
+    }
+
+    // Header or data row — render cells with │ borders
+    var cell_buf: [64][]const u8 = undefined;
+    const ncells = splitCells(line, &cell_buf);
+    const cells = cell_buf[0..ncells];
+
+    var col: usize = 0;
+
+    // Leading │
+    if (col < max_w) {
+        try frm.set(x + col, y, 0x2502, border_st); // │
+        col += 1;
+    }
+
+    for (cells) |cell| {
+        // Space before cell content
+        if (col < max_w) {
+            try frm.set(x + col, y, ' ', base_st);
+            col += 1;
+        }
+
+        // Cell content
+        if (is_header) {
+            var hdr_st = base_st;
+            hdr_st.bold = true;
+            col += try renderInline(frm, x + col, y, cell, max_w -| col, hdr_st);
+        } else {
+            col += try renderInline(frm, x + col, y, cell, max_w -| col, base_st);
+        }
+
+        // Space after cell content
+        if (col < max_w) {
+            try frm.set(x + col, y, ' ', base_st);
+            col += 1;
+        }
+
+        // │ separator
+        if (col < max_w) {
+            try frm.set(x + col, y, 0x2502, border_st); // │
+            col += 1;
+        }
+    }
+
+    return col;
+}
+
+fn renderCodeLine(frm: *frame.Frame, x: usize, y: usize, line: []const u8, max_w: usize, base_st: frame.Style, lang: syntax.Lang) MdRenderer.RenderError!usize {
+    var tok_buf: [512]syntax.Token = undefined;
+    const toks = syntax.tokenize(line, lang, &tok_buf);
+    var col: usize = 0;
+    for (toks) |tok| {
+        if (col >= max_w) break;
+        const text = line[tok.start..tok.end];
+        const st = tok.kind.style(base_st);
+        col += try writeStr(frm, x + col, y, text, max_w - col, st);
+    }
+    return col;
+}
 
 // -- Inline renderer --
 
@@ -653,4 +802,94 @@ test "max_w clips output" {
     // Column 3 should still be space
     const c3 = try frm.cell(3, 0);
     try testing.expectEqual(@as(u21, ' '), c3.cp);
+}
+
+test "table header renders bold with borders" {
+    var frm = try frame.Frame.init(testing.allocator, 40, 1);
+    defer frm.deinit(testing.allocator);
+
+    var md = MdRenderer{};
+    const n = try md.renderLine(&frm, 0, 0, "| Name | Age |", 40, .{});
+    try testing.expect(n > 0);
+    try testing.expect(md.in_table);
+
+    // First char should be │ (border)
+    const c0 = try frm.cell(0, 0);
+    try testing.expectEqual(@as(u21, 0x2502), c0.cp);
+
+    // "N" at col 2 should be bold (header)
+    const c2 = try frm.cell(2, 0);
+    try testing.expectEqual(@as(u21, 'N'), c2.cp);
+    try testing.expect(c2.style.bold);
+}
+
+test "table separator renders as box-drawing" {
+    var frm = try frame.Frame.init(testing.allocator, 40, 2);
+    defer frm.deinit(testing.allocator);
+
+    var md = MdRenderer{};
+    // First line starts table
+    _ = try md.renderLine(&frm, 0, 0, "| A | B |", 40, .{});
+    // Separator line
+    const n = try md.renderLine(&frm, 0, 1, "|---|---|", 40, .{});
+    try testing.expect(n > 0);
+    try testing.expect(md.saw_table_sep);
+
+    // Pipe positions → ┼, dash positions → ─
+    const c0 = try frm.cell(0, 1);
+    try testing.expectEqual(@as(u21, 0x253C), c0.cp); // ┼
+
+    const c1 = try frm.cell(1, 1);
+    try testing.expectEqual(@as(u21, 0x2500), c1.cp); // ─
+}
+
+test "table data row renders normal text with borders" {
+    var frm = try frame.Frame.init(testing.allocator, 40, 3);
+    defer frm.deinit(testing.allocator);
+
+    var md = MdRenderer{};
+    _ = try md.renderLine(&frm, 0, 0, "| H1 | H2 |", 40, .{});
+    _ = try md.renderLine(&frm, 0, 1, "|-----|-----|", 40, .{});
+    _ = try md.renderLine(&frm, 0, 2, "| foo | bar |", 40, .{});
+
+    // "f" should not be bold (data row, not header)
+    const cf = try frm.cell(2, 2);
+    try testing.expectEqual(@as(u21, 'f'), cf.cp);
+    try testing.expect(!cf.style.bold);
+}
+
+test "table state resets on non-table line" {
+    var frm = try frame.Frame.init(testing.allocator, 40, 1);
+    defer frm.deinit(testing.allocator);
+
+    var md = MdRenderer{};
+    _ = try md.renderLine(&frm, 0, 0, "| A |", 40, .{});
+    try testing.expect(md.in_table);
+    md.advanceSkipped("not a table");
+    try testing.expect(!md.in_table);
+}
+
+test "isTableSep detects separator lines" {
+    try testing.expect(isTableSep("|---|---|"));
+    try testing.expect(isTableSep("| --- | :---: |"));
+    try testing.expect(isTableSep("|:---|---:|"));
+    try testing.expect(!isTableSep("| data | here |"));
+    try testing.expect(!isTableSep("---"));
+}
+
+test "splitCells parses pipe-delimited cells" {
+    var buf: [64][]const u8 = undefined;
+    const n = splitCells("| hello | world | 42 |", &buf);
+    try testing.expectEqual(@as(usize, 3), n);
+    try testing.expectEqualStrings("hello", buf[0]);
+    try testing.expectEqualStrings("world", buf[1]);
+    try testing.expectEqualStrings("42", buf[2]);
+}
+
+test "splitCells handles no trailing pipe" {
+    var buf: [64][]const u8 = undefined;
+    const n = splitCells("| a | b", &buf);
+    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqualStrings("a", buf[0]);
+    try testing.expectEqualStrings("b", buf[1]);
 }

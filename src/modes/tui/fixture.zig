@@ -56,39 +56,45 @@ test "e2e simple text response" {
     try renderToVs(&ui, &vs);
 
     // h=10: tx_h=5 (rows 0..4), border 5, editor 6, border 7, footer 8-9
+    // Usage/stop no longer shown in transcript
     var found_text = false;
-    var found_stop = false;
     var r: usize = 0;
     while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "Hello, how can I help?") != null) found_text = true;
-        if (std.mem.indexOf(u8, row, "[stop done]") != null) found_stop = true;
     }
     try std.testing.expect(found_text);
-    try std.testing.expect(found_stop);
 }
 
 test "e2e text + thinking + text" {
-    var ui = try Ui.init(std.testing.allocator, 40, 8, "claude", "anthropic");
+    // h=10: tx_h=5, enough for 3 blocks + 2 gaps
+    var ui = try Ui.init(std.testing.allocator, 40, 10, "claude", "anthropic");
     defer ui.deinit();
 
     try ui.onProvider(.{ .text = "Let me think..." });
     try ui.onProvider(.{ .thinking = "analyzing the problem" });
     try ui.onProvider(.{ .text = "Here is my answer." });
 
-    var vs = try VScreen.init(std.testing.allocator, 40, 8);
+    var vs = try VScreen.init(std.testing.allocator, 40, 10);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // h=8: tx_h=3 (rows 0..2), border 3, editor 4, border 5, footer 6-7
-    // Thinking hidden by default → thinking block not visible at all
-    var r: usize = 0;
-    while (r < 3) : (r += 1) {
-        const row = try vs.rowText(std.testing.allocator, r);
+    // tx_h=5: Let me think (0), gap (1), analyzing (2), gap (3), Here is (4)
+    {
+        const row = try vs.rowText(std.testing.allocator, 0);
         defer std.testing.allocator.free(row);
-        try std.testing.expect(std.mem.indexOf(u8, row, "Thinking...") == null);
-        try std.testing.expect(std.mem.indexOf(u8, row, "analyzing the problem") == null);
+        try std.testing.expect(std.mem.indexOf(u8, row, "Let me think") != null);
+    }
+    {
+        const row = try vs.rowText(std.testing.allocator, 2);
+        defer std.testing.allocator.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "analyzing the problem") != null);
+    }
+    {
+        const row = try vs.rowText(std.testing.allocator, 4);
+        defer std.testing.allocator.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "Here is my answer") != null);
     }
 }
 
@@ -114,30 +120,27 @@ test "e2e tool call and result" {
     try renderToVs(&ui, &vs);
 
     // h=10: tx_h=5 (rows 0..4)
-    // Content at col 1 (padding). Bg fills from col 0.
+    // Tool call now shows as "$ read main.zig" in dim
     var found_tool = false;
     var r: usize = 0;
     while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
-        if (std.mem.indexOf(u8, row, "[tool read#c1]") != null) {
-            try vs.expectFg(r, 1, .{ .rgb = 0xffff00 }); // theme.warn
-            try vs.expectBg(r, 0, .{ .rgb = 0x282832 }); // theme.tool_pending_bg
+        if (std.mem.indexOf(u8, row, "$ read main.zig") != null) {
+            try vs.expectFg(r, 1, .{ .rgb = 0x666666 }); // theme.dim
             found_tool = true;
             break;
         }
     }
     try std.testing.expect(found_tool);
 
-    // Find tool result
+    // Find tool result (now shows output text in dim)
     var found_result = false;
     r = 0;
     while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
-        if (std.mem.indexOf(u8, row, "[tool-result #c1") != null) {
-            try vs.expectFg(r, 1, .{ .rgb = 0xb5bd68 }); // theme.success
-            try vs.expectBg(r, 0, .{ .rgb = 0x283228 }); // theme.tool_success_bg
+        if (std.mem.indexOf(u8, row, "const std") != null) {
             found_result = true;
             break;
         }
@@ -244,14 +247,16 @@ test "e2e multiple parallel tool calls" {
     try renderToVs(&ui, &vs);
 
     // h=14: tx_h=9 (rows 0..8)
+    // Error tool result shows error text with err fg and error bg
     var found_err_result = false;
     var r: usize = 0;
     while (r < 9) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
-        if (std.mem.indexOf(u8, row, "[tool-result #c3") != null) {
-            try vs.expectFg(r, 1, .{ .rgb = 0xcc6666 }); // theme.err
-            try vs.expectBg(r, 0, .{ .rgb = 0x3c2828 }); // theme.tool_error_bg
+        if (std.mem.indexOf(u8, row, "fail") != null) {
+            // Check if this row has error styling
+            vs.expectFg(r, 1, .{ .rgb = 0xcc6666 }) catch continue;
+            vs.expectBg(r, 0, .{ .rgb = 0x3c2828 }) catch continue;
             found_err_result = true;
             break;
         }
@@ -290,4 +295,175 @@ test "e2e footer visible at bottom" {
     defer std.testing.allocator.free(row7);
     try std.testing.expect(std.mem.indexOf(u8, row7, "gpt-4") != null);
     try std.testing.expect(std.mem.indexOf(u8, row7, "(openai)") != null);
+}
+
+// ── Golden parity tests ──
+// Full-frame style assertions: verify exact fg, bg, bold at each content position
+
+test "golden: text block has default fg, no bg fill" {
+    var ui = try Ui.init(std.testing.allocator, 30, 8, "m", "p");
+    defer ui.deinit();
+
+    try ui.onProvider(.{ .text = "hello" });
+
+    var vs = try VScreen.init(std.testing.allocator, 30, 8);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    // h=8: tx_h=3 (rows 0..2). Text at row 0, col 1 (1-col padding).
+    try vs.expectText(0, 1, "hello");
+    try vs.expectFg(0, 1, .{ .default = {} }); // theme.text = default
+    try vs.expectBg(0, 1, .{ .default = {} }); // no bg for text
+    try vs.expectBg(0, 0, .{ .default = {} }); // padding col also default
+}
+
+test "golden: tool_call has dim fg, no bg fill" {
+    var ui = try Ui.init(std.testing.allocator, 30, 8, "m", "p");
+    defer ui.deinit();
+
+    try ui.onProvider(.{ .tool_call = .{ .id = "c1", .name = "read", .args = "{}" } });
+
+    var vs = try VScreen.init(std.testing.allocator, 30, 8);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    // Find the tool row — now shows "$ read"
+    var tool_row: ?usize = null;
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
+        const row = try vs.rowText(std.testing.allocator, r);
+        defer std.testing.allocator.free(row);
+        if (std.mem.indexOf(u8, row, "$ read") != null) {
+            tool_row = r;
+            break;
+        }
+    }
+    try std.testing.expect(tool_row != null);
+    const tr = tool_row.?;
+
+    // Content fg = dim
+    try vs.expectFg(tr, 1, .{ .rgb = 0x666666 });
+    // No bg fill
+    try vs.expectBg(tr, 0, .{ .default = {} });
+}
+
+test "golden: tool_result success has dim fg" {
+    var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
+    defer ui.deinit();
+
+    try ui.onProvider(.{ .tool_result = .{ .id = "c1", .out = "ok", .is_err = false } });
+
+    var vs = try VScreen.init(std.testing.allocator, 40, 8);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    // Tool results now show output text in dim
+    var result_row: ?usize = null;
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
+        const row = try vs.rowText(std.testing.allocator, r);
+        defer std.testing.allocator.free(row);
+        if (std.mem.indexOf(u8, row, "ok") != null) {
+            result_row = r;
+            break;
+        }
+    }
+    try std.testing.expect(result_row != null);
+    const rr = result_row.?;
+
+    try vs.expectFg(rr, 1, .{ .rgb = 0x666666 }); // dim
+}
+
+test "golden: error block has err fg, bold, and error bg full row" {
+    var ui = try Ui.init(std.testing.allocator, 30, 8, "m", "p");
+    defer ui.deinit();
+
+    try ui.onProvider(.{ .err = "fail" });
+
+    var vs = try VScreen.init(std.testing.allocator, 30, 8);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    var err_row: ?usize = null;
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
+        const row = try vs.rowText(std.testing.allocator, r);
+        defer std.testing.allocator.free(row);
+        if (std.mem.indexOf(u8, row, "[err] fail") != null) {
+            err_row = r;
+            break;
+        }
+    }
+    try std.testing.expect(err_row != null);
+    const er = err_row.?;
+
+    try vs.expectFg(er, 1, .{ .rgb = 0xcc6666 }); // err
+    try vs.expectBold(er, 1, true); // bold
+    try vs.expectBg(er, 0, .{ .rgb = 0x3c2828 }); // error bg
+    try vs.expectBg(er, 29, .{ .rgb = 0x3c2828 }); // last col
+}
+
+test "golden: user message has user_msg_bg full row" {
+    var ui = try Ui.init(std.testing.allocator, 30, 8, "m", "p");
+    defer ui.deinit();
+
+    try ui.tr.userText("my prompt");
+
+    var vs = try VScreen.init(std.testing.allocator, 30, 8);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    var user_row: ?usize = null;
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
+        const row = try vs.rowText(std.testing.allocator, r);
+        defer std.testing.allocator.free(row);
+        if (std.mem.indexOf(u8, row, "my prompt") != null) {
+            user_row = r;
+            break;
+        }
+    }
+    try std.testing.expect(user_row != null);
+    const ur = user_row.?;
+
+    try vs.expectBg(ur, 0, .{ .rgb = 0x343541 }); // user_msg_bg
+    try vs.expectBg(ur, 29, .{ .rgb = 0x343541 }); // last col
+}
+
+test "golden: footer fg matches dim color" {
+    var ui = try Ui.initFull(std.testing.allocator, 40, 8, "claude", "anthropic", "/tmp", "main");
+    defer ui.deinit();
+
+    var vs = try VScreen.init(std.testing.allocator, 40, 8);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    // Footer at rows 6-7. Line 1 (row 6) has cwd in dim.
+    try vs.expectFg(6, 0, .{ .rgb = 0x666666 }); // dim
+    // Footer line 2 has right-aligned model; find it
+    const row7 = try vs.rowText(std.testing.allocator, 7);
+    defer std.testing.allocator.free(row7);
+    try std.testing.expect(std.mem.indexOf(u8, row7, "claude") != null);
+}
+
+test "golden: wide CJK in editor clips correctly" {
+    var ui = try Ui.init(std.testing.allocator, 10, 6, "m", "p");
+    defer ui.deinit();
+
+    // Type wide CJK characters
+    _ = try ui.ed.apply(.{ .char = 0x4E2D }); // 中 (width 2)
+    _ = try ui.ed.apply(.{ .char = 0x6587 }); // 文 (width 2)
+    _ = try ui.ed.apply(.{ .char = 'A' });
+
+    var vs = try VScreen.init(std.testing.allocator, 10, 6);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    // Editor at row 1 (tx_h=1 for h=6, border=0, editor=1, border=2, footer=3-4... no)
+    // h=6: reserved=5 → tx_h=1. Border row 1, editor row 2, border row 3, footer 4-5.
+    const editor_row = 2;
+    const row = try vs.rowText(std.testing.allocator, editor_row);
+    defer std.testing.allocator.free(row);
+    // Editor has 1-col padding, then "中文A" = 2+2+1 = 5 cols
+    try std.testing.expect(std.mem.indexOf(u8, row, "A") != null);
 }

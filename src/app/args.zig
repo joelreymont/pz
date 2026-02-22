@@ -45,6 +45,7 @@ pub const Parsed = struct {
     no_session: bool = false,
     tool_mask: u8 = core.tools.builtin.mask_all,
     model: ?[]const u8 = null,
+    models: ?[]const u8 = null, // comma-separated model list for cycling
     provider: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     provider_cmd: ?[]const u8 = null,
@@ -52,6 +53,7 @@ pub const Parsed = struct {
     verbose: bool = false,
     system_prompt: ?[]const u8 = null,
     append_system_prompt: ?[]const u8 = null,
+    max_turns: u16 = 0,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -87,6 +89,7 @@ pub const ParseError = error{
     DuplicateTool,
     ToolsConflict,
     MissingModelValue,
+    MissingModelsValue,
     DuplicateModel,
     MissingProviderValue,
     DuplicateProvider,
@@ -98,6 +101,8 @@ pub const ParseError = error{
     InvalidThinking,
     MissingSystemPromptValue,
     MissingAppendSystemPromptValue,
+    MissingMaxTurnsValue,
+    InvalidMaxTurns,
 };
 
 pub fn parse(argv: []const []const u8) ParseError!Parsed {
@@ -108,10 +113,30 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
     var tools_seen = false;
 
     const Flag = enum {
-        help, version, cont, resm, session, no_session,
-        tui, print, mode, prompt, config, no_config,
-        no_tools, tools, model, provider, session_dir, provider_cmd,
-        thinking, verbose, system_prompt, append_system_prompt,
+        help,
+        version,
+        cont,
+        resm,
+        session,
+        no_session,
+        tui,
+        print,
+        mode,
+        prompt,
+        config,
+        no_config,
+        no_tools,
+        tools,
+        model,
+        models,
+        provider,
+        session_dir,
+        provider_cmd,
+        thinking,
+        verbose,
+        system_prompt,
+        append_system_prompt,
+        max_turns,
     };
     const flag_map = std.StaticStringMap(Flag).initComptime(.{
         .{ "-h", .help },
@@ -136,6 +161,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .{ "--no-tools", .no_tools },
         .{ "--tools", .tools },
         .{ "--model", .model },
+        .{ "--models", .models },
         .{ "--provider", .provider },
         .{ "--session-dir", .session_dir },
         .{ "--provider-cmd", .provider_cmd },
@@ -143,6 +169,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .{ "--verbose", .verbose },
         .{ "--system-prompt", .system_prompt },
         .{ "--append-system-prompt", .append_system_prompt },
+        .{ "--max-turns", .max_turns },
     });
     const mode_map = std.StaticStringMap(Mode).initComptime(.{
         .{ "tui", .tui },
@@ -206,6 +233,11 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
                     if (val.len == 0) return error.MissingModelValue;
                     try setModel(&out, val);
                 },
+                .models => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingModelsValue;
+                    if (val.len == 0) return error.MissingModelsValue;
+                    out.models = val;
+                },
                 .provider => {
                     const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingProviderValue;
                     if (val.len == 0) return error.MissingProviderValue;
@@ -237,6 +269,10 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
                     if (val.len == 0) return error.MissingAppendSystemPromptValue;
                     out.append_system_prompt = val;
                 },
+                .max_turns => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingMaxTurnsValue;
+                    out.max_turns = std.fmt.parseInt(u16, val, 10) catch return error.InvalidMaxTurns;
+                },
             }
             continue;
         }
@@ -246,7 +282,8 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
                 try setMode(&out, &mode_seen, try parseMode(tok));
                 continue;
             }
-            if ((out.mode == .print or out.mode == .json) and out.prompt == null) {
+            // Collect positional args as prompt (like pi does)
+            if (out.prompt == null) {
                 try setPrompt(&out, tok);
                 continue;
             }
@@ -257,7 +294,6 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
     }
 
     if (out.show_help or out.show_version) return out;
-    if (mode_seen and (out.mode == .tui or out.mode == .rpc) and out.prompt != null) return error.PromptOnlyForPrint;
     if (mode_seen and out.mode == .print and out.prompt == null) return error.MissingPrintPrompt;
     return out;
 }
@@ -459,8 +495,14 @@ test "errors on unknown arg" {
     try std.testing.expectError(error.UnknownArg, parse(&.{"--wat"}));
 }
 
-test "errors on unexpected positional in tui mode" {
-    try std.testing.expectError(error.UnexpectedPositional, parse(&.{ "tui", "extra" }));
+test "positional after mode becomes prompt" {
+    const out = try parse(&.{ "tui", "hello world" });
+    try std.testing.expectEqual(Mode.tui, out.mode);
+    try std.testing.expectEqualStrings("hello world", out.prompt.?);
+}
+
+test "errors on second positional" {
+    try std.testing.expectError(error.UnexpectedPositional, parse(&.{ "tui", "a", "b" }));
 }
 
 test "errors on missing mode value" {
@@ -487,8 +529,10 @@ test "errors on duplicate prompt" {
     try std.testing.expectError(error.DuplicatePrompt, parse(&.{ "--print", "--prompt", "a", "--prompt", "b" }));
 }
 
-test "errors when prompt is provided for tui mode" {
-    try std.testing.expectError(error.PromptOnlyForPrint, parse(&.{ "--tui", "--prompt", "hello" }));
+test "tui mode accepts prompt" {
+    const out = try parse(&.{ "--tui", "--prompt", "hello" });
+    try std.testing.expectEqualStrings("hello", out.prompt.?);
+    try std.testing.expect(out.mode == .tui);
 }
 
 test "errors when print mode has no prompt" {
@@ -593,4 +637,15 @@ test "errors on duplicate and missing model or provider command args" {
         error.DuplicateProviderCmd,
         parse(&.{ "--provider-cmd", "a", "--provider-cmd", "b" }),
     );
+}
+
+test "parse max-turns flag" {
+    const out = try parse(&.{ "--max-turns", "10" });
+    try std.testing.expectEqual(@as(u16, 10), out.max_turns);
+
+    const eq = try parse(&.{"--max-turns=5"});
+    try std.testing.expectEqual(@as(u16, 5), eq.max_turns);
+
+    try std.testing.expectError(error.MissingMaxTurnsValue, parse(&.{"--max-turns"}));
+    try std.testing.expectError(error.InvalidMaxTurns, parse(&.{ "--max-turns", "abc" }));
 }

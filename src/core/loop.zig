@@ -322,6 +322,15 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
         return failWithReport(opts, .store_append, hist_err);
     };
 
+    // Cache tool schemas — registry is static across turns
+    const req_tools = buildReqTools(opts.alloc, opts.reg) catch |tools_err| {
+        return failWithReport(opts, .provider_start, tools_err);
+    };
+    defer {
+        for (req_tools) |t| opts.alloc.free(t.schema);
+        opts.alloc.free(req_tools);
+    }
+
     var turns: u16 = 0;
     var tool_calls: u32 = 0;
 
@@ -342,9 +351,6 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
 
         const req_msgs = buildReqMsgs(turn_alloc, hist.items.items, opts.system_prompt) catch |msg_err| {
             return failWithReport(opts, .provider_start, msg_err);
-        };
-        const req_tools = buildReqTools(turn_alloc, opts.reg) catch |tools_err| {
-            return failWithReport(opts, .provider_start, tools_err);
         };
 
         var stream = opts.provider.start(.{
@@ -536,12 +542,18 @@ fn buildReqTools(
     reg: tools.Registry,
 ) ![]providers.Tool {
     const out = try alloc.alloc(providers.Tool, reg.entries.len);
+    var built: usize = 0;
+    errdefer {
+        for (out[0..built]) |t| alloc.free(t.schema);
+        alloc.free(out);
+    }
     for (reg.entries, out) |entry, *slot| {
         slot.* = .{
             .name = entry.name,
             .desc = entry.spec.desc,
             .schema = try buildSchema(alloc, entry.spec.params),
         };
+        built += 1;
     }
     return out;
 }

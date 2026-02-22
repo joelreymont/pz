@@ -195,11 +195,12 @@ pub fn init() void {
     if (std.posix.getenv("COLORFGBG")) |val| {
         if (std.mem.lastIndexOfScalar(u8, val, ';')) |sep| {
             const bg_str = val[sep + 1 ..];
-            const bg = std.fmt.parseInt(u8, bg_str, 10) catch return;
-            // bg >= 8 typically means a light background
-            if (bg >= 8) {
-                active = &light;
-            }
+            if (std.fmt.parseInt(u8, bg_str, 10)) |bg| {
+                // bg >= 8 typically means a light background
+                if (bg >= 8) {
+                    active = &light;
+                }
+            } else |_| {}
         }
     }
 }

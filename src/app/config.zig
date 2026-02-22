@@ -43,12 +43,17 @@ pub const Config = struct {
     provider: []u8,
     session_dir: []u8,
     provider_cmd: ?[]u8 = null,
+    enabled_models: ?[][]u8 = null, // model cycle list
 
     pub fn deinit(self: *Config, alloc: std.mem.Allocator) void {
         alloc.free(self.model);
         alloc.free(self.provider);
         alloc.free(self.session_dir);
         if (self.provider_cmd) |v| alloc.free(v);
+        if (self.enabled_models) |models| {
+            for (models) |m| alloc.free(m);
+            alloc.free(models);
+        }
         self.* = undefined;
     }
 };
@@ -88,6 +93,10 @@ pub fn discover(
             file_cfg.value.provider_cmd,
             error.InvalidFileMode,
         );
+        // File models override pi settings
+        if (file_cfg.value.models) |csv| {
+            try setModels(alloc, &out, csv);
+        }
     }
 
     try applyRawCfg(
@@ -101,6 +110,12 @@ pub fn discover(
         error.InvalidEnvMode,
     );
 
+    // PZ_MODELS env var
+    if (dupEnvAlias(alloc, "PZ_MODELS", "PI_MODELS")) |v| {
+        defer alloc.free(v);
+        try setModels(alloc, &out, v);
+    }
+
     if (parsed.mode_set) out.mode = parsed.mode;
     try applyRawCfg(
         alloc,
@@ -113,11 +128,17 @@ pub fn discover(
         error.InvalidMode,
     );
 
+    // CLI --models overrides everything
+    if (parsed.models) |csv| {
+        try setModels(alloc, &out, csv);
+    }
+
     return out;
 }
 
 const FileCfg = struct {
     model: ?[]const u8 = null,
+    models: ?[]const u8 = null, // comma-separated
     provider: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     mode: ?[]const u8 = null,
@@ -127,6 +148,8 @@ const FileCfg = struct {
 const PiFileCfg = struct {
     defaultModel: ?[]const u8 = null,
     model: ?[]const u8 = null,
+    enabledModels: ?[]const []const u8 = null,
+    models: ?[]const u8 = null, // comma-separated (pz native)
     defaultProvider: ?[]const u8 = null,
     provider: ?[]const u8 = null,
     sessionDir: ?[]const u8 = null,
@@ -190,6 +213,12 @@ fn applyPiCfg(alloc: std.mem.Allocator, cfg: *Config, pi: PiFileCfg) Err!void {
         pick(pi.provider_cmd, pi.providerCommand),
         error.InvalidPiMode,
     );
+    // Pi's enabledModels (JSON array) or pz-style comma-separated models
+    if (pi.enabledModels) |arr| {
+        try setModelsFromArray(alloc, cfg, arr);
+    } else if (pi.models) |csv| {
+        try setModels(alloc, cfg, csv);
+    }
 }
 
 fn applyRawCfg(
@@ -207,6 +236,48 @@ fn applyRawCfg(
     if (session_dir) |v| try replaceStr(alloc, &out.session_dir, v);
     if (mode) |v| out.mode = try parseMode(v, invalid_mode);
     if (provider_cmd) |v| try replaceOptStr(alloc, &out.provider_cmd, v);
+}
+
+/// Parse comma-separated model list into enabled_models.
+fn setModels(alloc: std.mem.Allocator, cfg: *Config, csv: []const u8) Err!void {
+    var list = std.ArrayList([]u8).empty;
+    errdefer {
+        for (list.items) |m| alloc.free(m);
+        list.deinit(alloc);
+    }
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |raw| {
+        const trimmed = std.mem.trim(u8, raw, " \t");
+        if (trimmed.len == 0) continue;
+        try list.append(alloc, try alloc.dupe(u8, trimmed));
+    }
+    if (list.items.len == 0) return;
+    // Free previous
+    if (cfg.enabled_models) |old| {
+        for (old) |m| alloc.free(m);
+        alloc.free(old);
+    }
+    cfg.enabled_models = try list.toOwnedSlice(alloc);
+}
+
+/// Set enabled_models from a JSON string array (pi's enabledModels format).
+fn setModelsFromArray(alloc: std.mem.Allocator, cfg: *Config, arr: []const []const u8) Err!void {
+    if (arr.len == 0) return;
+    var list = try alloc.alloc([]u8, arr.len);
+    errdefer {
+        for (list, 0..) |_, i| {
+            if (i < arr.len) alloc.free(list[i]);
+        }
+        alloc.free(list);
+    }
+    for (arr, 0..) |m, i| {
+        list[i] = try alloc.dupe(u8, m);
+    }
+    if (cfg.enabled_models) |old| {
+        for (old) |m| alloc.free(m);
+        alloc.free(old);
+    }
+    cfg.enabled_models = list;
 }
 
 fn pick(primary: ?[]const u8, fallback: ?[]const u8) ?[]const u8 {
@@ -458,4 +529,58 @@ test "config local auto file overrides pi settings" {
     try std.testing.expectEqualStrings("local-sessions", cfg.session_dir);
     try std.testing.expect(cfg.provider_cmd != null);
     try std.testing.expectEqualStrings("local-cmd", cfg.provider_cmd.?);
+}
+
+test "config loads enabled_models from --models flag" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const parsed = try args.parse(&.{ "--models", "claude-opus-4-6,claude-haiku-4-5" });
+    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled_models != null);
+    const models = cfg.enabled_models.?;
+    try std.testing.expectEqual(@as(usize, 2), models.len);
+    try std.testing.expectEqualStrings("claude-opus-4-6", models[0]);
+    try std.testing.expectEqualStrings("claude-haiku-4-5", models[1]);
+}
+
+test "config loads enabled_models from file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = auto_cfg_path,
+        .data = "{\"models\":\"model-a, model-b, model-c\"}",
+    });
+
+    const parsed = try args.parse(&.{});
+    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled_models != null);
+    const models = cfg.enabled_models.?;
+    try std.testing.expectEqual(@as(usize, 3), models.len);
+    try std.testing.expectEqualStrings("model-a", models[0]);
+    try std.testing.expectEqualStrings("model-b", models[1]);
+    try std.testing.expectEqualStrings("model-c", models[2]);
+}
+
+test "config cli --models overrides file models" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{
+        .sub_path = auto_cfg_path,
+        .data = "{\"models\":\"file-model\"}",
+    });
+
+    const parsed = try args.parse(&.{ "--models", "cli-model" });
+    var cfg = try discover(std.testing.allocator, tmp.dir, parsed, .{});
+    defer cfg.deinit(std.testing.allocator);
+
+    try std.testing.expect(cfg.enabled_models != null);
+    try std.testing.expectEqual(@as(usize, 1), cfg.enabled_models.?.len);
+    try std.testing.expectEqualStrings("cli-model", cfg.enabled_models.?[0]);
 }

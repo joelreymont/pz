@@ -25,7 +25,9 @@ pub fn run(
 
     const tmp_path = try sid_path.sidExtAlloc(alloc, sid, ".jsonl.compact.tmp");
     defer alloc.free(tmp_path);
-    errdefer dir.deleteFile(tmp_path) catch {};
+    errdefer dir.deleteFile(tmp_path) catch |err| {
+        std.debug.print("warning: temp file cleanup failed: {s}\n", .{@errorName(err)});
+    };
 
     const in_file = try dir.openFile(src_path, .{ .mode = .read_only });
     const in_bytes = try in_file.getEndPos();

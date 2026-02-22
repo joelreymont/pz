@@ -6,6 +6,7 @@ const termcap = @import("termcap.zig");
 const DecMode = enum(u16) {
     cursor = 25,
     alt_screen = 1049,
+    bracketed_paste = 2004,
     sync = 2026,
 };
 
@@ -56,19 +57,30 @@ pub const Renderer = struct {
 
     pub fn setup(out: anytype) !void {
         try out.writeAll(decSet(.alt_screen) ++ decRst(.cursor) ++
-            "\x1b[?1000h\x1b[?1006h");
+            "\x1b[?1000h\x1b[?1006h" ++ decSet(.bracketed_paste) ++
+            "\x1b[>1u"); // Kitty keyboard protocol: push with disambiguate flag
     }
 
     pub fn cleanup(out: anytype) !void {
-        try out.writeAll("\x1b[?1006l\x1b[?1000l" ++
+        try out.writeAll("\x1b[<u" ++ // Kitty keyboard protocol: pop
+            decRst(.bracketed_paste) ++
+            "\x1b[?1006l\x1b[?1000l" ++
             decSet(.cursor) ++ decRst(.alt_screen));
+    }
+
+    pub fn setTitle(out: anytype, title: []const u8) !void {
+        try out.writeAll("\x1b]0;");
+        try out.writeAll(title);
+        try out.writeAll("\x07");
     }
 
     pub fn render(self: *Renderer, next: *const frame.Frame, out: anytype) (RenderError || anyerror)!void {
         if (self.prev.w != next.w or self.prev.h != next.h) return error.SizeMismatch;
 
         try out.writeAll(decSet(.sync));
-        errdefer out.writeAll(decRst(.sync)) catch {};
+        errdefer out.writeAll(decRst(.sync)) catch |err| {
+            std.debug.print("warning: sync reset failed: {s}\n", .{@errorName(err)});
+        };
 
         if (self.cold) {
             try out.writeAll("\x1b[0m\x1b[2J\x1b[H");

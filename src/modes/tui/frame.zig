@@ -135,7 +135,7 @@ pub const Frame = struct {
             ct += 1;
         }
 
-        return ct;
+        return col - x;
     }
 
     pub fn copyFrom(self: *Frame, other: *const Frame) CopyError!void {
@@ -210,7 +210,7 @@ test "frame write wide CJK characters" {
     defer f.deinit(std.testing.allocator);
 
     const wrote = try f.write(0, 0, "A中B", .{});
-    try std.testing.expectEqual(@as(usize, 3), wrote);
+    try std.testing.expectEqual(@as(usize, 4), wrote); // A(1) + 中(2) + B(1) = 4 display cols
 
     try std.testing.expectEqual(@as(u21, 'A'), (try f.cell(0, 0)).cp);
     try std.testing.expectEqual(@as(u21, 0x4E2D), (try f.cell(1, 0)).cp); // '中'
@@ -224,7 +224,7 @@ test "frame write wide char clipped at boundary" {
     defer f.deinit(std.testing.allocator);
 
     const wrote = try f.write(0, 0, "A中X", .{});
-    try std.testing.expectEqual(@as(usize, 2), wrote); // A + 中, no room for X
+    try std.testing.expectEqual(@as(usize, 3), wrote); // A(1col) + 中(2cols) = 3 cols, no room for X
 
     try std.testing.expectEqual(@as(u21, 'A'), (try f.cell(0, 0)).cp);
     try std.testing.expectEqual(@as(u21, 0x4E2D), (try f.cell(1, 0)).cp);

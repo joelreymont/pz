@@ -12,7 +12,9 @@ pub const Rect = struct {
     h: usize,
 };
 
-const Kind = enum { text, thinking, tool, err, meta };
+const imgproto = @import("imgproto.zig");
+
+const Kind = enum { text, user, thinking, tool, err, meta, image };
 
 const Span = struct {
     start: usize, // byte offset in buf
@@ -48,13 +50,21 @@ const Block = struct {
     }
 };
 
+pub const ImageRef = struct {
+    path: []const u8, // borrowed from block
+    y: usize, // screen row
+    w: usize, // available width
+};
+
 pub const Transcript = struct {
     alloc: std.mem.Allocator,
     blocks: std.ArrayListUnmanaged(Block) = .empty,
     md: markdown.MdRenderer = .{},
     scroll_off: usize = 0,
     show_tools: bool = true,
-    show_thinking: bool = false,
+    show_thinking: bool = true,
+    img_refs: [8]ImageRef = undefined,
+    img_ref_n: u8 = 0,
 
     pub fn scrollUp(self: *Transcript, n: usize) void {
         self.scroll_off +|= n;
@@ -118,50 +128,40 @@ pub const Transcript = struct {
                     .italic = true,
                 });
             },
-            .tool_call => |tc| try self.pushFmt(.tool, "[tool {s}#{s}] {s}", .{
-                tc.name,
-                tc.id,
-                tc.args,
-            }, .{
-                .fg = theme.get().warn,
-                .bg = theme.get().tool_pending_bg,
-            }),
+            .tool_call => |tc| {
+                // Format like pi: " $ command args" for bash,
+                // " $ tool_name path" for file tools, etc.
+                const display = fmtToolCall(self.alloc, tc.name, tc.args) catch
+                    try std.fmt.allocPrint(self.alloc, " $ {s}", .{tc.name});
+                defer self.alloc.free(display);
+                try self.pushBlock(.tool, display, .{
+                    .fg = theme.get().dim,
+                });
+            },
             .tool_result => |tr| {
-                const kind: Kind = if (tr.is_err) .err else .tool;
-                const base_st: frame.Style = if (tr.is_err) .{
-                    .fg = theme.get().err,
-                    .bg = theme.get().tool_error_bg,
-                } else .{
-                    .fg = theme.get().success,
-                    .bg = theme.get().tool_success_bg,
-                };
-                const tag = if (tr.is_err) "true" else "false";
-                try self.pushAnsi(kind, "[tool-result #{s} err={s}] ", .{
-                    tr.id, tag,
-                }, tr.out, base_st);
+                if (tr.is_err) {
+                    try self.pushAnsi(.err, "", .{}, tr.out, .{
+                        .fg = theme.get().err,
+                        .bg = theme.get().tool_error_bg,
+                    });
+                } else {
+                    // Show result with collapsing like pi
+                    try self.pushToolResult(tr.out);
+                }
             },
             .err => |t| try self.pushFmt(.err, "[err] {s}", .{t}, .{
                 .fg = theme.get().err,
                 .bold = true,
                 .bg = theme.get().tool_error_bg,
             }),
-            .usage => |u| try self.pushFmt(.meta, "[usage {d}/{d}/{d}]", .{
-                u.in_tok,
-                u.out_tok,
-                u.tot_tok,
-            }, .{
-                .fg = theme.get().dim,
-            }),
-            .stop => |s| try self.pushFmt(.meta, "[stop {s}]", .{
-                @tagName(s.reason),
-            }, .{
-                .fg = theme.get().dim,
-            }),
+            // Usage and stop are tracked in panels, not shown in transcript
+            .usage => {},
+            .stop => {},
         }
     }
 
     pub fn userText(self: *Transcript, t: []const u8) AppendError!void {
-        try self.pushBlock(.text, t, .{ .bg = theme.get().user_msg_bg });
+        try self.pushBlock(.user, t, .{ .bg = theme.get().user_msg_bg });
     }
 
     pub fn infoText(self: *Transcript, t: []const u8) AppendError!void {
@@ -172,11 +172,16 @@ pub const Transcript = struct {
         try self.pushBlock(.meta, t, st);
     }
 
+    pub fn imageBlock(self: *Transcript, path: []const u8) AppendError!void {
+        try self.pushBlock(.image, path, .{ .fg = theme.get().dim });
+    }
+
     pub fn pushAnsiText(self: *Transcript, ansi_text: []const u8) AppendError!void {
         try self.pushAnsi(.meta, "", .{}, ansi_text, .{});
     }
 
-    pub fn render(self: *const Transcript, frm: *frame.Frame, rect: Rect) RenderError!void {
+    pub fn render(self: *Transcript, frm: *frame.Frame, rect: Rect) RenderError!void {
+        self.img_ref_n = 0;
         if (rect.w == 0 or rect.h == 0) return;
 
         _ = try rectEndX(frm, rect);
@@ -188,12 +193,15 @@ pub const Transcript = struct {
         const content_x = rect.x + pad;
         const avail_w = rect.w - pad;
 
-        // Count total display lines
+        // Count total display lines (including 1-line gap between blocks)
         var total: usize = 0;
+        var vis_ct: usize = 0;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
-            total += countLines(self.blockDisplayText(b), avail_w);
+            total += blockLineCount(b, avail_w);
+            vis_ct += 1;
         }
+        if (vis_ct > 1) total += vis_ct - 1; // gaps
         if (total == 0) return;
 
         // If content overflows, reserve 1 col for scrollbar
@@ -205,8 +213,9 @@ pub const Transcript = struct {
             total = 0;
             for (self.blocks.items) |*b| {
                 if (!self.blockVisible(b)) continue;
-                total += countLines(self.blockDisplayText(b), text_w);
+                total += blockLineCount(b, text_w);
             }
+            if (vis_ct > 1) total += vis_ct - 1;
         }
 
         // Auto-scroll when scroll_off == 0, otherwise respect manual offset
@@ -222,10 +231,53 @@ pub const Transcript = struct {
         var row: usize = 0;
 
         var md = markdown.MdRenderer{};
+        var first_vis = true;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
+
+            // 1-line gap between blocks
+            if (!first_vis) {
+                if (skipped < skip) {
+                    skipped += 1;
+                } else if (row < rect.h) {
+                    row += 1;
+                }
+            }
+            first_vis = false;
+
+            // Image blocks: header line + reserved rows
+            if (b.kind == .image) {
+                const blk_h = imgproto.img_rows;
+                var img_skipped: usize = 0;
+                var ir: usize = 0;
+                while (ir < blk_h) : (ir += 1) {
+                    if (skipped < skip) {
+                        skipped += 1;
+                        img_skipped += 1;
+                        continue;
+                    }
+                    if (row >= rect.h) break;
+                    const y = rect.y + row;
+                    if (ir == 0) {
+                        // First visible row: show header
+                        _ = try frm.write(content_x, y, b.text(), b.st);
+                    }
+                    // Record image position (first displayed row)
+                    if (ir == img_skipped and self.img_ref_n < self.img_refs.len) {
+                        self.img_refs[self.img_ref_n] = .{
+                            .path = b.text(),
+                            .y = y,
+                            .w = text_w,
+                        };
+                        self.img_ref_n += 1;
+                    }
+                    row += 1;
+                }
+                continue;
+            }
+
             const txt = self.blockDisplayText(b);
-            const use_md = b.kind == .text;
+            const use_md = b.kind == .text or b.kind == .user;
             if (use_md) md = .{};
             var wit = wrapIter(txt, text_w);
             while (wit.next()) |line| {
@@ -238,7 +290,7 @@ pub const Transcript = struct {
                     }
                     continue;
                 }
-                if (row >= rect.h) return;
+                if (row >= rect.h) break;
 
                 const y = rect.y + row;
 
@@ -294,6 +346,11 @@ pub const Transcript = struct {
         return b.text();
     }
 
+    fn blockLineCount(b: *const Block, w: usize) usize {
+        if (b.kind == .image) return imgproto.img_rows;
+        return countLines(b.text(), w);
+    }
+
     fn pushBlock(self: *Transcript, kind: Kind, t: []const u8, st: frame.Style) AppendError!void {
         try ensureUtf8(t);
         var buf: std.ArrayListUnmanaged(u8) = .empty;
@@ -314,8 +371,10 @@ pub const Transcript = struct {
         st: frame.Style,
     ) AppendError!void {
         const txt = try std.fmt.allocPrint(self.alloc, fmt, args);
-        errdefer self.alloc.free(txt);
-        try ensureUtf8(txt);
+        ensureUtf8(txt) catch {
+            self.alloc.free(txt);
+            return error.InvalidUtf8;
+        };
         var buf: std.ArrayListUnmanaged(u8) = .{
             .items = txt,
             .capacity = txt.len,
@@ -359,6 +418,7 @@ pub const Transcript = struct {
         buf.appendSliceAssumeCapacity(prefix);
         buf.appendSliceAssumeCapacity(parsed.buf.items);
         parsed.buf.deinit(self.alloc);
+        parsed.buf = .empty; // prevent double-free via errdefer
 
         try ensureUtf8(buf.items);
 
@@ -369,7 +429,91 @@ pub const Transcript = struct {
             .spans = parsed.spans,
         });
     }
+
+    /// Show tool result, collapsing long output like pi does:
+    /// "... (N earlier lines, ctrl+o to expand)"
+    fn pushToolResult(self: *Transcript, out: []const u8) AppendError!void {
+        const max_tail = 6; // show last N lines
+        var lines: usize = 0;
+        for (out) |c| {
+            if (c == '\n') lines += 1;
+        }
+        if (out.len > 0 and out[out.len - 1] != '\n') lines += 1;
+
+        if (lines <= max_tail + 1) {
+            // Short enough: show all
+            try self.pushAnsi(.tool, "", .{}, out, .{
+                .fg = theme.get().dim,
+            });
+            return;
+        }
+
+        // Find where the tail starts
+        const hidden = lines - max_tail;
+        var skip: usize = 0;
+        var nl_count: usize = 0;
+        for (out, 0..) |c, idx| {
+            if (c == '\n') {
+                nl_count += 1;
+                if (nl_count == hidden) {
+                    skip = idx + 1;
+                    break;
+                }
+            }
+        }
+
+        try self.pushAnsi(.tool, " ... ({d} earlier lines, ctrl+o to expand)\n", .{hidden}, out[skip..], .{
+            .fg = theme.get().dim,
+        });
+    }
 };
+
+// -- Tool call formatting --
+
+fn fmtToolCall(alloc: std.mem.Allocator, name: []const u8, args: []const u8) ![]u8 {
+    // Parse JSON args to extract display-friendly command
+    // For bash: show "$ cd ... && cmd"
+    // For file tools: show "$ tool_name path"
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, args, .{}) catch
+        return std.fmt.allocPrint(alloc, " $ {s}", .{name});
+    defer parsed.deinit();
+
+    const obj = switch (parsed.value) {
+        .object => |o| o,
+        else => return std.fmt.allocPrint(alloc, " $ {s}", .{name}),
+    };
+
+    // bash tool: show command
+    if (std.mem.eql(u8, name, "bash")) {
+        if (obj.get("command")) |cmd| {
+            const cmd_str = switch (cmd) {
+                .string => |s| s,
+                else => return std.fmt.allocPrint(alloc, " $ bash", .{}),
+            };
+            return std.fmt.allocPrint(alloc, " $ {s}", .{cmd_str});
+        }
+    }
+
+    // File tools: show path
+    if (obj.get("path")) |path| {
+        const path_str = switch (path) {
+            .string => |s| s,
+            else => return std.fmt.allocPrint(alloc, " $ {s}", .{name}),
+        };
+        return std.fmt.allocPrint(alloc, " $ {s} {s}", .{ name, path_str });
+    }
+
+    // edit: show file_path
+    if (obj.get("file_path")) |path| {
+        const path_str = switch (path) {
+            .string => |s| s,
+            else => return std.fmt.allocPrint(alloc, " $ {s}", .{name}),
+        };
+        return std.fmt.allocPrint(alloc, " $ {s} {s}", .{ name, path_str });
+    }
+
+    return std.fmt.allocPrint(alloc, " $ {s}", .{name});
+}
 
 // -- Word wrap --
 
@@ -720,6 +864,7 @@ fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     var used: usize = 0;
     while (i < text.len and used < cols) {
         const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
         const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
         const w = wc.wcwidth(cp);
         if (used + w > cols) break;
@@ -781,52 +926,43 @@ test "transcript appends provider events and renders fixed-height tail" {
     // 4 blocks: text("one"), thinking, tool, text("three")
     try std.testing.expectEqual(@as(usize, 4), tr.count());
 
-    var frm = try frame.Frame.init(std.testing.allocator, 24, 3);
+    // 4 blocks + 3 gaps = 7 lines; show last 5 to see two, $ read, three
+    var frm = try frame.Frame.init(std.testing.allocator, 24, 5);
     defer frm.deinit(std.testing.allocator);
     try tr.render(&frm, .{
         .x = 0,
         .y = 0,
         .w = 24,
-        .h = 3,
+        .h = 5,
     });
 
-    var raw0: [24]u8 = undefined;
-    var raw1: [24]u8 = undefined;
-    var raw2: [24]u8 = undefined;
-    const r0 = try rowAscii(&frm, 0, raw0[0..]);
-    const r1 = try rowAscii(&frm, 1, raw1[0..]);
-    const r2 = try rowAscii(&frm, 2, raw2[0..]);
-
-    // Thinking hidden by default → 3 visible blocks: one, tool, three
-    try std.testing.expect(std.mem.indexOf(u8, r0, "one") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "[tool read#c1] {}") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r2, "three") != null);
+    // Lines: two(0), gap(1), $ read(2), gap(3), three(4)
+    var raw: [24]u8 = undefined;
+    const r0 = try rowAscii(&frm, 0, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r0, "two") != null);
+    const r2 = try rowAscii(&frm, 2, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "$ read") != null);
+    const r4 = try rowAscii(&frm, 4, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r4, "three") != null);
 }
 
-test "transcript fills tool rows with background color" {
+test "transcript tool call rows have dim fg" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
     try tr.append(.{ .tool_call = .{
         .id = "x",
         .name = "ls",
-        .args = ".",
+        .args = "{\"path\":\".\"}",
     } });
 
     var frm = try frame.Frame.init(std.testing.allocator, 30, 1);
     defer frm.deinit(std.testing.allocator);
     try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 1 });
 
-    // Col 0 is padding (bg filled), col 1 has tool text
-    const c0 = try frm.cell(0, 0);
-    try std.testing.expect(frame.Color.eql(c0.style.bg, theme.get().tool_pending_bg));
+    // Tool calls now render as "$ ls ." in dim
     const c1 = try frm.cell(1, 0);
-    try std.testing.expect(frame.Color.eql(c1.style.fg, theme.get().warn));
-    try std.testing.expect(frame.Color.eql(c1.style.bg, theme.get().tool_pending_bg));
-
-    // Remaining cols should be filled with bg
-    const c_last = try frm.cell(29, 0);
-    try std.testing.expect(frame.Color.eql(c_last.style.bg, theme.get().tool_pending_bg));
+    try std.testing.expect(frame.Color.eql(c1.style.fg, theme.get().dim));
 }
 
 test "transcript text lines have no background fill" {
@@ -1172,32 +1308,40 @@ test "render with scroll offset shows earlier content" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
-    // 4 single-line blocks, viewport of 2 rows
+    // 4 single-line blocks + 3 gaps = 7 lines total
     try tr.append(.{ .text = "AAA" });
     try tr.userText("BBB");
     try tr.userText("CCC");
     try tr.userText("DDD");
 
-    // At bottom (scroll_off=0): should show CCC, DDD
-    var frm = try frame.Frame.init(std.testing.allocator, 20, 2);
+    // At bottom (scroll_off=0) with 3-row viewport: gap, DDD (last 2 of 7)
+    // Use 3 rows to see: CCC, gap, DDD
+    var frm = try frame.Frame.init(std.testing.allocator, 20, 3);
     defer frm.deinit(std.testing.allocator);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 2 });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
 
-    var raw0: [20]u8 = undefined;
-    var raw1: [20]u8 = undefined;
-    var r0 = try rowAscii(&frm, 0, raw0[0..]);
-    var r1 = try rowAscii(&frm, 1, raw1[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r0, "CCC") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "DDD") != null);
+    var raw: [20]u8 = undefined;
+    {
+        const r0 = try rowAscii(&frm, 0, raw[0..]);
+        try std.testing.expect(std.mem.indexOf(u8, r0, "CCC") != null);
+    }
+    {
+        const r2 = try rowAscii(&frm, 2, raw[0..]);
+        try std.testing.expect(std.mem.indexOf(u8, r2, "DDD") != null);
+    }
 
-    // Scroll up 2 lines: should show AAA, BBB
-    tr.scrollUp(2);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 2 });
+    // Scroll up 4 lines: show AAA, gap, BBB from top
+    tr.scrollUp(4);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
 
-    r0 = try rowAscii(&frm, 0, raw0[0..]);
-    r1 = try rowAscii(&frm, 1, raw1[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r0, "AAA") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "BBB") != null);
+    {
+        const r0 = try rowAscii(&frm, 0, raw[0..]);
+        try std.testing.expect(std.mem.indexOf(u8, r0, "AAA") != null);
+    }
+    {
+        const r2 = try rowAscii(&frm, 2, raw[0..]);
+        try std.testing.expect(std.mem.indexOf(u8, r2, "BBB") != null);
+    }
 }
 
 test "show_tools hides tool blocks" {
@@ -1209,24 +1353,25 @@ test "show_tools hides tool blocks" {
     try tr.append(.{ .tool_result = .{ .id = "c1", .out = "ok", .is_err = false } });
     try tr.append(.{ .text = "bye" });
 
-    // 4 blocks visible by default
-    var frm = try frame.Frame.init(std.testing.allocator, 30, 4);
+    // 4 blocks + 3 gaps = 7 lines visible by default
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 7);
     defer frm.deinit(std.testing.allocator);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 4 });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 7 });
     var raw: [30]u8 = undefined;
-    const r1 = try rowAscii(&frm, 1, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "[tool") != null);
+    // hello, gap, $ read, gap, ok, gap, bye
+    const r2 = try rowAscii(&frm, 2, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "$ read") != null);
 
-    // Hide tools
+    // Hide tools: 2 blocks (hello, bye) + 1 gap = 3 lines
     tr.show_tools = false;
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 4 });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 7 });
     const r0h = try rowAscii(&frm, 0, raw[0..]);
     try std.testing.expect(std.mem.indexOf(u8, r0h, "hello") != null);
-    const r1h = try rowAscii(&frm, 1, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1h, "bye") != null);
+    const r2h = try rowAscii(&frm, 2, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2h, "bye") != null);
 }
 
-test "thinking hidden by default, visible when toggled" {
+test "thinking visible by default, hidden when toggled" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
@@ -1234,30 +1379,29 @@ test "thinking hidden by default, visible when toggled" {
     try tr.append(.{ .thinking = "deep reasoning here" });
     try tr.append(.{ .text = "after" });
 
-    // Default: show_thinking=false → thinking block completely hidden
-    var frm = try frame.Frame.init(std.testing.allocator, 20, 2);
+    // Default: show_thinking=true → 3 blocks + 2 gaps = 5 lines
+    // h=5 shows all: before, gap, deep reasoning, gap, after
+    var frm = try frame.Frame.init(std.testing.allocator, 40, 5);
     defer frm.deinit(std.testing.allocator);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 2 });
-
-    var raw: [20]u8 = undefined;
-    const r0 = try rowAscii(&frm, 0, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r0, "before") != null);
-    const r1 = try rowAscii(&frm, 1, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "after") != null);
-
-    // Toggle on → thinking text visible with italic style
-    tr.show_thinking = true;
-    var frm2 = try frame.Frame.init(std.testing.allocator, 40, 3);
-    defer frm2.deinit(std.testing.allocator);
-    try tr.render(&frm2, .{ .x = 0, .y = 0, .w = 40, .h = 3 });
-    var raw2: [40]u8 = undefined;
-    const r1v = try rowAscii(&frm2, 1, raw2[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1v, "deep reasoning") != null);
-    // Expanded thinking has italic + thinking_fg
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 5 });
+    var raw: [40]u8 = undefined;
+    const r2v = try rowAscii(&frm, 2, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2v, "deep reasoning") != null);
     const t = theme.get();
-    const c_exp = try frm2.cell(1, 1);
+    const c_exp = try frm.cell(1, 2);
     try std.testing.expect(c_exp.style.italic);
     try std.testing.expect(frame.Color.eql(c_exp.style.fg, t.thinking_fg));
+
+    // Toggle off → 2 blocks + 1 gap = 3 lines: before, gap, after
+    tr.show_thinking = false;
+    var frm2 = try frame.Frame.init(std.testing.allocator, 20, 3);
+    defer frm2.deinit(std.testing.allocator);
+    try tr.render(&frm2, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
+    var raw2: [20]u8 = undefined;
+    const r0 = try rowAscii(&frm2, 0, raw2[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r0, "before") != null);
+    const r2 = try rowAscii(&frm2, 2, raw2[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "after") != null);
 }
 
 test "error block renders with err fg, bold, and error bg" {
@@ -1322,7 +1466,7 @@ test "info text has dim fg and no bg" {
     try std.testing.expect(c1.style.bg.isDefault());
 }
 
-test "tool result success has success fg and success bg" {
+test "tool result success has dim fg" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
@@ -1338,11 +1482,7 @@ test "tool result success has success fg and success bg" {
 
     const t = theme.get();
     const c1 = try frm.cell(1, 0);
-    try std.testing.expect(frame.Color.eql(c1.style.fg, t.success));
-    try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_success_bg));
-    // Full-width bg fill
-    const c_last = try frm.cell(49, 0);
-    try std.testing.expect(frame.Color.eql(c_last.style.bg, t.tool_success_bg));
+    try std.testing.expect(frame.Color.eql(c1.style.fg, t.dim));
 }
 
 test "tool result error has err fg and error bg" {
@@ -1365,24 +1505,15 @@ test "tool result error has err fg and error bg" {
     try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_error_bg));
 }
 
-test "usage and stop have dim fg" {
+test "usage and stop produce no transcript blocks" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
     try tr.append(.{ .usage = .{ .in_tok = 10, .out_tok = 20, .tot_tok = 30 } });
     try tr.append(.{ .stop = .{ .reason = .done } });
 
-    var frm = try frame.Frame.init(std.testing.allocator, 40, 2);
-    defer frm.deinit(std.testing.allocator);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 2 });
-
-    const t = theme.get();
-    // Usage line
-    const c_usage = try frm.cell(1, 0);
-    try std.testing.expect(frame.Color.eql(c_usage.style.fg, t.dim));
-    // Stop line
-    const c_stop = try frm.cell(1, 1);
-    try std.testing.expect(frame.Color.eql(c_stop.style.fg, t.dim));
+    // No blocks should be added for usage/stop events
+    try std.testing.expectEqual(@as(usize, 0), tr.count());
 }
 
 test "scroll offset clamped to max" {
@@ -1393,17 +1524,17 @@ test "scroll offset clamped to max" {
     try tr.userText("B");
     try tr.userText("C");
 
-    // 3 lines, viewport 2 => max_skip=1, scrolling up 999 should clamp
+    // 3 blocks + 2 gaps = 5 lines, viewport 3 => max_skip=2
+    // Scrolling up 999 clamps to max, showing first 3: A, gap, B
     tr.scrollUp(999);
 
-    var frm = try frame.Frame.init(std.testing.allocator, 10, 2);
+    var frm = try frame.Frame.init(std.testing.allocator, 10, 3);
     defer frm.deinit(std.testing.allocator);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 10, .h = 2 });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 10, .h = 3 });
 
-    var raw0: [10]u8 = undefined;
-    var raw1: [10]u8 = undefined;
-    const r0 = try rowAscii(&frm, 0, raw0[0..]);
-    const r1 = try rowAscii(&frm, 1, raw1[0..]);
+    var raw: [10]u8 = undefined;
+    const r0 = try rowAscii(&frm, 0, raw[0..]);
     try std.testing.expect(std.mem.indexOf(u8, r0, "A") != null);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "B") != null);
+    const r2 = try rowAscii(&frm, 2, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "B") != null);
 }

@@ -27,6 +27,10 @@ pub const Client = struct {
         self.auth.deinit();
     }
 
+    pub fn isSub(self: *const Client) bool {
+        return self.auth.auth == .oauth;
+    }
+
     pub fn asProvider(self: *Client) providers.Provider {
         return providers.Provider.from(Client, self, Client.start);
     }
@@ -34,6 +38,74 @@ pub const Client = struct {
     const max_retries = 3;
     const base_delay_ms = 2000;
     const max_delay_ms = 60000;
+
+    /// Proactive pre-request refresh: if token looks expired, try refreshing.
+    /// Failure is non-fatal — the 401 retry handler will surface real errors.
+    fn tryProactiveRefresh(self: *Client, ar: std.mem.Allocator) void {
+        if (self.auth.auth != .oauth) return;
+        const now = std.time.milliTimestamp();
+        if (now < self.auth.auth.oauth.expires) return;
+        if (self.refreshAuth(ar)) |_| {} else |err| {
+            std.debug.print("warning: proactive token refresh failed: {s}\n", .{@errorName(err)});
+        }
+    }
+
+    /// Refresh OAuth token. Tries refresh endpoint first, then reloads from
+    /// disk (another process may have refreshed).
+    fn refreshAuth(self: *Client, ar: std.mem.Allocator) !void {
+        const old = self.auth.auth.oauth;
+
+        // Try refresh endpoint
+        if (auth_mod.refreshOAuth(ar, old)) |new_oauth| {
+            const auth_ar = self.auth.arena.allocator();
+            const new_access = try auth_ar.dupe(u8, new_oauth.access);
+            const new_refresh = try auth_ar.dupe(u8, new_oauth.refresh);
+            ar.free(new_oauth.access);
+            ar.free(new_oauth.refresh);
+            self.auth.auth = .{ .oauth = .{
+                .access = new_access,
+                .refresh = new_refresh,
+                .expires = new_oauth.expires,
+            } };
+            return;
+        } else |_| {}
+
+        // Refresh failed — reload from disk (another instance may have refreshed)
+        var reloaded = auth_mod.load(self.alloc) catch return error.RefreshFailed;
+        switch (reloaded.auth) {
+            .oauth => |oauth| {
+                const now = std.time.milliTimestamp();
+                if (now < oauth.expires) {
+                    // Disk has a valid token — swap
+                    self.auth.deinit();
+                    self.auth = reloaded;
+                    return;
+                }
+            },
+            else => {},
+        }
+        reloaded.deinit();
+        return error.RefreshFailed;
+    }
+
+    fn buildAuthHeaders(self: *Client, ar: std.mem.Allocator) !std.ArrayListUnmanaged(std.http.Header) {
+        var hdrs = std.ArrayListUnmanaged(std.http.Header){};
+        try hdrs.append(ar, .{ .name = "content-type", .value = "application/json" });
+        try hdrs.append(ar, .{ .name = "anthropic-version", .value = api_version });
+
+        switch (self.auth.auth) {
+            .oauth => |oauth| {
+                const bearer = try std.fmt.allocPrint(ar, "Bearer {s}", .{oauth.access});
+                try hdrs.append(ar, .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" });
+                try hdrs.append(ar, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" });
+                try hdrs.append(ar, .{ .name = "authorization", .value = bearer });
+            },
+            .api_key => |key| {
+                try hdrs.append(ar, .{ .name = "x-api-key", .value = key });
+            },
+        }
+        return hdrs;
+    }
 
     fn start(self: *Client, req: providers.Req) anyerror!providers.Stream {
         const stream = try self.alloc.create(SseStream);
@@ -45,25 +117,14 @@ pub const Client = struct {
 
         const ar = stream.arena.allocator();
 
+        // Proactively refresh expired OAuth tokens (best-effort: 401 handler retries)
+        self.tryProactiveRefresh(ar);
+
         // Build request body
         const body = try buildBody(ar, req);
 
         // Auth headers
-        var hdrs = std.ArrayListUnmanaged(std.http.Header){};
-        try hdrs.append(ar, .{ .name = "content-type", .value = "application/json" });
-        try hdrs.append(ar, .{ .name = "anthropic-version", .value = api_version });
-
-        switch (self.auth.auth) {
-            .oauth => |token| {
-                const bearer = try std.fmt.allocPrint(ar, "Bearer {s}", .{token});
-                try hdrs.append(ar, .{ .name = "anthropic-beta", .value = "oauth-2025-04-20" });
-                try hdrs.append(ar, .{ .name = "anthropic-dangerous-direct-browser-access", .value = "true" });
-                try hdrs.append(ar, .{ .name = "authorization", .value = bearer });
-            },
-            .api_key => |key| {
-                try hdrs.append(ar, .{ .name = "x-api-key", .value = key });
-            },
-        }
+        var hdrs = try self.buildAuthHeaders(ar);
 
         const uri = std.Uri{
             .scheme = "https",
@@ -72,6 +133,7 @@ pub const Client = struct {
         };
 
         var attempt: u32 = 0;
+        var did_refresh = false;
         while (true) : (attempt += 1) {
             stream.req = try self.http.request(.POST, uri, .{
                 .extra_headers = hdrs.items,
@@ -89,13 +151,33 @@ pub const Client = struct {
             stream.response = try stream.req.receiveHead(&stream.redir_buf);
 
             const status_int: u16 = @intFromEnum(stream.response.head.status);
+
+            // On 401 with OAuth, try refreshing token once
+            if (status_int == 401 and self.auth.auth == .oauth and !did_refresh) {
+                did_refresh = true;
+                const refreshed = if (self.refreshAuth(ar)) true else |_| false;
+                if (refreshed) {
+                    // Drain old response before retry (read failure is non-fatal: deinit closes connection)
+                    const rdr = stream.response.reader(&stream.transfer_buf);
+                    _ = rdr.allocRemaining(ar, .limited(16384)) catch |err| {
+                        std.debug.print("warning: drain failed: {s}\n", .{@errorName(err)});
+                    };
+                    stream.req.deinit();
+                    hdrs = try self.buildAuthHeaders(ar);
+                    continue;
+                }
+                // Refresh failed — fall through to show the 401 error
+            }
+
             const retryable = status_int == 429 or (status_int >= 500 and status_int < 600);
 
             if (!retryable or attempt >= max_retries) break;
 
-            // Drain response body before retry
+            // Drain response body before retry (read failure is non-fatal: deinit closes connection)
             const rdr = stream.response.reader(&stream.transfer_buf);
-            _ = rdr.allocRemaining(ar, .limited(16384)) catch {};
+            _ = rdr.allocRemaining(ar, .limited(16384)) catch |err| {
+                std.debug.print("warning: drain failed: {s}\n", .{@errorName(err)});
+            };
             stream.req.deinit();
 
             // Backoff: min(base * 2^attempt, max)
@@ -105,7 +187,13 @@ pub const Client = struct {
 
         if (stream.response.head.status != .ok) {
             stream.err_mode = true;
-            const rdr = stream.response.reader(&stream.transfer_buf);
+            var decomp: std.http.Decompress = undefined;
+            var decomp_buf: [16384]u8 = undefined;
+            const rdr = stream.response.readerDecompressing(
+                &stream.transfer_buf,
+                &decomp,
+                &decomp_buf,
+            );
             const err_body = rdr.allocRemaining(ar, .limited(16384)) catch
                 try ar.dupe(u8, "unknown error");
             const status_int: u16 = @intFromEnum(stream.response.head.status);
@@ -128,11 +216,13 @@ const SseStream = struct {
     send_buf: [1024]u8,
     transfer_buf: [16384]u8,
     redir_buf: [0]u8,
-    body_rdr: *std.Io.Reader,
+    body_rdr: ?*std.Io.Reader,
 
     // SSE state
     in_tok: u64,
     out_tok: u64,
+    cache_read: u64,
+    cache_write: u64,
     tool_id: std.ArrayListUnmanaged(u8),
     tool_name: std.ArrayListUnmanaged(u8),
     tool_args: std.ArrayListUnmanaged(u8),
@@ -151,9 +241,11 @@ const SseStream = struct {
             .send_buf = undefined,
             .transfer_buf = undefined,
             .redir_buf = .{},
-            .body_rdr = undefined,
+            .body_rdr = null,
             .in_tok = 0,
             .out_tok = 0,
+            .cache_read = 0,
+            .cache_write = 0,
             .tool_id = .{},
             .tool_name = .{},
             .tool_args = .{},
@@ -184,7 +276,11 @@ const SseStream = struct {
         _ = self.arena.reset(.retain_capacity);
 
         while (true) {
-            const line = self.body_rdr.takeDelimiter('\n') catch |err| switch (err) {
+            const rdr = self.body_rdr orelse {
+                self.done = true;
+                return null;
+            };
+            const line = rdr.takeDelimiter('\n') catch |err| switch (err) {
                 error.ReadFailed => {
                     self.done = true;
                     return null;
@@ -252,6 +348,8 @@ const SseStream = struct {
         const msg = objGet(root, "message") orelse return null;
         const usage = objGet(msg, "usage") orelse return null;
         self.in_tok = jsonU64(usage.get("input_tokens"));
+        self.cache_read = jsonU64(usage.get("cache_read_input_tokens"));
+        self.cache_write = jsonU64(usage.get("cache_creation_input_tokens"));
         return null;
     }
 
@@ -316,6 +414,8 @@ const SseStream = struct {
             .in_tok = self.in_tok,
             .out_tok = self.out_tok,
             .tot_tok = self.in_tok + self.out_tok,
+            .cache_read = self.cache_read,
+            .cache_write = self.cache_write,
         } };
         self.pending = .{ .stop = .{ .reason = mapStopReason(reason_str) } };
         self.done = true;
@@ -421,7 +521,13 @@ fn buildBody(alloc: std.mem.Allocator, req: providers.Req) ![]u8 {
     try js.write(req.model);
 
     try js.objectField("max_tokens");
-    try js.write(req.opts.max_out orelse default_max_tokens);
+    const base_max = req.opts.max_out orelse default_max_tokens;
+    // max_tokens must exceed thinking budget
+    const think_bud: u32 = if (req.opts.thinking == .budget and req.opts.thinking_budget > 0)
+        req.opts.thinking_budget
+    else
+        0;
+    try js.write(if (think_bud >= base_max) think_bud + default_max_tokens else base_max);
 
     try js.objectField("stream");
     try js.write(true);
@@ -485,26 +591,19 @@ fn buildBody(alloc: std.mem.Allocator, req: providers.Req) ![]u8 {
 }
 
 fn writeSystem(js: *std.json.Stringify, msgs: []const providers.Msg) !void {
-    // Collect system message text parts into top-level "system" field
-    var has_sys = false;
+    // Count total system text parts for cache_control on last one
+    var total: usize = 0;
     for (msgs) |msg| {
         if (msg.role != .system) continue;
         for (msg.parts) |part| {
-            switch (part) {
-                .text => {
-                    has_sys = true;
-                    break;
-                },
-                else => {},
-            }
-            if (has_sys) break;
+            if (part == .text) total += 1;
         }
-        if (has_sys) break;
     }
-    if (!has_sys) return;
+    if (total == 0) return;
 
     try js.objectField("system");
     try js.beginArray();
+    var idx: usize = 0;
     for (msgs) |msg| {
         if (msg.role != .system) continue;
         for (msg.parts) |part| {
@@ -515,6 +614,15 @@ fn writeSystem(js: *std.json.Stringify, msgs: []const providers.Msg) !void {
                     try js.write("text");
                     try js.objectField("text");
                     try js.write(text);
+                    // Mark last system block for prompt caching
+                    idx += 1;
+                    if (idx == total) {
+                        try js.objectField("cache_control");
+                        try js.beginObject();
+                        try js.objectField("type");
+                        try js.write("ephemeral");
+                        try js.endObject();
+                    }
                     try js.endObject();
                 },
                 else => {},

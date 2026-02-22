@@ -39,6 +39,7 @@ fn onWinch(_: c_int) callconv(.c) void {
 
 // -- Raw terminal mode --
 
+/// Only accessed from main thread (enableRaw/restore). Not thread-safe by design.
 var saved_termios: ?std.posix.termios = null;
 
 /// Put stdin into raw mode (disable canonical mode, echo, signal chars).
@@ -67,7 +68,9 @@ pub fn enableRaw(fd: std.posix.fd_t) bool {
 /// Restore original terminal attributes.
 pub fn restore(fd: std.posix.fd_t) void {
     if (saved_termios) |orig| {
-        std.posix.tcsetattr(fd, .FLUSH, orig) catch {};
+        std.posix.tcsetattr(fd, .FLUSH, orig) catch |err| {
+            std.debug.print("warning: terminal restore failed: {s}\n", .{@errorName(err)});
+        };
         saved_termios = null;
     }
 }

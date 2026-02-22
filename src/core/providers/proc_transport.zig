@@ -73,7 +73,9 @@ const ProcChunk = struct {
 
         child.spawn() catch |spawn_err| return mapProcErr(spawn_err);
         errdefer {
-            killAndWait(&child) catch {};
+            killAndWait(&child) catch |err| {
+                std.debug.print("warning: child cleanup failed: {s}\n", .{@errorName(err)});
+            };
         }
 
         var stdin = child.stdin orelse return error.Closed;
@@ -122,7 +124,9 @@ const ProcChunk = struct {
     fn deinit(self: *ProcChunk) void {
         if (!self.done) {
             self.stdout.close();
-            killAndWait(&self.child) catch {};
+            killAndWait(&self.child) catch |err| {
+                std.debug.print("warning: child cleanup failed: {s}\n", .{@errorName(err)});
+            };
             self.done = true;
         }
 

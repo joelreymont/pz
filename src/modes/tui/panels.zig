@@ -47,9 +47,13 @@ pub const Panels = struct {
     branch: []const u8 = "",
     usage: core.providers.Usage = .{},
     has_usage: bool = false,
+    cost_micents: u64 = 0, // cumulative cost in 1/100000 of a dollar
+    cum_tok: u64 = 0, // cumulative tokens across session
     ctx_limit: u64 = 0,
     run_state: RunState = .idle,
+    turns: u32 = 0,
     thinking_label: []const u8 = "",
+    is_sub: bool = false, // subscription (vs pay-per-token)
 
     pub const InitError = std.mem.Allocator.Error || error{InvalidUtf8};
     pub const EventError = std.mem.Allocator.Error || error{InvalidUtf8};
@@ -149,10 +153,15 @@ pub const Panels = struct {
             },
             .tool_result => |tr| try self.applyResult(tr),
             .usage => |usage| {
+                self.cost_micents +|= calcCost(self.model.items, usage);
+                self.cum_tok = usage.tot_tok;
                 self.usage = usage;
                 self.has_usage = true;
             },
-            .stop => |stop| self.run_state = mapStop(stop.reason),
+            .stop => |stop| {
+                self.run_state = mapStop(stop.reason);
+                if (stop.reason == .done or stop.reason == .max_out) self.turns += 1;
+            },
             .err => |msg| {
                 try self.setErr(msg);
                 self.run_state = .failed;
@@ -160,10 +169,9 @@ pub const Panels = struct {
         }
     }
 
-    /// Render 2-line footer matching pi layout:
-    ///   Line 1: cwd:branch • state [err]
-    ///   Line 2: ↑in ↓out [pct%/Nk]  model
-    /// All text dim unless otherwise noted.
+    /// Render footer matching pi layout:
+    ///   Line 1: dim(cwd (branch))
+    ///   Line 2: dim(↑turns ↓tok R1.2k W3.4k $0.05 (sub) 2.9%/200k (auto))  dim((prov) model • thinking)
     pub fn renderFooter(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
         if (rect.w == 0 or rect.h == 0) return;
 
@@ -174,57 +182,98 @@ pub const Panels = struct {
         const dim_st = frame.Style{ .fg = theme.get().dim };
         const y1 = rect.y;
 
-        // --- Line 1: cwd (branch) ---
+        // --- Line 1: dim(cwd (branch)) ---
         {
             var x = rect.x;
             if (self.cwd.len > 0) {
                 try writePart(frm, &x, x_end, y1, self.cwd, dim_st);
-                if (self.branch.len > 0) {
-                    try writePart(frm, &x, x_end, y1, " (", dim_st);
-                    try writePart(frm, &x, x_end, y1, self.branch, dim_st);
-                    try writePart(frm, &x, x_end, y1, ")", dim_st);
-                }
+            }
+            if (self.branch.len > 0) {
+                try writePart(frm, &x, x_end, y1, " (", dim_st);
+                try writePart(frm, &x, x_end, y1, self.branch, dim_st);
+                try writePart(frm, &x, x_end, y1, ")", dim_st);
             }
         }
 
         if (rect.h < 2) return;
         const y2 = rect.y + 1;
 
-        // --- Line 2: ↑in ↓out [pct%/Nk]   ...   model ---
+        // --- Line 2: stats on left, model on right ---
         {
             var x = rect.x;
 
-            // Left: usage stats
+            // Left: turn count + usage stats
+            if (self.turns > 0) {
+                var tb: [16]u8 = undefined;
+                const tt = fmtBuf(&tb, "{d}", .{self.turns}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, tt, dim_st);
+                try writePart(frm, &x, x_end, y2, if (self.turns == 1) " turn " else " turns ", dim_st);
+            }
             if (self.has_usage) {
-                try writePart(frm, &x, x_end, y2, "\xe2\x86\x91", dim_st);
+                try writePart(frm, &x, x_end, y2, "\xe2\x86\x91", dim_st); // ↑
                 var ib: [16]u8 = undefined;
-                const it = fmtBuf(&ib, "{d}", .{self.usage.in_tok}) catch return error.NoSpaceLeft;
+                const it = fmtCompact(&ib, self.usage.in_tok) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, it, dim_st);
 
-                try writePart(frm, &x, x_end, y2, " \xe2\x86\x93", dim_st);
+                try writePart(frm, &x, x_end, y2, " \xe2\x86\x93", dim_st); // ↓
                 var ob: [16]u8 = undefined;
-                const ot = fmtBuf(&ob, "{d}", .{self.usage.out_tok}) catch return error.NoSpaceLeft;
+                const ot = fmtCompact(&ob, self.usage.out_tok) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, ot, dim_st);
 
+                // R/W cache tokens
+                if (self.usage.cache_read > 0) {
+                    try writePart(frm, &x, x_end, y2, " R", dim_st);
+                    var rb: [16]u8 = undefined;
+                    const rt = fmtCompact(&rb, self.usage.cache_read) catch return error.NoSpaceLeft;
+                    try writePart(frm, &x, x_end, y2, rt, dim_st);
+                }
+                if (self.usage.cache_write > 0) {
+                    try writePart(frm, &x, x_end, y2, " W", dim_st);
+                    var wb: [16]u8 = undefined;
+                    const wt = fmtCompact(&wb, self.usage.cache_write) catch return error.NoSpaceLeft;
+                    try writePart(frm, &x, x_end, y2, wt, dim_st);
+                }
+
+                // Cost: $N.NNN
+                if (self.cost_micents > 0) {
+                    var cb: [16]u8 = undefined;
+                    const ct = fmtCost(&cb, self.cost_micents) catch return error.NoSpaceLeft;
+                    try writePart(frm, &x, x_end, y2, " $", dim_st);
+                    try writePart(frm, &x, x_end, y2, ct, dim_st);
+                }
+                // Subscription indicator
+                if (self.is_sub) {
+                    try writePart(frm, &x, x_end, y2, " (sub)", dim_st);
+                }
+
                 if (self.ctx_limit > 0) {
-                    const pct = self.usage.tot_tok * 100 / self.ctx_limit;
+                    // Decimal percent: N.N%
+                    const pct_x10 = self.cum_tok *| 1000 / self.ctx_limit;
+                    const pct = pct_x10 / 10;
                     const pct_fg = if (pct >= 90) theme.get().err else if (pct >= 70) theme.get().warn else theme.get().accent;
 
                     try writePart(frm, &x, x_end, y2, " ", dim_st);
-                    var pb: [8]u8 = undefined;
-                    const pt = fmtBuf(&pb, "{d}%", .{pct}) catch return error.NoSpaceLeft;
+                    var pb: [16]u8 = undefined;
+                    const pt = fmtBuf(&pb, "{d}.{d}%", .{ pct_x10 / 10, pct_x10 % 10 }) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, pt, .{ .fg = pct_fg });
                     var lb: [16]u8 = undefined;
                     const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, lt, dim_st);
+                    try writePart(frm, &x, x_end, y2, " (auto)", dim_st);
                 }
+            } else if (self.ctx_limit > 0) {
+                // No usage yet — show 0.0%/Nk (auto) like pi
+                try writePart(frm, &x, x_end, y2, "0.0%", dim_st);
+                var lb: [16]u8 = undefined;
+                const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, lt, dim_st);
+                try writePart(frm, &x, x_end, y2, " (auto)", dim_st);
             }
 
-            // Right: model • thinking-level
+            // Right: (prov) model • thinking-level
             const model_text = self.model.items;
             const prov_text = self.provider.items;
             if (model_text.len > 0) {
-                // Calculate right-side width
                 var right_cols = cpCountSlice(model_text);
                 if (prov_text.len > 0)
                     right_cols += cpCountSlice(prov_text) + 3; // "(" + prov + ") "
@@ -239,7 +288,7 @@ pub const Panels = struct {
                     }
                     try writePart(frm, &rx, x_end, y2, model_text, dim_st);
                     if (self.thinking_label.len > 0) {
-                        try writePart(frm, &rx, x_end, y2, " \xc2\xb7 ", dim_st); // " · "
+                        try writePart(frm, &rx, x_end, y2, " \xe2\x80\xa2 ", dim_st); // " • "
                         try writePart(frm, &rx, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
                     }
                 }
@@ -326,6 +375,43 @@ pub const Panels = struct {
     }
 };
 
+/// Cost in micents (1/100000 $) from usage + model name.
+/// Prices per million tokens: opus in=$15 out=$75, sonnet in=$3 out=$15, haiku in=$0.80 out=$4.
+/// Cache read: opus=$1.50, sonnet=$0.30, haiku=$0.08. Cache write: opus=$18.75, sonnet=$3.75, haiku=$1.00.
+/// Returns micents to add to cumulative total.
+fn calcCost(model: []const u8, u: core.providers.Usage) u64 {
+    // Detect model tier from name substring
+    const Rates = struct { in: u64, out: u64, cr: u64, cw: u64 };
+    const rates: Rates = if (std.mem.indexOf(u8, model, "opus") != null)
+        .{ .in = 1500, .out = 7500, .cr = 150, .cw = 1875 }
+    else if (std.mem.indexOf(u8, model, "haiku") != null)
+        .{ .in = 80, .out = 400, .cr = 8, .cw = 100 }
+    else // sonnet or unknown → sonnet rates
+        .{ .in = 300, .out = 1500, .cr = 30, .cw = 375 };
+
+    // rates in cents/MTok. micents = tokens * cents / MTok * (100000/100) = tokens * rate / 1000
+    // Use saturating math to prevent overflow on extreme token counts
+    return (u.in_tok *| rates.in +| u.out_tok *| rates.out +| u.cache_read *| rates.cr +| u.cache_write *| rates.cw) / 1000;
+}
+
+/// Format micents as "N.NNN" (dollars with 3 decimal places).
+fn fmtCost(buf: []u8, micents: u64) error{NoSpaceLeft}![]const u8 {
+    const dollars = micents / 100_000;
+    const frac = (micents % 100_000) / 100; // 3 decimal places
+    return fmtBuf(buf, "{d}.{d:0>3}", .{ dollars, frac });
+}
+
+/// Format token count compactly: 500, 1.2k, 45k, 1.5M
+fn fmtCompact(buf: []u8, n: u64) error{NoSpaceLeft}![]const u8 {
+    if (n >= 1_000_000) {
+        return fmtBuf(buf, "{d}.{d}M", .{ n / 1_000_000, (n % 1_000_000) / 100_000 });
+    } else if (n >= 1000) {
+        return fmtBuf(buf, "{d}.{d}k", .{ n / 1000, (n % 1000) / 100 });
+    } else {
+        return fmtBuf(buf, "{d}", .{n});
+    }
+}
+
 fn fmtBuf(buf: []u8, comptime fmt: []const u8, args: anytype) error{NoSpaceLeft}![]const u8 {
     return std.fmt.bufPrint(buf, fmt, args) catch return error.NoSpaceLeft;
 }
@@ -345,7 +431,7 @@ fn usageCols(self: *const Panels) usize {
     c += 1; // space
     c += 1 + digitCols(self.usage.out_tok); // ↓N
     if (self.ctx_limit > 0) {
-        const pct = self.usage.tot_tok * 100 / self.ctx_limit;
+        const pct = self.cum_tok *| 100 / self.ctx_limit;
         c += 1; // space
         c += digitCols(pct) + 1; // N%
         c += 1 + digitCols(self.ctx_limit / 1000) + 1; // /Nk
@@ -354,14 +440,8 @@ fn usageCols(self: *const Panels) usize {
 }
 
 fn cpCountSlice(text: []const u8) usize {
-    var i: usize = 0;
-    var cols: usize = 0;
-    while (i < text.len) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
-        i += n;
-        cols += 1;
-    }
-    return cols;
+    const wc = @import("wcwidth.zig");
+    return wc.strwidth(text);
 }
 
 fn runStateText(st: RunState) []const u8 {
@@ -420,14 +500,18 @@ fn ensureUtf8(text: []const u8) error{InvalidUtf8}!void {
 
 fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     if (cols == 0 or text.len == 0) return text[0..0];
+    const wc = @import("wcwidth.zig");
 
     var i: usize = 0;
     var used: usize = 0;
-    while (i < text.len and used < cols) {
+    while (i < text.len) {
         const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
-        _ = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        const w = wc.wcwidth(cp);
+        if (used + w > cols) break;
         i += n;
-        used += 1;
+        used += w;
     }
     return text[0..i];
 }
@@ -521,6 +605,7 @@ test "panels track tool lifecycle and state transitions" {
         .reason = .done,
     } });
     try std.testing.expect(ps.state() == .done);
+    try std.testing.expectEqual(@as(u32, 1), ps.turns);
 }
 
 test "panels render 2-line footer with cwd and model" {
@@ -539,7 +624,7 @@ test "panels render 2-line footer with cwd and model" {
 
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    // Line 1: "myproj:main" at col 0 with dim color
+    // Line 1: "myproj" at col 0 with dim color (no branch shown)
     try expectPrefix(&frm, 0, "myproj");
     const cwd_cell = try frm.cell(0, 0);
     try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().dim));
@@ -591,6 +676,60 @@ test "panels render footer cwd only no branch" {
     try std.testing.expectEqual(@as(u21, ' '), after.cp);
 }
 
+test "panels footer shows initial 0.0% and (auto) with ctx_limit" {
+    var ps = try Panels.initFull(std.testing.allocator, "claude", "anthropic", "~/proj", "");
+    defer ps.deinit();
+    ps.ctx_limit = 200000;
+
+    var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
+    defer frm.deinit(std.testing.allocator);
+
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
+
+    // Line 2 should have "0.0%/200k (auto)" before usage arrives
+    var found_auto = false;
+    var buf: [60]u8 = undefined;
+    const row = try rowAscii(&frm, 1, buf[0..]);
+    if (std.mem.indexOf(u8, row, "(auto)") != null) found_auto = true;
+    try std.testing.expect(found_auto);
+
+    // Should also have 0.0%
+    try std.testing.expect(std.mem.indexOf(u8, row, "0.0%") != null);
+}
+
+test "panels footer shows (auto) after usage" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "~/proj", "");
+    defer ps.deinit();
+    ps.ctx_limit = 200000;
+
+    try ps.append(.{ .usage = .{ .in_tok = 100, .out_tok = 50, .tot_tok = 1000 } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
+    defer frm.deinit(std.testing.allocator);
+
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
+
+    // Search for "(auto)" in frame row 1 (contains non-ASCII ↑↓)
+    try std.testing.expect(findAsciiSeq(&frm, 1, "(auto)"));
+}
+
+fn findAsciiSeq(frm: *const frame.Frame, y: usize, needle: []const u8) bool {
+    if (needle.len == 0) return true;
+    var x: usize = 0;
+    while (x + needle.len <= frm.w) : (x += 1) {
+        var ok = true;
+        for (needle, 0..) |ch, j| {
+            const c = frm.cell(x + j, y) catch return false;
+            if (c.cp != @as(u21, ch)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return true;
+    }
+    return false;
+}
+
 test "panels validate utf8 model and event fields" {
     const bad = [_]u8{0xff};
     try std.testing.expectError(error.InvalidUtf8, Panels.init(std.testing.allocator, bad[0..], "ok"));
@@ -620,4 +759,64 @@ test "panels render rejects out of bounds rect" {
         .w = 1,
         .h = 2,
     }));
+}
+
+test "calcCost opus pricing" {
+    const u = core.providers.Usage{ .in_tok = 1_000_000, .out_tok = 1_000_000 };
+    // opus: $15/MTok in + $75/MTok out = $90 = 9_000_000 micents
+    const cost = calcCost("claude-opus-4-6", u);
+    try std.testing.expectEqual(@as(u64, 9_000_000), cost);
+}
+
+test "calcCost sonnet pricing" {
+    const u = core.providers.Usage{ .in_tok = 1_000_000, .out_tok = 1_000_000 };
+    // sonnet: $3/MTok in + $15/MTok out = $18 = 1_800_000 micents
+    const cost = calcCost("claude-sonnet-4-6", u);
+    try std.testing.expectEqual(@as(u64, 1_800_000), cost);
+}
+
+test "calcCost includes cache_write" {
+    const u = core.providers.Usage{ .in_tok = 0, .out_tok = 0, .cache_write = 1_000_000 };
+    // sonnet cache_write: $3.75/MTok = 375 cents = 375_000 micents
+    const cost = calcCost("claude-sonnet-4-6", u);
+    try std.testing.expectEqual(@as(u64, 375_000), cost);
+}
+
+test "fmtCost formats dollars" {
+    var buf: [16]u8 = undefined;
+    // 4_600 micents = $0.046
+    const r1 = try fmtCost(&buf, 4_600);
+    try std.testing.expectEqualStrings("0.046", r1);
+    // 3_000_000 micents = $30.000
+    const r2 = try fmtCost(&buf, 3_000_000);
+    try std.testing.expectEqualStrings("30.000", r2);
+}
+
+test "panels footer shows cost and sub" {
+    var ps = try Panels.initFull(std.testing.allocator, "claude-opus-4-6", "anthropic", "~/proj", "main");
+    defer ps.deinit();
+    ps.ctx_limit = 200000;
+    ps.is_sub = true;
+
+    try ps.append(.{ .usage = .{ .in_tok = 1000, .out_tok = 200, .tot_tok = 1200 } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 80, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 80, .h = 2 });
+
+    // Should have "$" and "(sub)" in line 2
+    try std.testing.expect(findAsciiSeq(&frm, 1, "$"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, "(sub)"));
+}
+
+test "panels footer shows turn count" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
+    defer ps.deinit();
+    ps.turns = 5;
+
+    var frm = try frame.Frame.init(std.testing.allocator, 40, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 2 });
+
+    try std.testing.expect(findAsciiSeq(&frm, 1, "5 turns"));
 }

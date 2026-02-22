@@ -5,8 +5,10 @@ const mouse = @import("mouse.zig");
 pub const Ev = union(enum) {
     key: editor.Key,
     mouse: mouse.Ev,
+    paste: []const u8, // bracketed paste content
     resize: void, // SIGWINCH detected
     none: void, // timeout / no data
+    err: void, // fatal read error (EBADF, etc.)
 };
 
 pub const Reader = struct {
@@ -14,13 +16,28 @@ pub const Reader = struct {
     buf: [256]u8 = undefined,
     len: usize = 0,
     pos: usize = 0,
+    paste_buf: [65536]u8 = undefined,
+    paste_len: usize = 0,
+    in_paste: bool = false,
 
     pub fn init(fd: std.posix.fd_t) Reader {
         return .{ .fd = fd };
     }
 
+    /// Inject bytes into the read buffer (e.g. from InputWatcher stash).
+    pub fn inject(self: *Reader, data: []const u8) void {
+        self.compact();
+        const avail = self.buf.len - self.len;
+        const n = @min(data.len, avail);
+        @memcpy(self.buf[self.len..][0..n], data[0..n]);
+        self.len += n;
+    }
+
     /// Read next input event. May block up to VTIME (100ms).
     pub fn next(self: *Reader) Ev {
+        // Bracketed paste accumulation mode
+        if (self.in_paste) return self.accumulatePaste();
+
         // Try to parse from existing buffer first
         if (self.pos < self.len) {
             if (self.parseOne()) |ev| return ev;
@@ -30,7 +47,7 @@ pub const Reader = struct {
         self.compact();
         const n = std.posix.read(self.fd, self.buf[self.len..]) catch |err| switch (err) {
             error.WouldBlock => return .none,
-            else => return .none,
+            else => return .err,
         };
         if (n == 0) {
             // Lone ESC with no follow-up data → standalone ESC key
@@ -43,6 +60,47 @@ pub const Reader = struct {
         self.len += n;
 
         return self.parseOne() orelse .none;
+    }
+
+    fn accumulatePaste(self: *Reader) Ev {
+        // Accumulate paste content until \x1b[201~ (paste end)
+        while (true) {
+            // Process remaining buffer bytes
+            while (self.pos < self.len) {
+                const b = self.buf[self.pos];
+                // Check for paste end sequence: \x1b[201~
+                if (b == 0x1b) {
+                    const rem = self.len - self.pos;
+                    if (rem >= 6) {
+                        if (std.mem.eql(u8, self.buf[self.pos .. self.pos + 6], "\x1b[201~")) {
+                            self.pos += 6;
+                            self.in_paste = false;
+                            return .{ .paste = self.paste_buf[0..self.paste_len] };
+                        }
+                        // Not end marker — consume ESC as paste content
+                    } else {
+                        // ESC near buffer end — need more data to check marker
+                        break;
+                    }
+                }
+                if (self.paste_len < self.paste_buf.len) {
+                    self.paste_buf[self.paste_len] = b;
+                    self.paste_len += 1;
+                }
+                self.pos += 1;
+            }
+
+            // Need more data
+            self.compact();
+            const n = std.posix.read(self.fd, self.buf[self.len..]) catch return .err;
+            if (n == 0) {
+                // EOF during paste — return what we have
+                self.in_paste = false;
+                if (self.paste_len > 0) return .{ .paste = self.paste_buf[0..self.paste_len] };
+                return .none;
+            }
+            self.len += n;
+        }
     }
 
     fn compact(self: *Reader) void {
@@ -72,9 +130,32 @@ pub const Reader = struct {
                 self.pos += 2;
                 return .{ .key = .alt_enter };
             }
-            // ESC + other: treat ESC as standalone (alt-key, ignore for now)
+            // Alt+b / Alt+f: word movement
+            if (data[1] == 'b') {
+                self.pos += 2;
+                return .{ .key = .alt_b };
+            }
+            if (data[1] == 'f') {
+                self.pos += 2;
+                return .{ .key = .alt_f };
+            }
+            if (data[1] == 'd') {
+                self.pos += 2;
+                return .{ .key = .alt_d };
+            }
+            if (data[1] == 'y') {
+                self.pos += 2;
+                return .{ .key = .alt_y };
+            }
+            // ESC + unrecognized: emit standalone ESC
             self.pos += 1;
-            return .none;
+            return .{ .key = .esc };
+        }
+
+        // Ctrl-A
+        if (data[0] == 0x01) {
+            self.pos += 1;
+            return .{ .key = .ctrl_a };
         }
 
         // Ctrl-C
@@ -87,6 +168,12 @@ pub const Reader = struct {
         if (data[0] == 0x04) {
             self.pos += 1;
             return .{ .key = .ctrl_d };
+        }
+
+        // Ctrl-E
+        if (data[0] == 0x05) {
+            self.pos += 1;
+            return .{ .key = .ctrl_e };
         }
 
         // Ctrl-G
@@ -125,12 +212,34 @@ pub const Reader = struct {
             return .{ .key = .ctrl_t };
         }
 
+        // Ctrl-U
+        if (data[0] == 0x15) {
+            self.pos += 1;
+            return .{ .key = .ctrl_u };
+        }
+
         // Ctrl-V (paste image)
         if (data[0] == 0x16) {
             self.pos += 1;
             return .{ .key = .ctrl_v };
         }
 
+        // Ctrl-W
+        if (data[0] == 0x17) {
+            self.pos += 1;
+            return .{ .key = .ctrl_w };
+        }
+
+        // Ctrl-] (jump-to-char)
+        if (data[0] == 0x1d) {
+            self.pos += 1;
+            return .{ .key = .ctrl_close_bracket };
+        }
+        // Ctrl-Y
+        if (data[0] == 0x19) {
+            self.pos += 1;
+            return .{ .key = .ctrl_y };
+        }
         // Ctrl-Z
         if (data[0] == 0x1a) {
             self.pos += 1;
@@ -152,7 +261,13 @@ pub const Reader = struct {
             return .{ .key = .backspace };
         }
 
-        // Tab and other control chars — ignore
+        // Tab
+        if (data[0] == 0x09) {
+            self.pos += 1;
+            return .{ .key = .tab };
+        }
+
+        // Other control chars — ignore
         if (data[0] < 0x20) {
             self.pos += 1;
             return .none;
@@ -175,6 +290,14 @@ pub const Reader = struct {
     fn parseCsi(self: *Reader, data: []const u8) ?Ev {
         if (data.len < 3) return null; // need at least ESC [ X
 
+        // Bracketed paste start: ESC [ 200 ~
+        if (data.len >= 6 and std.mem.eql(u8, data[2..6], "200~")) {
+            self.pos += 6;
+            self.in_paste = true;
+            self.paste_len = 0;
+            return self.accumulatePaste();
+        }
+
         // SGR mouse: ESC [ < ...
         if (data[2] == '<') {
             if (mouse.parse(data)) |r| {
@@ -192,11 +315,11 @@ pub const Reader = struct {
         switch (data[2]) {
             'A' => {
                 self.pos += 3;
-                return .none;
+                return .{ .key = .up };
             }, // up
             'B' => {
                 self.pos += 3;
-                return .none;
+                return .{ .key = .down };
             }, // down
             'Z' => {
                 self.pos += 3;
@@ -252,18 +375,28 @@ pub const Reader = struct {
 };
 
 fn mapCsiParam(seq: []const u8) Ev {
-    // "3~" = delete, "1~"/"7~" = home, "4~"/"8~" = end
+    // "3~" = delete, "1~"/"7~" = home, "4~"/"8~" = end, "5~"/"6~" = page up/down
     if (seq.len == 2 and seq[1] == '~') {
         return switch (seq[0]) {
             '3' => .{ .key = .delete },
             '1', '7' => .{ .key = .home },
             '4', '8' => .{ .key = .end },
+            '5' => .{ .key = .page_up },
+            '6' => .{ .key = .page_down },
             else => .none,
         };
     }
     // "1;3A" = Alt+Up
     if (seq.len == 4 and std.mem.eql(u8, seq, "1;3A")) {
         return .{ .key = .alt_up };
+    }
+    // "1;5D" = Ctrl+Left, "1;5C" = Ctrl+Right
+    if (seq.len == 4 and std.mem.eql(u8, seq[0..3], "1;5")) {
+        return switch (seq[3]) {
+            'D' => .{ .key = .ctrl_left },
+            'C' => .{ .key = .ctrl_right },
+            else => .none,
+        };
     }
     // Kitty keyboard protocol: "N;Mu" where N=codepoint, M=modifiers
     if (seq.len >= 3 and seq[seq.len - 1] == 'u') {
@@ -273,18 +406,71 @@ fn mapCsiParam(seq: []const u8) Ev {
 }
 
 fn parseKittyKey(params: []const u8) ?editor.Key {
-    // Format: "codepoint;modifiers" — modifiers: 2=shift, 4=shift+ctrl (mod-1 encoding)
-    // Actually kitty uses mod-1: 2=shift, 5=ctrl, 6=shift+ctrl
+    // Format: "codepoint;modifiers" — modifiers use mod-1 encoding:
+    // 2=shift, 3=alt, 5=ctrl, 6=shift+ctrl, 7=alt+ctrl
     const sep = std.mem.indexOfScalar(u8, params, ';') orelse return null;
     const cp = std.fmt.parseInt(u21, params[0..sep], 10) catch return null;
     const mods = std.fmt.parseInt(u8, params[sep + 1 ..], 10) catch return null;
-    // mods is 1-based: actual = mods - 1. Bit 0=shift, bit 2=ctrl
     const actual = mods -| 1;
     const shift = actual & 1 != 0;
+    const alt = actual & 2 != 0;
     const ctrl = actual & 4 != 0;
 
-    // Shift+Ctrl+P (p=112, P=80)
-    if ((cp == 'p' or cp == 'P') and shift and ctrl) return .shift_ctrl_p;
+    // Shift+Ctrl combos
+    if (shift and ctrl and !alt) {
+        return switch (cp) {
+            'p', 'P' => .shift_ctrl_p,
+            'z', 'Z' => .ctrl_shift_z,
+            else => null,
+        };
+    }
+
+    // Ctrl combos
+    if (ctrl and !shift and !alt) {
+        return switch (cp) {
+            'a', 'A' => .ctrl_a,
+            'c', 'C' => .ctrl_c,
+            'd', 'D' => .ctrl_d,
+            'e', 'E' => .ctrl_e,
+            'g', 'G' => .ctrl_g,
+            'k', 'K' => .ctrl_k,
+            'l', 'L' => .ctrl_l,
+            'o', 'O' => .ctrl_o,
+            'p', 'P' => .ctrl_p,
+            't', 'T' => .ctrl_t,
+            'u', 'U' => .ctrl_u,
+            'v', 'V' => .ctrl_v,
+            'w', 'W' => .ctrl_w,
+            'y', 'Y' => .ctrl_y,
+            'z', 'Z' => .ctrl_z,
+            ']' => .ctrl_close_bracket,
+            else => null,
+        };
+    }
+
+    // Alt combos
+    if (alt and !shift and !ctrl) {
+        return switch (cp) {
+            'b', 'B' => .alt_b,
+            'd', 'D' => .alt_d,
+            'f', 'F' => .alt_f,
+            'y', 'Y' => .alt_y,
+            '\r', '\n' => .alt_enter,
+            else => null,
+        };
+    }
+
+    // Unmodified special keys via Kitty
+    if (actual == 0) {
+        return switch (cp) {
+            13 => .enter,
+            9 => .tab,
+            27 => .esc,
+            127 => .backspace,
+            else => null,
+        };
+    }
+
     return null;
 }
 
@@ -486,4 +672,117 @@ test "parse shift-ctrl-p kitty uppercase" {
     @memcpy(r.buf[0..seq.len], seq);
     r.len = seq.len;
     try expectKey(r.parseOne().?, .shift_ctrl_p);
+}
+
+test "parse bracketed paste" {
+    var r = Reader.init(-1);
+    // Full paste sequence in one buffer: ESC[200~ hello ESC[201~
+    const seq = "\x1b[200~hello\x1b[201~";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    const ev = r.parseOne() orelse return error.TestUnexpectedResult;
+    switch (ev) {
+        .paste => |text| try std.testing.expectEqualStrings("hello", text),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse bracketed paste multi-line" {
+    var r = Reader.init(-1);
+    const seq = "\x1b[200~line1\nline2\nline3\x1b[201~";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    const ev = r.parseOne() orelse return error.TestUnexpectedResult;
+    switch (ev) {
+        .paste => |text| try std.testing.expectEqualStrings("line1\nline2\nline3", text),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "parse ctrl-a ctrl-e ctrl-u ctrl-w" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x01;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_a);
+
+    r.pos = 0;
+    r.buf[0] = 0x05;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_e);
+
+    r.pos = 0;
+    r.buf[0] = 0x15;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_u);
+
+    r.pos = 0;
+    r.buf[0] = 0x17;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_w);
+}
+
+test "parse alt-b alt-f" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x1b;
+    r.buf[1] = 'b';
+    r.len = 2;
+    try expectKey(r.parseOne().?, .alt_b);
+
+    r.pos = 0;
+    r.buf[0] = 0x1b;
+    r.buf[1] = 'f';
+    r.len = 2;
+    try expectKey(r.parseOne().?, .alt_f);
+}
+
+test "parse ctrl-left ctrl-right" {
+    var r = Reader.init(-1);
+    const left = "\x1b[1;5D";
+    @memcpy(r.buf[0..left.len], left);
+    r.len = left.len;
+    try expectKey(r.parseOne().?, .ctrl_left);
+
+    r.pos = 0;
+    const right = "\x1b[1;5C";
+    @memcpy(r.buf[0..right.len], right);
+    r.len = right.len;
+    try expectKey(r.parseOne().?, .ctrl_right);
+}
+
+test "parse alt-d" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x1b;
+    r.buf[1] = 'd';
+    r.len = 2;
+    try expectKey(r.parseOne().?, .alt_d);
+}
+
+test "parse alt-y" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x1b;
+    r.buf[1] = 'y';
+    r.len = 2;
+    try expectKey(r.parseOne().?, .alt_y);
+}
+
+test "parse ctrl-y" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x19;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_y);
+}
+
+test "parse ctrl-shift-z kitty protocol" {
+    var r = Reader.init(-1);
+    const seq = "\x1b[122;6u";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    try expectKey(r.parseOne().?, .ctrl_shift_z);
+}
+
+test "parse ctrl-close-bracket" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x1d;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_close_bracket);
 }

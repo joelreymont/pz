@@ -1,12 +1,16 @@
 const std = @import("std");
 const core = @import("../../core/mod.zig");
-const editor = @import("editor.zig");
+pub const editor = @import("editor.zig");
 const mouse = @import("mouse.zig");
 const transcript = @import("transcript.zig");
 const panels = @import("panels.zig");
 const frame = @import("frame.zig");
 const render = @import("render.zig");
 const theme = @import("theme.zig");
+const overlay_mod = @import("overlay.zig");
+const cmdprev_mod = @import("cmdprev.zig");
+const pathcomp_mod = @import("pathcomp.zig");
+const imgproto_mod = @import("imgproto.zig");
 
 pub const Ui = struct {
     alloc: std.mem.Allocator,
@@ -16,6 +20,12 @@ pub const Ui = struct {
     frm: frame.Frame,
     rnd: render.Renderer,
     border_fg: frame.Color = .{ .rgb = 0x81a2be },
+    ov: ?overlay_mod.Overlay = null,
+    cp: ?cmdprev_mod.CmdPreview = null,
+    arg_src: ?[]const []const u8 = null, // runtime-provided arg completion source
+    path_items: ?[][]u8 = null, // owned file path completion items
+    img_cap: imgproto_mod.ImageCap = .none,
+    spin: u8 = 0,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -49,13 +59,16 @@ pub const Ui = struct {
 
     pub fn resize(self: *Ui, w: usize, h: usize) !void {
         if (w == self.frm.w and h == self.frm.h) return;
+        const new_frm = try frame.Frame.init(self.alloc, w, h);
+        const new_rnd = try render.Renderer.init(self.alloc, w, h);
         self.rnd.deinit();
         self.frm.deinit(self.alloc);
-        self.frm = try frame.Frame.init(self.alloc, w, h);
-        self.rnd = try render.Renderer.init(self.alloc, w, h);
+        self.frm = new_frm;
+        self.rnd = new_rnd;
     }
 
     pub fn deinit(self: *Ui) void {
+        self.clearPathItems();
         self.rnd.deinit();
         self.frm.deinit(self.alloc);
         self.pn.deinit();
@@ -64,16 +77,34 @@ pub const Ui = struct {
         self.* = undefined;
     }
 
+    pub fn clearPathItems(self: *Ui) void {
+        if (self.path_items) |items| {
+            pathcomp_mod.freeList(self.alloc, items);
+            self.path_items = null;
+        }
+    }
+
     pub fn onProvider(self: *Ui, ev: core.providers.Ev) !void {
         try self.tr.append(ev);
         try self.pn.append(ev);
+        if (ev == .stop and ev.stop.reason == .max_out) {
+            try self.tr.infoText("[max tokens reached]");
+        }
     }
 
     pub fn onKey(self: *Ui, key: editor.Key) !editor.Action {
+        // Intercept up/down for wrapped-line navigation
+        switch (key) {
+            .up => if (self.wrapUp()) return .none,
+            .down => if (self.wrapDown()) return .none,
+            else => {},
+        }
         const act = try self.ed.apply(key);
         if (act == .submit) {
-            if (self.ed.text().len != 0) {
-                try self.tr.userText(self.ed.text());
+            const t = self.ed.text();
+            if (t.len != 0) {
+                try self.ed.pushHistory(t);
+                try self.tr.userText(t);
             }
             self.ed.clear();
             self.tr.scrollToBottom();
@@ -95,11 +126,15 @@ pub const Ui = struct {
         const w = self.frm.w;
         const h = self.frm.h;
 
-        // Layout matching pi: transcript | border | editor | border | footer(2)
-        // Reserved: 2 borders + 1 editor + 2 footer = 5
+        // Layout matching pi: transcript | border | editor(1..N) | border | footer(2)
         const footer_h: usize = if (h >= 6) 2 else if (h >= 4) 1 else 0;
         const border_h: usize = if (h >= 5) 2 else 0;
-        const editor_h: usize = if (h > footer_h + border_h) 1 else 0;
+        const max_ed: usize = 8; // max editor rows
+        const ed_room = if (w > 1) w - 1 else 1; // editor display width (pad=1)
+        const wi = wrapInfo(self.ed.text(), self.ed.cursor(), ed_room);
+        const want_ed = @max(wi.rows, 1);
+        const avail_ed = if (h > footer_h + border_h + 1) h - footer_h - border_h - 1 else 1;
+        const editor_h: usize = @min(@min(want_ed, max_ed), avail_ed);
         const reserved = footer_h + border_h + editor_h;
         const tx_h = if (h > reserved) h - reserved else 0;
 
@@ -113,15 +148,17 @@ pub const Ui = struct {
         }
 
         if (border_h >= 1 and editor_h > 0) {
-            try self.drawBorder(tx_h);
+            try self.drawBorderWithStatus(tx_h);
         }
 
         if (editor_h > 0) {
-            try self.drawEditorLine(tx_h + @min(border_h, 1));
+            // Editor scroll: ensure cursor row is visible
+            const ed_scroll = if (wi.cur_row >= editor_h) wi.cur_row - editor_h + 1 else 0;
+            try self.drawEditor(tx_h + @min(border_h, 1), editor_h, ed_room, ed_scroll);
         }
 
         if (border_h >= 2) {
-            try self.drawBorder(tx_h + 1 + editor_h);
+            try self.drawBorder(tx_h + @min(border_h, 1) + editor_h);
         }
 
         if (footer_h > 0) {
@@ -133,7 +170,44 @@ pub const Ui = struct {
             });
         }
 
+        // Command preview: render below editor, overlaying lower border/footer (like pi)
+        if (self.cp) |*cp| {
+            const ed_y = tx_h + @min(border_h, 1);
+            const below = ed_y + 1; // first row below editor
+            if (below < h) {
+                try cp.renderDown(&self.frm, below, w, h);
+            }
+        }
+
+        if (self.ov) |*ov| {
+            try ov.render(&self.frm);
+        }
+
         try self.rnd.render(&self.frm, out);
+
+        // Render inline images after frame (they overlay frame cells)
+        if (self.img_cap != .none) {
+            var i: u8 = 0;
+            while (i < self.tr.img_ref_n) : (i += 1) {
+                const ref = self.tr.img_refs[i];
+                try imgproto_mod.writeImageAt(out, self.alloc, ref.path, 1, ref.y, ref.w, self.img_cap);
+            }
+        }
+
+        // Position hardware cursor on editor
+        if (editor_h > 0 and self.ov == null and w > 1) {
+            const pad: usize = 1;
+            const ed_y_base = tx_h + @min(border_h, 1);
+            const ed_scroll = if (wi.cur_row >= editor_h) wi.cur_row - editor_h + 1 else 0;
+            const vis_row = wi.cur_row - ed_scroll;
+            var cup: [16]u8 = undefined;
+            const seq = std.fmt.bufPrint(&cup, "\x1b[{};{}H", .{ ed_y_base + vis_row + 1, pad + wi.cur_col + 1 }) catch
+                return error.Overflow;
+            try out.writeAll(seq);
+            try out.writeAll("\x1b[?25h"); // show cursor
+        } else {
+            try out.writeAll("\x1b[?25l"); // hide cursor
+        }
     }
 
     pub fn editorText(self: *const Ui) []const u8 {
@@ -146,6 +220,57 @@ pub const Ui = struct {
 
     pub fn setProvider(self: *Ui, provider: []const u8) !void {
         try self.pn.setProvider(provider);
+    }
+
+    /// Try moving cursor up in wrapped text. Returns true if handled.
+    pub fn wrapUp(self: *Ui) bool {
+        const width = if (self.frm.w > 1) self.frm.w - 1 else 1;
+        const wi = wrapInfo(self.ed.text(), self.ed.cursor(), width);
+        if (wi.rows <= 1 or wi.cur_row == 0) return false;
+        self.ed.cur = wrapRowCol(self.ed.text(), wi.cur_row - 1, wi.cur_col, width);
+        return true;
+    }
+
+    /// Try moving cursor down in wrapped text. Returns true if handled.
+    pub fn wrapDown(self: *Ui) bool {
+        const width = if (self.frm.w > 1) self.frm.w - 1 else 1;
+        const wi = wrapInfo(self.ed.text(), self.ed.cursor(), width);
+        if (wi.rows <= 1 or wi.cur_row >= wi.rows - 1) return false;
+        self.ed.cur = wrapRowCol(self.ed.text(), wi.cur_row + 1, wi.cur_col, width);
+        return true;
+    }
+
+    pub fn updatePreview(self: *Ui) void {
+        self.cp = null;
+        self.clearPathItems();
+
+        const text = self.ed.text();
+        if (text.len > 0 and text[0] == '/') {
+            const prefix = text[1..];
+            if (std.mem.indexOfScalar(u8, prefix, ' ')) |sp| {
+                if (self.arg_src) |src| {
+                    const arg = std.mem.trim(u8, prefix[sp + 1 ..], " \t");
+                    self.cp = cmdprev_mod.CmdPreview.updateArgs(src, arg);
+                }
+            } else {
+                self.cp = cmdprev_mod.CmdPreview.update(prefix);
+            }
+        } else if (text.len > 0) {
+            // Check for @ mention in last word
+            const cur = self.ed.cursor();
+            const ws = lastWordStart(text, cur);
+            const word = text[ws..cur];
+            if (word.len > 0 and word[0] == '@') {
+                const pattern = word[1..];
+                if (pathcomp_mod.list(self.alloc, pattern)) |items| {
+                    self.path_items = items;
+                    self.cp = cmdprev_mod.CmdPreview.updateArgs(
+                        pathcomp_mod.asConst(items),
+                        pattern,
+                    );
+                }
+            }
+        }
     }
 
     pub fn clearTranscript(self: *Ui) void {
@@ -166,22 +291,242 @@ pub const Ui = struct {
     }
 
     fn drawBorder(self: *Ui, y: usize) !void {
-        const st = frame.Style{ .fg = self.border_fg };
+        try self.drawBorderPlain(y, null);
+    }
+
+    const spin_chars = [_]u21{ 0x280B, 0x2819, 0x2839, 0x2838, 0x283C, 0x2834, 0x2826, 0x2827, 0x2807, 0x280F };
+
+    fn drawBorderWithStatus(self: *Ui, y: usize) !void {
+        const active = self.pn.run_state == .streaming or self.pn.run_state == .tool;
+        if (active) self.spin +%= 1;
+        var lbl_buf: [48]u8 = undefined;
+        const label: ?[]const u8 = switch (self.pn.run_state) {
+            .streaming, .tool => blk: {
+                const prefix: []const u8 = if (self.pn.run_state == .tool) " running tool " else " streaming ";
+                const sc = spin_chars[self.spin % spin_chars.len];
+                break :blk std.fmt.bufPrint(&lbl_buf, "{s}{u} ", .{ prefix, sc }) catch prefix;
+            },
+            .canceled => " canceled ",
+            .failed => " error ",
+            else => null,
+        };
+        try self.drawBorderPlain(y, label);
+    }
+
+    fn drawBorderPlain(self: *Ui, y: usize, label: ?[]const u8) !void {
+        const bst = frame.Style{ .fg = self.border_fg };
         var x: usize = 0;
         while (x < self.frm.w) : (x += 1) {
-            try self.frm.set(x, y, 0x2500, st); // ─
+            try self.frm.set(x, y, 0x2500, bst); // ─
+        }
+        if (label) |lbl| {
+            const t = theme.get();
+            const fg = switch (self.pn.run_state) {
+                .streaming, .tool => t.accent,
+                .canceled => t.warn,
+                .failed => t.err,
+                else => t.dim,
+            };
+            const lst = frame.Style{ .fg = fg };
+            _ = try self.frm.write(1, y, lbl, lst);
         }
     }
 
-    fn drawEditorLine(self: *Ui, y: usize) !void {
-        // pi: 1-col left padding, no prompt character
+    fn drawEditor(self: *Ui, y_base: usize, rows: usize, width: usize, scroll: usize) !void {
         const pad: usize = 1;
-        if (self.frm.w <= pad) return;
-        const room = self.frm.w - pad;
-        const txt = try clipCols(self.ed.text(), room);
-        _ = try self.frm.write(pad, y, txt, .{});
+        if (self.frm.w <= pad or rows == 0) return;
+        const text = self.ed.text();
+        const wcw = @import("wcwidth.zig").wcwidth;
+
+        // Walk text, tracking wrapped rows
+        var row: usize = 0;
+        var col: usize = 0;
+        var i: usize = 0;
+        var vis_row: usize = 0;
+        while (i < text.len and vis_row < rows) {
+            const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+            if (i + n > text.len) break;
+            const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
+            if (cp == '\n') {
+                row += 1;
+                col = 0;
+                i += n;
+                if (row >= scroll) vis_row = row - scroll;
+                continue;
+            }
+            const cw = wcw(cp);
+            if (col + cw > width) {
+                row += 1;
+                col = 0;
+            }
+            if (row >= scroll and row < scroll + rows) {
+                vis_row = row - scroll;
+                try self.frm.set(pad + col, y_base + vis_row, cp, .{});
+            }
+            col += cw;
+            i += n;
+        }
     }
 };
+
+/// Find start of the word containing cursor position.
+fn lastWordStart(text: []const u8, cur: usize) usize {
+    var i = cur;
+    while (i > 0 and text[i - 1] != ' ' and text[i - 1] != '\n' and text[i - 1] != '\t') i -= 1;
+    return i;
+}
+
+/// Wrapped-line info for cursor positioning and rendering.
+const WrapInfo = struct {
+    rows: usize, // total display rows
+    cur_row: usize, // cursor's row (0-based)
+    cur_col: usize, // cursor's column within its row
+};
+
+/// Compute wrap info for text at given display width.
+fn wrapInfo(text: []const u8, byte_pos: usize, width: usize) WrapInfo {
+    if (width == 0) return .{ .rows = 1, .cur_row = 0, .cur_col = 0 };
+    const wcw = @import("wcwidth.zig").wcwidth;
+    var row: usize = 0;
+    var col: usize = 0;
+    var cur_row: usize = 0;
+    var cur_col: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (i == byte_pos) {
+            cur_row = row;
+            cur_col = col;
+        }
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + n > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
+        if (cp == '\n') {
+            row += 1;
+            col = 0;
+            i += n;
+            continue;
+        }
+        const cw = wcw(cp);
+        if (col + cw > width) {
+            row += 1;
+            col = 0;
+        }
+        col += cw;
+        i += n;
+    }
+    if (byte_pos >= text.len) {
+        cur_row = row;
+        cur_col = col;
+    }
+    return .{ .rows = row + 1, .cur_row = cur_row, .cur_col = cur_col };
+}
+
+/// Find byte offset at start of a given wrapped row.
+fn wrapRowStart(text: []const u8, target_row: usize, width: usize) usize {
+    if (width == 0 or target_row == 0) return 0;
+    const wcw = @import("wcwidth.zig").wcwidth;
+    var row: usize = 0;
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (row == target_row) return i;
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + n > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
+        if (cp == '\n') {
+            row += 1;
+            col = 0;
+            i += n;
+            continue;
+        }
+        const cw = wcw(cp);
+        if (col + cw > width) {
+            row += 1;
+            col = 0;
+            if (row == target_row) return i;
+        }
+        col += cw;
+        i += n;
+    }
+    return i;
+}
+
+/// Find byte offset for a given (row, col) in wrapped text.
+fn wrapRowCol(text: []const u8, target_row: usize, target_col: usize, width: usize) usize {
+    if (width == 0) return 0;
+    const wcw = @import("wcwidth.zig").wcwidth;
+    var row: usize = 0;
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < text.len) {
+        if (row == target_row and col >= target_col) return i;
+        if (row > target_row) return i;
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + n > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
+        if (cp == '\n') {
+            if (row == target_row) return i; // at end of target row
+            row += 1;
+            col = 0;
+            i += n;
+            continue;
+        }
+        const cw = wcw(cp);
+        if (col + cw > width) {
+            row += 1;
+            col = 0;
+            if (row == target_row and col >= target_col) return i;
+            if (row > target_row) return i;
+        }
+        col += cw;
+        i += n;
+    }
+    return i;
+}
+
+fn cursorCol(text: []const u8, byte_pos: usize) usize {
+    const wcwidth = @import("wcwidth.zig").wcwidth;
+    var i: usize = 0;
+    var col: usize = 0;
+    while (i < byte_pos and i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + n > text.len) break;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
+        col += wcwidth(cp);
+        i += n;
+    }
+    return col;
+}
+
+fn viewportSlice(text: []const u8, skip_cols: usize, cols: usize) error{InvalidUtf8}![]const u8 {
+    if (cols == 0 or text.len == 0) return text[0..0];
+    const wcwidth = @import("wcwidth.zig").wcwidth;
+    var i: usize = 0;
+    var col: usize = 0;
+
+    // Skip `skip_cols` columns
+    while (i < text.len and col < skip_cols) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        col += wcwidth(cp);
+        i += n;
+    }
+    const start = i;
+
+    // Take `cols` columns
+    var used: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        const w: usize = wcwidth(cp);
+        if (used + w > cols) break;
+        i += n;
+        used += w;
+    }
+    return text[start..i];
+}
 
 fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     if (cols == 0 or text.len == 0) return text[0..0];
@@ -191,6 +536,7 @@ fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     var used: usize = 0;
     while (i < text.len) {
         const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
         const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
         const w: usize = wcwidth(cp);
         if (used + w > cols) break;
@@ -318,4 +664,89 @@ test "harness resize to same size is noop" {
     var out = TestBuf.init(raw[0..]);
     try ui.draw(&out);
     try std.testing.expect(out.view().len != 0);
+}
+
+test "wrapInfo single line" {
+    const wi = wrapInfo("hello", 5, 20);
+    try std.testing.expectEqual(@as(usize, 1), wi.rows);
+    try std.testing.expectEqual(@as(usize, 0), wi.cur_row);
+    try std.testing.expectEqual(@as(usize, 5), wi.cur_col);
+}
+
+test "wrapInfo wraps at width" {
+    // "abcde" with width 3 → wraps: "abc" + "de"
+    const wi = wrapInfo("abcde", 4, 3);
+    try std.testing.expectEqual(@as(usize, 2), wi.rows);
+    try std.testing.expectEqual(@as(usize, 1), wi.cur_row); // 'd' on second row
+    try std.testing.expectEqual(@as(usize, 1), wi.cur_col);
+}
+
+test "wrapInfo with newline" {
+    const wi = wrapInfo("ab\ncd", 4, 10);
+    try std.testing.expectEqual(@as(usize, 2), wi.rows);
+    try std.testing.expectEqual(@as(usize, 1), wi.cur_row);
+    try std.testing.expectEqual(@as(usize, 1), wi.cur_col);
+}
+
+test "wrapRowCol maps target position" {
+    // "abcde" width 3 → row0: "abc", row1: "de"
+    const pos = wrapRowCol("abcde", 1, 0, 3);
+    try std.testing.expectEqual(@as(usize, 3), pos); // byte 3 = 'd'
+}
+
+test "wrapUp and wrapDown navigate wrapped lines" {
+    var ui = try Ui.init(std.testing.allocator, 6, 10, "m", "p");
+    defer ui.deinit();
+
+    // "abcdef" with width 5 (pad=1) → "abcde" + "f" → 2 rows
+    try ui.ed.setText("abcdef");
+    ui.ed.cur = 6; // end
+
+    // wrapUp should move to first row
+    try std.testing.expect(ui.wrapUp());
+    try std.testing.expect(ui.ed.cur < 6);
+
+    // wrapDown should move back
+    try std.testing.expect(ui.wrapDown());
+
+    // wrapDown at last row returns false (history)
+    try std.testing.expect(!ui.wrapDown());
+}
+
+test "updatePreview shows file dropdown on @" {
+    var ui = try Ui.init(std.testing.allocator, 40, 10, "m", "p");
+    defer ui.deinit();
+
+    // Type "@src/" — should trigger file completion
+    try ui.ed.setText("@src/");
+    ui.updatePreview();
+    try std.testing.expect(ui.cp != null);
+    try std.testing.expect(ui.path_items != null);
+    try std.testing.expect(ui.path_items.?.len > 0);
+}
+
+test "updatePreview clears on no @" {
+    var ui = try Ui.init(std.testing.allocator, 40, 10, "m", "p");
+    defer ui.deinit();
+
+    try ui.ed.setText("hello");
+    ui.updatePreview();
+    try std.testing.expect(ui.cp == null);
+    try std.testing.expect(ui.path_items == null);
+}
+
+test "updatePreview slash overrides file mode" {
+    var ui = try Ui.init(std.testing.allocator, 40, 10, "m", "p");
+    defer ui.deinit();
+
+    try ui.ed.setText("/help");
+    ui.updatePreview();
+    try std.testing.expect(ui.cp != null);
+    try std.testing.expect(ui.path_items == null); // not file mode
+}
+
+test "lastWordStart finds word boundary" {
+    try std.testing.expectEqual(@as(usize, 6), lastWordStart("hello @src/", 11));
+    try std.testing.expectEqual(@as(usize, 0), lastWordStart("@src/", 5));
+    try std.testing.expectEqual(@as(usize, 4), lastWordStart("foo @", 5));
 }
