@@ -82,20 +82,27 @@ test "e2e text + thinking + text" {
     try renderToVs(&ui, &vs);
 
     // h=8: tx_h=3 (rows 0..2), border 3, editor 4, border 5, footer 6-7
-    var found_thinking = false;
+    // Thinking hidden by default → collapsed "Thinking..." label with italic style
+    var found_label = false;
     var r: usize = 0;
     while (r < 3) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
-        if (std.mem.indexOf(u8, row, "[thinking]") != null) {
-            // Content at col 1 due to 1-col left padding
+        if (std.mem.indexOf(u8, row, "Thinking...") != null) {
             try vs.expectItalic(r, 1, true);
             try vs.expectFg(r, 1, .{ .rgb = 0x808080 });
-            found_thinking = true;
+            found_label = true;
             break;
         }
     }
-    try std.testing.expect(found_thinking);
+    try std.testing.expect(found_label);
+    // Full thinking content should NOT appear
+    r = 0;
+    while (r < 3) : (r += 1) {
+        const row = try vs.rowText(std.testing.allocator, r);
+        defer std.testing.allocator.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "analyzing the problem") == null);
+    }
 }
 
 test "e2e tool call and result" {
@@ -274,11 +281,11 @@ test "e2e editor border visible" {
     try renderToVs(&ui, &vs);
 
     // h=8: tx_h=3, border row 3, editor row 4, border row 5, footer 6-7
-    // Border should be ─ (U+2500) in thinking_high color
+    // Border should be ─ (U+2500) in default border_fg (thinking_med / adaptive)
     try vs.expectText(3, 0, "\xe2\x94\x80"); // ─
-    try vs.expectFg(3, 0, .{ .rgb = 0xb294bb }); // theme.thinking_high
+    try vs.expectFg(3, 0, .{ .rgb = 0x81a2be }); // thinking_med (adaptive default)
     try vs.expectText(5, 0, "\xe2\x94\x80"); // bottom border too
-    try vs.expectFg(5, 0, .{ .rgb = 0xb294bb });
+    try vs.expectFg(5, 0, .{ .rgb = 0x81a2be });
 }
 
 test "e2e footer visible at bottom" {

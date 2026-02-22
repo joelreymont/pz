@@ -54,7 +54,7 @@ pub const Transcript = struct {
     md: markdown.MdRenderer = .{},
     scroll_off: usize = 0,
     show_tools: bool = true,
-    show_thinking: bool = true,
+    show_thinking: bool = false,
 
     pub fn scrollUp(self: *Transcript, n: usize) void {
         self.scroll_off +|= n;
@@ -173,7 +173,7 @@ pub const Transcript = struct {
         var total: usize = 0;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
-            total += countLines(b.text(), avail_w);
+            total += countLines(self.blockDisplayText(b), avail_w);
         }
         if (total == 0) return;
 
@@ -186,7 +186,7 @@ pub const Transcript = struct {
             total = 0;
             for (self.blocks.items) |*b| {
                 if (!self.blockVisible(b)) continue;
-                total += countLines(b.text(), text_w);
+                total += countLines(self.blockDisplayText(b), text_w);
             }
         }
 
@@ -205,7 +205,7 @@ pub const Transcript = struct {
         var md = markdown.MdRenderer{};
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
-            const txt = b.text();
+            const txt = self.blockDisplayText(b);
             const use_md = b.kind == .text;
             if (use_md) md = .{};
             var wit = wrapIter(txt, text_w);
@@ -265,10 +265,16 @@ pub const Transcript = struct {
         }
     }
 
+    const thinking_label = "Thinking...";
+
     fn blockVisible(self: *const Transcript, b: *const Block) bool {
         if (!self.show_tools and b.kind == .tool) return false;
-        if (!self.show_thinking and b.kind == .thinking) return false;
         return true;
+    }
+
+    fn blockDisplayText(self: *const Transcript, b: *const Block) []const u8 {
+        if (!self.show_thinking and b.kind == .thinking) return thinking_label;
+        return b.text();
     }
 
     fn pushBlock(self: *Transcript, kind: Kind, t: []const u8, st: frame.Style) AppendError!void {
@@ -770,7 +776,8 @@ test "transcript appends provider events and renders fixed-height tail" {
     const r1 = try rowAscii(&frm, 1, raw1[0..]);
     const r2 = try rowAscii(&frm, 2, raw2[0..]);
 
-    try std.testing.expect(std.mem.indexOf(u8, r0, "[thinking] two") != null);
+    // Thinking hidden by default → collapsed "Thinking..." label
+    try std.testing.expect(std.mem.indexOf(u8, r0, "Thinking...") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1, "[tool read#c1] {}") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "three") != null);
 }
@@ -1180,15 +1187,15 @@ test "show_tools hides tool blocks" {
     try std.testing.expect(std.mem.indexOf(u8, r1h, "bye") != null);
 }
 
-test "show_thinking hides thinking blocks" {
+test "thinking collapsed by default shows label with style" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
     try tr.append(.{ .text = "before" });
-    try tr.append(.{ .thinking = "hmm" });
+    try tr.append(.{ .thinking = "deep reasoning here" });
     try tr.append(.{ .text = "after" });
 
-    tr.show_thinking = false;
+    // Default: show_thinking=false → collapsed label
     var frm = try frame.Frame.init(std.testing.allocator, 20, 3);
     defer frm.deinit(std.testing.allocator);
     try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
@@ -1197,10 +1204,156 @@ test "show_thinking hides thinking blocks" {
     const r0 = try rowAscii(&frm, 0, raw[0..]);
     try std.testing.expect(std.mem.indexOf(u8, r0, "before") != null);
     const r1 = try rowAscii(&frm, 1, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "after") != null);
-    // Row 2 should be blank
+    try std.testing.expect(std.mem.indexOf(u8, r1, "Thinking...") != null);
+    // Full content NOT shown
+    try std.testing.expect(std.mem.indexOf(u8, r1, "deep reasoning") == null);
+
+    // Verify style: collapsed thinking label has italic + thinking_fg
+    const t = theme.get();
+    const c_think = try frm.cell(1, 1); // col 1 = first char after padding
+    try std.testing.expect(c_think.style.italic);
+    try std.testing.expect(frame.Color.eql(c_think.style.fg, t.thinking_fg));
+
     const r2 = try rowAscii(&frm, 2, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r2, "thinking") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "after") != null);
+
+    // Toggle on → full content visible with italic style
+    tr.show_thinking = true;
+    var frm2 = try frame.Frame.init(std.testing.allocator, 40, 3);
+    defer frm2.deinit(std.testing.allocator);
+    try tr.render(&frm2, .{ .x = 0, .y = 0, .w = 40, .h = 3 });
+    var raw2: [40]u8 = undefined;
+    const r1v = try rowAscii(&frm2, 1, raw2[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r1v, "[thinking]") != null);
+    // Expanded thinking also has italic + thinking_fg
+    const c_exp = try frm2.cell(1, 1);
+    try std.testing.expect(c_exp.style.italic);
+    try std.testing.expect(frame.Color.eql(c_exp.style.fg, t.thinking_fg));
+}
+
+test "error block renders with err fg, bold, and error bg" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .err = "rate limit exceeded" });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 40, 1);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 1 });
+
+    const t = theme.get();
+    // Col 0 = padding with bg fill
+    const c0 = try frm.cell(0, 0);
+    try std.testing.expect(frame.Color.eql(c0.style.bg, t.tool_error_bg));
+    // Col 1 = first text char with err fg + bold + error bg
+    const c1 = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c1.style.fg, t.err));
+    try std.testing.expect(c1.style.bold);
+    try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_error_bg));
+    // Trailing cols also have error bg
+    const c_last = try frm.cell(39, 0);
+    try std.testing.expect(frame.Color.eql(c_last.style.bg, t.tool_error_bg));
+}
+
+test "user message has user_msg_bg" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.userText("hello from user");
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 1);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 1 });
+
+    const t = theme.get();
+    // Padding col and text col both have user_msg_bg
+    const c0 = try frm.cell(0, 0);
+    try std.testing.expect(frame.Color.eql(c0.style.bg, t.user_msg_bg));
+    const c1 = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c1.style.bg, t.user_msg_bg));
+    // Trailing fill
+    const c_last = try frm.cell(29, 0);
+    try std.testing.expect(frame.Color.eql(c_last.style.bg, t.user_msg_bg));
+}
+
+test "info text has dim fg and no bg" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.infoText("loaded CLAUDE.md");
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 1);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 1 });
+
+    const t = theme.get();
+    const c1 = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c1.style.fg, t.dim));
+    // No bg fill for info text (default bg)
+    try std.testing.expect(c1.style.bg.isDefault());
+}
+
+test "tool result success has success fg and success bg" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_result = .{
+        .id = "r1",
+        .out = "all good",
+        .is_err = false,
+    } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 50, 1);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 50, .h = 1 });
+
+    const t = theme.get();
+    const c1 = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c1.style.fg, t.success));
+    try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_success_bg));
+    // Full-width bg fill
+    const c_last = try frm.cell(49, 0);
+    try std.testing.expect(frame.Color.eql(c_last.style.bg, t.tool_success_bg));
+}
+
+test "tool result error has err fg and error bg" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_result = .{
+        .id = "r2",
+        .out = "not found",
+        .is_err = true,
+    } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 50, 1);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 50, .h = 1 });
+
+    const t = theme.get();
+    const c1 = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c1.style.fg, t.err));
+    try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_error_bg));
+}
+
+test "usage and stop have dim fg" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .usage = .{ .in_tok = 10, .out_tok = 20, .tot_tok = 30 } });
+    try tr.append(.{ .stop = .{ .reason = .done } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 40, 2);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 2 });
+
+    const t = theme.get();
+    // Usage line
+    const c_usage = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c_usage.style.fg, t.dim));
+    // Stop line
+    const c_stop = try frm.cell(1, 1);
+    try std.testing.expect(frame.Color.eql(c_stop.style.fg, t.dim));
 }
 
 test "scroll offset clamped to max" {

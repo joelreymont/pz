@@ -15,6 +15,7 @@ pub const Ui = struct {
     pn: panels.Panels,
     frm: frame.Frame,
     rnd: render.Renderer,
+    border_fg: frame.Color = .{ .rgb = 0x81a2be },
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -165,7 +166,7 @@ pub const Ui = struct {
     }
 
     fn drawBorder(self: *Ui, y: usize) !void {
-        const st = frame.Style{ .fg = theme.get().thinking_high };
+        const st = frame.Style{ .fg = self.border_fg };
         var x: usize = 0;
         while (x < self.frm.w) : (x += 1) {
             try self.frm.set(x, y, 0x2500, st); // ─

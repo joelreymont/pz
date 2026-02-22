@@ -220,20 +220,16 @@ pub const Panels = struct {
                 }
             }
 
-            // Thinking label (after usage, before model)
-            if (self.thinking_label.len > 0) {
-                if (x > rect.x) try writePart(frm, &x, x_end, y2, "  ", dim_st);
-                try writePart(frm, &x, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
-            }
-
-            // Right: (provider) model
+            // Right: model • thinking-level
             const model_text = self.model.items;
             const prov_text = self.provider.items;
             if (model_text.len > 0) {
-                // Calculate right-side width: "(prov) model" or just "model"
+                // Calculate right-side width
                 var right_cols = cpCountSlice(model_text);
                 if (prov_text.len > 0)
                     right_cols += cpCountSlice(prov_text) + 3; // "(" + prov + ") "
+                if (self.thinking_label.len > 0)
+                    right_cols += 3 + self.thinking_label.len; // " • " + label
                 if (right_cols < rect.w) {
                     var rx = x_end - right_cols;
                     if (prov_text.len > 0) {
@@ -242,6 +238,10 @@ pub const Panels = struct {
                         try writePart(frm, &rx, x_end, y2, ") ", dim_st);
                     }
                     try writePart(frm, &rx, x_end, y2, model_text, dim_st);
+                    if (self.thinking_label.len > 0) {
+                        try writePart(frm, &rx, x_end, y2, " \xc2\xb7 ", dim_st); // " · "
+                        try writePart(frm, &rx, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
+                    }
                 }
             }
         }

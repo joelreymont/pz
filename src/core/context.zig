@@ -56,6 +56,45 @@ fn assembleParts(alloc: std.mem.Allocator, parts: []const []u8) !?[]u8 {
     return buf;
 }
 
+/// Returns list of discovered context file paths (for startup display).
+pub fn discoverPaths(alloc: std.mem.Allocator) ![][]u8 {
+    var paths = std.ArrayListUnmanaged([]u8){};
+    errdefer {
+        for (paths.items) |p| alloc.free(p);
+        paths.deinit(alloc);
+    }
+
+    if (globalDir(alloc)) |gdir| {
+        defer alloc.free(gdir);
+        if (findFile(alloc, gdir)) |p| try paths.append(alloc, p);
+    }
+
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd = std.process.getCwd(&cwd_buf) catch return try paths.toOwnedSlice(alloc);
+
+    var dir: []const u8 = cwd;
+    while (true) {
+        if (findFile(alloc, dir)) |p| try paths.append(alloc, p);
+        if (parent(dir)) |par| {
+            dir = par;
+        } else break;
+    }
+
+    return try paths.toOwnedSlice(alloc);
+}
+
+fn findFile(alloc: std.mem.Allocator, dir: []const u8) ?[]u8 {
+    for ([_][]const u8{ "AGENTS.md", "CLAUDE.md" }) |name| {
+        const path = std.fmt.allocPrint(alloc, "{s}/{s}", .{ dir, name }) catch return null;
+        std.fs.accessAbsolute(path, .{}) catch {
+            alloc.free(path);
+            continue;
+        };
+        return path;
+    }
+    return null;
+}
+
 fn globalDir(alloc: std.mem.Allocator) ?[]u8 {
     const home = std.process.getEnvVarOwned(alloc, "HOME") catch return null;
     defer alloc.free(home);

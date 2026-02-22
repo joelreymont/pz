@@ -8,6 +8,7 @@ const tui_render = @import("../modes/tui/render.zig");
 const tui_term = @import("../modes/tui/term.zig");
 const tui_input = @import("../modes/tui/input.zig");
 const tui_editor = @import("../modes/tui/editor.zig");
+const tui_theme = @import("../modes/tui/theme.zig");
 const args_mod = @import("args.zig");
 
 pub const Err = error{
@@ -77,7 +78,7 @@ const NativeProviderRuntime = struct {
     }
 };
 
-const missing_provider_msg = "provider_cmd missing; set --provider-cmd or PIZI_PROVIDER_CMD";
+const missing_provider_msg = "provider_cmd missing; set --provider-cmd or PZ_PROVIDER_CMD";
 
 const MissingProvider = struct {
     alloc: std.mem.Allocator,
@@ -480,6 +481,21 @@ fn runTui(
     var thinking = run_cmd.thinking;
     var popts = thinking.toProviderOpts();
     ui.pn.thinking_label = thinkingLabel(thinking);
+    ui.border_fg = thinkingBorderFg(thinking);
+
+    // Startup info: show discovered context files
+    {
+        const ctx_paths = try core.context.discoverPaths(alloc);
+        defer {
+            for (ctx_paths) |p| alloc.free(p);
+            alloc.free(ctx_paths);
+        }
+        for (ctx_paths) |p| {
+            const msg = try std.fmt.allocPrint(alloc, "  {s}", .{p});
+            defer alloc.free(msg);
+            try ui.tr.infoText(msg);
+        }
+    }
 
     try ui.draw(out);
     if (run_cmd.prompt) |prompt| {
@@ -651,6 +667,7 @@ fn runTui(
                             thinking = cycleThinking(thinking);
                             popts = thinking.toProviderOpts();
                             ui.pn.thinking_label = thinkingLabel(thinking);
+                            ui.border_fg = thinkingBorderFg(thinking);
                             try ui.draw(out);
                         },
                         .cycle_model => {
@@ -1712,14 +1729,19 @@ fn cycleThinking(cur: args_mod.ThinkingLevel) args_mod.ThinkingLevel {
 }
 
 fn thinkingLabel(level: args_mod.ThinkingLevel) []const u8 {
+    return @tagName(level);
+}
+
+fn thinkingBorderFg(level: args_mod.ThinkingLevel) @import("../modes/tui/frame.zig").Color {
+    const t = tui_theme.get();
     return switch (level) {
-        .adaptive => "",
-        .off => "think:off",
-        .minimal => "think:min",
-        .low => "think:low",
-        .medium => "think:med",
-        .high => "think:high",
-        .xhigh => "think:xhigh",
+        .off => t.thinking_off,
+        .minimal => t.thinking_min,
+        .low => t.thinking_low,
+        .medium => t.thinking_med,
+        .high => t.thinking_high,
+        .xhigh => t.thinking_xhigh,
+        .adaptive => t.thinking_med,
     };
 }
 

@@ -469,7 +469,7 @@ test "bash handler applies explicit env variables" {
 
     const env = [_]tools.Call.Env{
         .{
-            .key = "PIZI_BASH_ENV",
+            .key = "PZ_BASH_ENV",
             .val = "ok",
         },
     };
@@ -481,7 +481,7 @@ test "bash handler applies explicit env variables" {
         .id = "b2",
         .kind = .bash,
         .args = .{ .bash = .{
-            .cmd = "printf '%s' \"$PIZI_BASH_ENV\"",
+            .cmd = "printf '%s' \"$PZ_BASH_ENV\"",
             .env = env[0..],
         } },
         .src = .model,

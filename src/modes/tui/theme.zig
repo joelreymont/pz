@@ -172,7 +172,7 @@ pub const light = Theme{
 var active: *const Theme = &dark;
 
 pub fn init() void {
-    if (std.posix.getenv("PIZI_THEME")) |val| {
+    if (std.posix.getenv("PZ_THEME")) |val| {
         const map = std.StaticStringMap(*const Theme).initComptime(.{
             .{ "light", &light },
             .{ "dark", &dark },
