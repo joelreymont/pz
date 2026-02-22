@@ -12,16 +12,21 @@ pub fn detect() ColorCap {
     if (std.posix.getenv("NO_COLOR") != null) return .none;
 
     if (std.posix.getenv("COLORTERM")) |ct| {
-        if (std.mem.eql(u8, ct, "truecolor") or std.mem.eql(u8, ct, "24bit"))
-            return .truecolor;
+        const ct_map = std.StaticStringMap(ColorCap).initComptime(.{
+            .{ "truecolor", .truecolor },
+            .{ "24bit", .truecolor },
+        });
+        if (ct_map.get(ct)) |cap| return cap;
     }
 
     if (std.posix.getenv("TERM")) |term| {
-        if (std.mem.eql(u8, term, "dumb")) return .none;
+        const term_map = std.StaticStringMap(ColorCap).initComptime(.{
+            .{ "dumb", .none },
+            .{ "linux", .basic },
+            .{ "vt100", .basic },
+        });
+        if (term_map.get(term)) |cap| return cap;
         if (std.mem.indexOf(u8, term, "256color") != null) return .c256;
-        // Known limited terminals get basic
-        if (std.mem.eql(u8, term, "linux") or std.mem.eql(u8, term, "vt100"))
-            return .basic;
     }
 
     // Most modern terminals support truecolor even without advertising it

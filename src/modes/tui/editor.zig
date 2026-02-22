@@ -10,12 +10,23 @@ pub const Key = union(enum) {
     delete: void,
     enter: void,
     ctrl_c: void,
+    ctrl_d: void,
+    ctrl_o: void,
+    ctrl_p: void,
+    ctrl_t: void,
+    esc: void,
+    shift_tab: void,
 };
 
 pub const Action = enum {
     none,
     submit,
     cancel,
+    interrupt,
+    cycle_thinking,
+    cycle_model,
+    toggle_tools,
+    toggle_thinking,
 };
 
 pub const Editor = struct {
@@ -78,7 +89,19 @@ pub const Editor = struct {
                 break :blk .none;
             },
             .enter => .submit,
-            .ctrl_c => .cancel,
+            .ctrl_c => if (self.buf.items.len > 0) blk: {
+                self.clear();
+                break :blk .interrupt;
+            } else .cancel,
+            .ctrl_d => if (self.buf.items.len == 0) Action.cancel else .none,
+            .ctrl_o => .toggle_tools,
+            .ctrl_p => .cycle_model,
+            .ctrl_t => .toggle_thinking,
+            .esc => blk: {
+                if (self.buf.items.len > 0) self.clear();
+                break :blk .interrupt;
+            },
+            .shift_tab => .cycle_thinking,
         };
     }
 
@@ -151,5 +174,61 @@ test "editor maps enter and ctrl-c to actions" {
     defer ed.deinit();
 
     try std.testing.expect((try ed.apply(.{ .enter = {} })) == .submit);
+    // ctrl-c on empty → cancel (quit)
     try std.testing.expect((try ed.apply(.{ .ctrl_c = {} })) == .cancel);
+}
+
+test "esc clears editor text" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    _ = try ed.apply(.{ .char = 'h' });
+    _ = try ed.apply(.{ .char = 'i' });
+    try std.testing.expectEqualStrings("hi", ed.text());
+
+    // ESC with text → interrupt + clear
+    try std.testing.expect((try ed.apply(.{ .esc = {} })) == .interrupt);
+    try std.testing.expectEqualStrings("", ed.text());
+
+    // ESC on empty → interrupt (no-op clear)
+    try std.testing.expect((try ed.apply(.{ .esc = {} })) == .interrupt);
+}
+
+test "ctrl-c clears text first then cancels" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    _ = try ed.apply(.{ .char = 'x' });
+    // ctrl-c with text → interrupt + clear
+    try std.testing.expect((try ed.apply(.{ .ctrl_c = {} })) == .interrupt);
+    try std.testing.expectEqualStrings("", ed.text());
+
+    // ctrl-c on empty → cancel (quit)
+    try std.testing.expect((try ed.apply(.{ .ctrl_c = {} })) == .cancel);
+}
+
+test "ctrl-d exits on empty, no-op on text" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    // empty → cancel (exit)
+    try std.testing.expect((try ed.apply(.{ .ctrl_d = {} })) == .cancel);
+
+    _ = try ed.apply(.{ .char = 'a' });
+    // with text → none (no-op)
+    try std.testing.expect((try ed.apply(.{ .ctrl_d = {} })) == .none);
+}
+
+test "shift-tab cycles thinking" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    try std.testing.expect((try ed.apply(.{ .shift_tab = {} })) == .cycle_thinking);
+}
+
+test "ctrl-p cycles model" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    try std.testing.expect((try ed.apply(.{ .ctrl_p = {} })) == .cycle_model);
 }

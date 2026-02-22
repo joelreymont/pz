@@ -42,11 +42,15 @@ pub const ToolResult = struct {
     is_err: bool = false,
 };
 
+pub const ThinkingMode = enum { off, adaptive, budget };
+
 pub const Opts = struct {
     temp: ?f32 = null,
     top_p: ?f32 = null,
     max_out: ?u32 = null,
     stop: []const []const u8 = &.{},
+    thinking: ThinkingMode = .adaptive,
+    thinking_budget: u32 = 0, // 0 = default per mode
 };
 
 pub const Ev = union(enum) {

@@ -38,6 +38,9 @@ const BufWriter = struct {
     }
 };
 
+// Layout helper: reserved = 5 (border + editor + border + 2 footer)
+// tx_h = h - 5 for h >= 6
+
 // ── Scenarios ──
 
 test "e2e simple text response" {
@@ -52,14 +55,11 @@ test "e2e simple text response" {
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // Status bar row 0: model name
-    try vs.expectText(0, 0, "gpt-4");
-
-    // Find text and stop lines anywhere in body
+    // h=10: tx_h=5 (rows 0..4), border 5, editor 6, border 7, footer 8-9
     var found_text = false;
     var found_stop = false;
-    var r: usize = 1;
-    while (r < 9) : (r += 1) {
+    var r: usize = 0;
+    while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "Hello, how can I help?") != null) found_text = true;
@@ -81,18 +81,16 @@ test "e2e text + thinking + text" {
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // Thinking should have italic and thinking_fg color
-    // Find the thinking line
+    // h=8: tx_h=3 (rows 0..2), border 3, editor 4, border 5, footer 6-7
     var found_thinking = false;
-    var r: usize = 1;
-    while (r < 7) : (r += 1) {
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "[thinking]") != null) {
-            // Check italic styling
-            try vs.expectItalic(r, 0, true);
-            // Check fg color matches theme.thinking_fg (rgb 0x808080)
-            try vs.expectFg(r, 0, .{ .rgb = 0x808080 });
+            // Content at col 1 due to 1-col left padding
+            try vs.expectItalic(r, 1, true);
+            try vs.expectFg(r, 1, .{ .rgb = 0x808080 });
             found_thinking = true;
             break;
         }
@@ -121,14 +119,15 @@ test "e2e tool call and result" {
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // Find tool call line — should have warn fg color and pending bg
+    // h=10: tx_h=5 (rows 0..4)
+    // Content at col 1 (padding). Bg fills from col 0.
     var found_tool = false;
-    var r: usize = 1;
-    while (r < 9) : (r += 1) {
+    var r: usize = 0;
+    while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "[tool read#c1]") != null) {
-            try vs.expectFg(r, 0, .{ .rgb = 0xffff00 }); // theme.warn
+            try vs.expectFg(r, 1, .{ .rgb = 0xffff00 }); // theme.warn
             try vs.expectBg(r, 0, .{ .rgb = 0x282832 }); // theme.tool_pending_bg
             found_tool = true;
             break;
@@ -136,14 +135,14 @@ test "e2e tool call and result" {
     }
     try std.testing.expect(found_tool);
 
-    // Find tool result — should have success fg and success bg
+    // Find tool result
     var found_result = false;
-    r = 1;
-    while (r < 9) : (r += 1) {
+    r = 0;
+    while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "[tool-result #c1") != null) {
-            try vs.expectFg(r, 0, .{ .rgb = 0xb5bd68 }); // theme.success
+            try vs.expectFg(r, 1, .{ .rgb = 0xb5bd68 }); // theme.success
             try vs.expectBg(r, 0, .{ .rgb = 0x283228 }); // theme.tool_success_bg
             found_result = true;
             break;
@@ -153,24 +152,25 @@ test "e2e tool call and result" {
 }
 
 test "e2e error response" {
-    var ui = try Ui.init(std.testing.allocator, 40, 6, "m", "p");
+    // Use larger terminal so error fits in transcript area
+    var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
     defer ui.deinit();
 
     try ui.onProvider(.{ .err = "rate limit exceeded" });
 
-    var vs = try VScreen.init(std.testing.allocator, 40, 6);
+    var vs = try VScreen.init(std.testing.allocator, 40, 8);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // Find error line
+    // h=8: tx_h=3 (rows 0..2)
     var found_err = false;
-    var r: usize = 1;
-    while (r < 5) : (r += 1) {
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "[err] rate limit exceeded") != null) {
-            try vs.expectFg(r, 0, .{ .rgb = 0xcc6666 }); // theme.err
-            try vs.expectBold(r, 0, true);
+            try vs.expectFg(r, 1, .{ .rgb = 0xcc6666 }); // theme.err
+            try vs.expectBold(r, 1, true);
             try vs.expectBg(r, 0, .{ .rgb = 0x3c2828 }); // theme.tool_error_bg
             found_err = true;
             break;
@@ -180,7 +180,7 @@ test "e2e error response" {
 }
 
 test "e2e tool result with ANSI is stripped" {
-    var ui = try Ui.init(std.testing.allocator, 50, 6, "m", "p");
+    var ui = try Ui.init(std.testing.allocator, 50, 8, "m", "p");
     defer ui.deinit();
 
     try ui.onProvider(.{ .tool_result = .{
@@ -189,14 +189,14 @@ test "e2e tool result with ANSI is stripped" {
         .is_err = false,
     } });
 
-    var vs = try VScreen.init(std.testing.allocator, 50, 6);
+    var vs = try VScreen.init(std.testing.allocator, 50, 8);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // ANSI should be stripped — text visible without ESC sequences
+    // h=8: tx_h=3 (rows 0..2)
     var found_stripped = false;
-    var r: usize = 1;
-    while (r < 5) : (r += 1) {
+    var r: usize = 0;
+    while (r < 3) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         // Should not contain raw ESC byte
@@ -210,34 +210,30 @@ test "e2e tool result with ANSI is stripped" {
 }
 
 test "e2e word wrap in narrow terminal" {
-    var ui = try Ui.init(std.testing.allocator, 20, 8, "m", "p");
+    var ui = try Ui.init(std.testing.allocator, 20, 10, "m", "p");
     defer ui.deinit();
 
     // Text wider than transcript area should wrap
     try ui.onProvider(.{ .text = "hello world this is a long response" });
 
-    var vs = try VScreen.init(std.testing.allocator, 20, 8);
+    var vs = try VScreen.init(std.testing.allocator, 20, 10);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // The transcript area is the left portion (w - tool_w).
-    // At w=20: tool_w = splitToolW(20) = max(12, 20/3=6) = 12.
-    // But that leaves tx_w = 20-12 = 8. With separator: tool_w = 12-1 = 11.
-    // So transcript gets 8 cols. "hello world..." wraps.
-    // Just verify no crash and multiple rows have content.
+    // h=10: tx_h=5 (rows 0..4)
+    // w=20, 1-col pad → 19 cols for text. "hello world this is a long response" wraps.
     var non_empty: usize = 0;
-    var r: usize = 1;
-    while (r < 7) : (r += 1) {
+    var r: usize = 0;
+    while (r < 5) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (row.len > 0) non_empty += 1;
     }
-    // With 8-col transcript and ~35 char text, expect at least 4 wrapped lines
-    try std.testing.expect(non_empty >= 4);
+    try std.testing.expect(non_empty >= 2);
 }
 
 test "e2e multiple parallel tool calls" {
-    var ui = try Ui.init(std.testing.allocator, 60, 12, "claude", "anthropic");
+    var ui = try Ui.init(std.testing.allocator, 60, 14, "claude", "anthropic");
     defer ui.deinit();
 
     try ui.onProvider(.{ .text = "Reading files..." });
@@ -249,18 +245,18 @@ test "e2e multiple parallel tool calls" {
     try ui.onProvider(.{ .tool_result = .{ .id = "c3", .out = "fail", .is_err = true } });
     try ui.onProvider(.{ .text = "Done." });
 
-    var vs = try VScreen.init(std.testing.allocator, 60, 12);
+    var vs = try VScreen.init(std.testing.allocator, 60, 14);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // Find the error result — should have error bg
+    // h=14: tx_h=9 (rows 0..8)
     var found_err_result = false;
-    var r: usize = 1;
-    while (r < 11) : (r += 1) {
+    var r: usize = 0;
+    while (r < 9) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
         if (std.mem.indexOf(u8, row, "[tool-result #c3") != null) {
-            try vs.expectFg(r, 0, .{ .rgb = 0xcc6666 }); // theme.err
+            try vs.expectFg(r, 1, .{ .rgb = 0xcc6666 }); // theme.err
             try vs.expectBg(r, 0, .{ .rgb = 0x3c2828 }); // theme.tool_error_bg
             found_err_result = true;
             break;
@@ -269,35 +265,35 @@ test "e2e multiple parallel tool calls" {
     try std.testing.expect(found_err_result);
 }
 
-test "e2e editor prompt visible" {
-    var ui = try Ui.init(std.testing.allocator, 30, 5, "m", "p");
+test "e2e editor border visible" {
+    var ui = try Ui.init(std.testing.allocator, 30, 8, "m", "p");
     defer ui.deinit();
 
-    var vs = try VScreen.init(std.testing.allocator, 30, 5);
+    var vs = try VScreen.init(std.testing.allocator, 30, 8);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // Last row should have the "> " prompt
-    try vs.expectText(4, 0, ">");
-    // Prompt should be accent colored and bold
-    try vs.expectFg(4, 0, .{ .rgb = 0x8abeb7 }); // theme.accent
-    try vs.expectBold(4, 0, true);
+    // h=8: tx_h=3, border row 3, editor row 4, border row 5, footer 6-7
+    // Border should be ─ (U+2500) in thinking_high color
+    try vs.expectText(3, 0, "\xe2\x94\x80"); // ─
+    try vs.expectFg(3, 0, .{ .rgb = 0xb294bb }); // theme.thinking_high
+    try vs.expectText(5, 0, "\xe2\x94\x80"); // bottom border too
+    try vs.expectFg(5, 0, .{ .rgb = 0xb294bb });
 }
 
-test "e2e separator between transcript and tools" {
-    var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
+test "e2e footer visible at bottom" {
+    var ui = try Ui.init(std.testing.allocator, 40, 8, "gpt-4", "openai");
     defer ui.deinit();
 
-    try ui.onProvider(.{ .tool_call = .{ .id = "c1", .name = "read", .args = "{}" } });
+    try ui.onProvider(.{ .usage = .{ .in_tok = 100, .out_tok = 50, .tot_tok = 150 } });
 
     var vs = try VScreen.init(std.testing.allocator, 40, 8);
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // At w=40: tool_w = splitToolW(40) = max(12, 40/3=13) = 13.
-    // tx_w = 40 - 13 = 27. Separator at col 27.
-    // Separator char is U+2502 (│)
-    const sep_cell = vs.cellAt(1, 27);
-    try std.testing.expectEqual(@as(u21, 0x2502), sep_cell.cp);
-    try vs.expectFg(1, 27, .{ .rgb = 0x505050 }); // theme.border_muted
+    // h=8: footer at rows 6-7. Check footer line 2 has (provider) model.
+    const row7 = try vs.rowText(std.testing.allocator, 7);
+    defer std.testing.allocator.free(row7);
+    try std.testing.expect(std.mem.indexOf(u8, row7, "gpt-4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row7, "(openai)") != null);
 }

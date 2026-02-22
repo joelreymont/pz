@@ -32,7 +32,14 @@ pub const Reader = struct {
             error.WouldBlock => return .none,
             else => return .none,
         };
-        if (n == 0) return .none;
+        if (n == 0) {
+            // Lone ESC with no follow-up data → standalone ESC key
+            if (self.pos < self.len and self.buf[self.pos] == 0x1b and self.len - self.pos == 1) {
+                self.pos += 1;
+                return .{ .key = .esc };
+            }
+            return .none;
+        }
         self.len += n;
 
         return self.parseOne() orelse .none;
@@ -69,6 +76,30 @@ pub const Reader = struct {
         if (data[0] == 0x03) {
             self.pos += 1;
             return .{ .key = .ctrl_c };
+        }
+
+        // Ctrl-D
+        if (data[0] == 0x04) {
+            self.pos += 1;
+            return .{ .key = .ctrl_d };
+        }
+
+        // Ctrl-O
+        if (data[0] == 0x0f) {
+            self.pos += 1;
+            return .{ .key = .ctrl_o };
+        }
+
+        // Ctrl-P
+        if (data[0] == 0x10) {
+            self.pos += 1;
+            return .{ .key = .ctrl_p };
+        }
+
+        // Ctrl-T
+        if (data[0] == 0x14) {
+            self.pos += 1;
+            return .{ .key = .ctrl_t };
         }
 
         // Enter (CR or LF)
@@ -132,6 +163,10 @@ pub const Reader = struct {
                 self.pos += 3;
                 return .none;
             }, // down
+            'Z' => {
+                self.pos += 3;
+                return .{ .key = .shift_tab };
+            },
             'C' => {
                 self.pos += 3;
                 return .{ .key = .right };
@@ -309,4 +344,18 @@ test "incomplete UTF-8 returns null" {
     r.buf[0] = 0xE4;
     r.len = 1;
     try std.testing.expect(r.parseOne() == null);
+}
+
+test "parse ctrl-d" {
+    var r = Reader.init(-1);
+    r.buf[0] = 0x04;
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_d);
+}
+
+test "parse shift-tab" {
+    var r = Reader.init(-1);
+    @memcpy(r.buf[0..3], "\x1b[Z");
+    r.len = 3;
+    try expectKey(r.parseOne().?, .shift_tab);
 }

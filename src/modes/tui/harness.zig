@@ -94,57 +94,42 @@ pub const Ui = struct {
         const w = self.frm.w;
         const h = self.frm.h;
 
-        if (h >= 1) {
-            try self.pn.renderStatus(&self.frm, .{
+        // Layout matching pi: transcript | border | editor | border | footer(2)
+        // Reserved: 2 borders + 1 editor + 2 footer = 5
+        const footer_h: usize = if (h >= 6) 2 else if (h >= 4) 1 else 0;
+        const border_h: usize = if (h >= 5) 2 else 0;
+        const editor_h: usize = if (h > footer_h + border_h) 1 else 0;
+        const reserved = footer_h + border_h + editor_h;
+        const tx_h = if (h > reserved) h - reserved else 0;
+
+        if (tx_h > 0 and w > 0) {
+            try self.tr.render(&self.frm, .{
                 .x = 0,
                 .y = 0,
                 .w = w,
-                .h = 1,
+                .h = tx_h,
             });
         }
 
-        if (h >= 2) {
-            const editor_y = h - 1;
-            try self.drawEditorLine(editor_y);
+        if (border_h >= 1 and editor_h > 0) {
+            try self.drawBorder(tx_h);
         }
 
-        if (h > 2 and w > 0) {
-            const body_y: usize = 1;
-            const body_h = h - 2;
-            const raw_tool_w = splitToolW(w);
+        if (editor_h > 0) {
+            try self.drawEditorLine(tx_h + @min(border_h, 1));
+        }
 
-            // Reserve 1 col for separator if room for sep + 2 cols of tools
-            const has_sep = raw_tool_w >= 3 and w > raw_tool_w;
-            const sep_w: usize = if (has_sep) 1 else 0;
-            const tool_w = if (has_sep) raw_tool_w - sep_w else raw_tool_w;
-            const tx_w = w - raw_tool_w;
+        if (border_h >= 2) {
+            try self.drawBorder(tx_h + 1 + editor_h);
+        }
 
-            if (tx_w > 0) {
-                try self.tr.render(&self.frm, .{
-                    .x = 0,
-                    .y = body_y,
-                    .w = tx_w,
-                    .h = body_h,
-                });
-            }
-
-            if (has_sep) {
-                const sep_x = tx_w;
-                const sep_st = frame.Style{ .fg = theme.get().border_muted };
-                var sy: usize = 0;
-                while (sy < body_h) : (sy += 1) {
-                    try self.frm.set(sep_x, body_y + sy, 0x2502, sep_st); // │
-                }
-            }
-
-            if (tool_w > 0) {
-                try self.pn.renderTools(&self.frm, .{
-                    .x = tx_w + sep_w,
-                    .y = body_y,
-                    .w = tool_w,
-                    .h = body_h,
-                });
-            }
+        if (footer_h > 0) {
+            try self.pn.renderFooter(&self.frm, .{
+                .x = 0,
+                .y = h - footer_h,
+                .w = w,
+                .h = footer_h,
+            });
         }
 
         try self.rnd.render(&self.frm, out);
@@ -162,26 +147,40 @@ pub const Ui = struct {
         try self.pn.setProvider(provider);
     }
 
-    fn drawEditorLine(self: *Ui, y: usize) !void {
-        const prompt = "> ";
-        const st = frame.Style{
-            .fg = theme.get().accent,
-            .bold = true,
-        };
-        _ = try self.frm.write(0, y, prompt, st);
+    pub fn clearTranscript(self: *Ui) void {
+        for (self.tr.blocks.items) |*b| b.deinit(self.alloc);
+        self.tr.blocks.items.len = 0;
+        self.tr.scroll_off = 0;
+    }
 
-        if (self.frm.w <= prompt.len) return;
-        const room = self.frm.w - prompt.len;
+    pub fn lastResponseText(self: *const Ui) ?[]const u8 {
+        // Find last text block (skip tool/meta blocks)
+        var i = self.tr.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            const blk = &self.tr.blocks.items[i];
+            if (blk.kind == .text) return blk.text();
+        }
+        return null;
+    }
+
+    fn drawBorder(self: *Ui, y: usize) !void {
+        const st = frame.Style{ .fg = theme.get().thinking_high };
+        var x: usize = 0;
+        while (x < self.frm.w) : (x += 1) {
+            try self.frm.set(x, y, 0x2500, st); // ─
+        }
+    }
+
+    fn drawEditorLine(self: *Ui, y: usize) !void {
+        // pi: 1-col left padding, no prompt character
+        const pad: usize = 1;
+        if (self.frm.w <= pad) return;
+        const room = self.frm.w - pad;
         const txt = try clipCols(self.ed.text(), room);
-        _ = try self.frm.write(prompt.len, y, txt, .{});
+        _ = try self.frm.write(pad, y, txt, .{});
     }
 };
-
-fn splitToolW(w: usize) usize {
-    if (w <= 12) return @min(@as(usize, 4), w);
-    const one_third = w / 3;
-    return @max(@as(usize, 12), one_third);
-}
 
 fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     if (cols == 0 or text.len == 0) return text[0..0];
@@ -220,21 +219,11 @@ const TestBuf = struct {
     }
 };
 
-test "harness renders fixed-size layout with transcript and tools" {
+test "harness renders full-width transcript with footer" {
     var ui = try Ui.init(std.testing.allocator, 40, 8, "gpt-x", "prov-a");
     defer ui.deinit();
 
     try ui.onProvider(.{ .text = "hello" });
-    try ui.onProvider(.{ .tool_call = .{
-        .id = "c1",
-        .name = "read",
-        .args = "{}",
-    } });
-    try ui.onProvider(.{ .tool_result = .{
-        .id = "c1",
-        .out = "ok",
-        .is_err = false,
-    } });
 
     var raw: [4096]u8 = undefined;
     var out = TestBuf.init(raw[0..]);

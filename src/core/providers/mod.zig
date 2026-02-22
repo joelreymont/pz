@@ -4,6 +4,8 @@ pub const stream_parse = @import("stream_parse.zig");
 pub const streaming = @import("streaming.zig");
 pub const first_provider = @import("first_provider.zig");
 pub const proc_transport = @import("proc_transport.zig");
+pub const auth = @import("auth.zig");
+pub const anthropic = @import("anthropic.zig");
 
 const c = @import("contract.zig");
 

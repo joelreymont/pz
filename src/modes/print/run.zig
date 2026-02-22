@@ -12,7 +12,12 @@ pub fn exec(run_ctx: contract.RunCtx) run_err.Err!void {
 }
 
 pub fn execWithWriter(run_ctx: contract.RunCtx, out: std.Io.AnyWriter) run_err.Err!void {
+    return execVerbose(run_ctx, out, false);
+}
+
+fn execVerbose(run_ctx: contract.RunCtx, out: std.Io.AnyWriter, verbose: bool) run_err.Err!void {
     var formatter = format.Formatter.init(run_ctx.alloc, out);
+    formatter.verbose = verbose;
     defer formatter.deinit();
 
     run_ctx.store.append(run_ctx.sid, .{
@@ -233,13 +238,13 @@ test "exec runs prompt path and persists mapped provider events" {
     var out_buf: [512]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    try execWithWriter(.{
+    try execVerbose(.{
         .alloc = std.testing.allocator,
         .provider = provider,
         .store = store,
         .sid = "sid-1",
         .prompt = "ship-it",
-    }, out_fbs.writer().any());
+    }, out_fbs.writer().any(), true);
 
     try std.testing.expectEqual(@as(usize, 1), provider_impl.start_ct);
     try std.testing.expectEqualStrings(model_default, provider_impl.model);
@@ -390,13 +395,13 @@ test "exec deinit stream and maps stream next error to typed print error" {
     var out_buf: [32]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    try std.testing.expectError(error.StreamRead, execWithWriter(.{
+    try std.testing.expectError(error.StreamRead, execVerbose(.{
         .alloc = std.testing.allocator,
         .provider = provider,
         .store = store,
         .sid = "sid-2",
         .prompt = "prompt-2",
-    }, out_fbs.writer().any()));
+    }, out_fbs.writer().any(), true));
 
     try std.testing.expectEqual(@as(usize, 1), provider_impl.stream.deinit_ct);
     try std.testing.expectEqual(@as(usize, 1), store_impl.append_ct);
@@ -497,13 +502,13 @@ test "exec maps max_out stop reason to deterministic typed error" {
     var out_buf: [128]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    try std.testing.expectError(error.StopMaxOut, execWithWriter(.{
+    try std.testing.expectError(error.StopMaxOut, execVerbose(.{
         .alloc = std.testing.allocator,
         .provider = provider,
         .store = store,
         .sid = "sid-3",
         .prompt = "prompt-3",
-    }, out_fbs.writer().any()));
+    }, out_fbs.writer().any(), true));
 
     try std.testing.expectEqual(@as(usize, 1), provider_impl.stream.deinit_ct);
     try std.testing.expectEqual(@as(usize, 3), store_impl.append_ct);
@@ -600,13 +605,13 @@ test "exec chooses highest stop reason deterministically" {
     var out_buf: [128]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
-    try std.testing.expectError(error.StopErr, execWithWriter(.{
+    try std.testing.expectError(error.StopErr, execVerbose(.{
         .alloc = std.testing.allocator,
         .provider = provider,
         .store = store,
         .sid = "sid-4",
         .prompt = "prompt-4",
-    }, out_fbs.writer().any()));
+    }, out_fbs.writer().any(), true));
 
     try std.testing.expectEqual(@as(usize, 1), provider_impl.stream.deinit_ct);
     try std.testing.expectEqual(@as(usize, 3), store_impl.append_ct);

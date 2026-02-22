@@ -67,51 +67,45 @@ fn parseLine(
     const tag = line[0..sep];
     const val = line[sep + 1 ..];
 
-    if (std.mem.eql(u8, tag, "text")) {
-        try appendEv(alloc, evs, .{ .text = try dup(alloc, val) });
-        return;
-    }
-    if (std.mem.eql(u8, tag, "thinking")) {
-        try appendEv(alloc, evs, .{ .thinking = try dup(alloc, val) });
-        return;
-    }
-    if (std.mem.eql(u8, tag, "tool_call")) {
-        const parts = try split3(val, '|');
-        try appendEv(alloc, evs, .{
-            .tool_call = .{
+    const Tag = enum { text, thinking, tool_call, tool_result, usage, stop, err };
+    const tag_map = std.StaticStringMap(Tag).initComptime(.{
+        .{ "text", .text },
+        .{ "thinking", .thinking },
+        .{ "tool_call", .tool_call },
+        .{ "tool_result", .tool_result },
+        .{ "usage", .usage },
+        .{ "stop", .stop },
+        .{ "err", .err },
+    });
+
+    const resolved = tag_map.get(tag) orelse return error.UnknownTag;
+    const ev: providers.Ev = switch (resolved) {
+        .text => .{ .text = try dup(alloc, val) },
+        .thinking => .{ .thinking = try dup(alloc, val) },
+        .tool_call => blk: {
+            const parts = try split3(val, '|');
+            break :blk .{ .tool_call = .{
                 .id = try dup(alloc, parts[0]),
                 .name = try dup(alloc, parts[1]),
                 .args = try dup(alloc, parts[2]),
-            },
-        });
-        return;
-    }
-    if (std.mem.eql(u8, tag, "tool_result")) {
-        const parts = try split3(val, '|');
-        try appendEv(alloc, evs, .{
-            .tool_result = .{
+            } };
+        },
+        .tool_result => blk: {
+            const parts = try split3(val, '|');
+            break :blk .{ .tool_result = .{
                 .id = try dup(alloc, parts[0]),
                 .out = try dup(alloc, parts[2]),
                 .is_err = try parseBool(parts[1]),
-            },
-        });
-        return;
-    }
-    if (std.mem.eql(u8, tag, "usage")) {
-        try appendEv(alloc, evs, .{ .usage = try parseUsage(val) });
-        return;
-    }
-    if (std.mem.eql(u8, tag, "stop")) {
-        saw_stop.* = true;
-        try appendEv(alloc, evs, .{ .stop = .{ .reason = try parseStop(val) } });
-        return;
-    }
-    if (std.mem.eql(u8, tag, "err")) {
-        try appendEv(alloc, evs, .{ .err = try dup(alloc, val) });
-        return;
-    }
-
-    return error.UnknownTag;
+            } };
+        },
+        .usage => .{ .usage = try parseUsage(val) },
+        .stop => blk: {
+            saw_stop.* = true;
+            break :blk .{ .stop = .{ .reason = try parseStop(val) } };
+        },
+        .err => .{ .err = try dup(alloc, val) },
+    };
+    try appendEv(alloc, evs, ev);
 }
 
 fn appendEv(
@@ -137,9 +131,11 @@ fn split3(raw: []const u8, sep: u8) Err![3][]const u8 {
 }
 
 fn parseBool(raw: []const u8) Err!bool {
-    if (std.mem.eql(u8, raw, "0")) return false;
-    if (std.mem.eql(u8, raw, "1")) return true;
-    return error.BadFrame;
+    const map = std.StaticStringMap(bool).initComptime(.{
+        .{ "0", false },
+        .{ "1", true },
+    });
+    return map.get(raw) orelse error.BadFrame;
 }
 
 fn parseUsage(raw: []const u8) Err!providers.Usage {
@@ -156,12 +152,14 @@ fn parseU64(raw: []const u8) Err!u64 {
 }
 
 fn parseStop(raw: []const u8) Err!providers.StopReason {
-    if (std.mem.eql(u8, raw, "done")) return .done;
-    if (std.mem.eql(u8, raw, "max_out")) return .max_out;
-    if (std.mem.eql(u8, raw, "tool")) return .tool;
-    if (std.mem.eql(u8, raw, "canceled")) return .canceled;
-    if (std.mem.eql(u8, raw, "err")) return .err;
-    return error.UnknownStop;
+    const map = std.StaticStringMap(providers.StopReason).initComptime(.{
+        .{ "done", .done },
+        .{ "max_out", .max_out },
+        .{ "tool", .tool },
+        .{ "canceled", .canceled },
+        .{ "err", .err },
+    });
+    return map.get(raw) orelse error.UnknownStop;
 }
 
 fn dup(alloc: std.mem.Allocator, raw: []const u8) Err![]const u8 {

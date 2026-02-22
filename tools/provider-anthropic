@@ -1,0 +1,194 @@
+#!/usr/bin/env bun
+// Provider bridge: reads pz JSON request on stdin, calls Anthropic Messages API,
+// outputs pz line protocol on stdout.
+
+import { readFileSync } from "fs";
+import { homedir } from "os";
+import { join } from "path";
+
+// Read auth
+function loadAuth() {
+  const path = join(homedir(), ".pi", "agent", "auth.json");
+  const raw = readFileSync(path, "utf8");
+  const auth = JSON.parse(raw);
+  const entry = auth.anthropic;
+  if (!entry) throw new Error("No anthropic entry in auth.json");
+  if (entry.type === "oauth") return { token: entry.access, type: "oauth" };
+  if (entry.type === "api_key") return { token: entry.key, type: "api_key" };
+  throw new Error(`Unknown auth type: ${entry.type}`);
+}
+
+// Read stdin
+const input = await Bun.stdin.text();
+const req = JSON.parse(input);
+
+// Convert pz messages to Anthropic format
+function convertMessages(msgs) {
+  const out = [];
+  for (const msg of msgs) {
+    const role = msg.role === "tool" ? "user" : msg.role;
+    const content = [];
+    for (const part of msg.parts) {
+      if (part.type === "text") {
+        content.push({ type: "text", text: part.text });
+      } else if (part.type === "tool_call") {
+        content.push({
+          type: "tool_use",
+          id: part.id,
+          name: part.name,
+          input: JSON.parse(part.args || "{}"),
+        });
+      } else if (part.type === "tool_result") {
+        content.push({
+          type: "tool_result",
+          tool_use_id: part.id,
+          content: part.out,
+          is_error: part.is_err || false,
+        });
+      }
+    }
+    // Merge consecutive same-role messages
+    if (out.length > 0 && out[out.length - 1].role === role) {
+      out[out.length - 1].content.push(...content);
+    } else {
+      out.push({ role, content });
+    }
+  }
+  return out;
+}
+
+// Build Anthropic request
+const messages = convertMessages(req.msgs || []);
+const body = {
+  model: req.model || "claude-sonnet-4-20250514",
+  max_tokens: req.opts?.max_out || 8192,
+  stream: true,
+  messages,
+};
+
+// Add tools if present
+if (req.tools && req.tools.length > 0) {
+  body.tools = req.tools.map((t) => ({
+    name: t.name,
+    description: t.desc || "",
+    input_schema: t.schema ? JSON.parse(t.schema) : { type: "object" },
+  }));
+}
+
+const auth = loadAuth();
+const headers = {
+  "content-type": "application/json",
+  "anthropic-version": "2023-06-01",
+};
+if (auth.type === "oauth") {
+  headers["authorization"] = `Bearer ${auth.token}`;
+  headers["anthropic-beta"] = "oauth-2025-04-20";
+  headers["anthropic-dangerous-direct-browser-access"] = "true";
+} else {
+  headers["x-api-key"] = auth.token;
+}
+
+const resp = await fetch("https://api.anthropic.com/v1/messages", {
+  method: "POST",
+  headers,
+  body: JSON.stringify(body),
+});
+
+if (!resp.ok) {
+  const text = await resp.text();
+  process.stdout.write(`err:${resp.status} ${text.replace(/\n/g, " ")}\n`);
+  process.stdout.write("stop:err\n");
+  process.exit(0);
+}
+
+// Parse SSE stream
+const reader = resp.body.getReader();
+const decoder = new TextDecoder();
+let buffer = "";
+let inTok = 0, outTok = 0;
+let toolId = "", toolName = "", toolArgs = "";
+let inToolInput = false;
+
+function emit(line) {
+  process.stdout.write(line + "\n");
+}
+
+while (true) {
+  const { done, value } = await reader.read();
+  if (done) break;
+
+  buffer += decoder.decode(value, { stream: true });
+  const lines = buffer.split("\n");
+  buffer = lines.pop();
+
+  for (const line of lines) {
+    if (!line.startsWith("data: ")) continue;
+    const data = line.slice(6);
+    if (data === "[DONE]") continue;
+
+    let ev;
+    try { ev = JSON.parse(data); } catch { continue; }
+
+    switch (ev.type) {
+      case "message_start":
+        if (ev.message?.usage) {
+          inTok = ev.message.usage.input_tokens || 0;
+        }
+        break;
+
+      case "content_block_start":
+        if (ev.content_block?.type === "tool_use") {
+          toolId = ev.content_block.id || "";
+          toolName = ev.content_block.name || "";
+          toolArgs = "";
+          inToolInput = true;
+        }
+        break;
+
+      case "content_block_delta":
+        if (ev.delta?.type === "text_delta") {
+          const parts = ev.delta.text.split("\n");
+          for (let i = 0; i < parts.length; i++) {
+            if (i > 0) emit("text:");
+            if (parts[i]) emit(`text:${parts[i]}`);
+          }
+        } else if (ev.delta?.type === "thinking_delta") {
+          const text = ev.delta.thinking;
+          const parts = text.split("\n");
+          for (let i = 0; i < parts.length; i++) {
+            if (i > 0) emit("thinking:");
+            if (parts[i]) emit(`thinking:${parts[i]}`);
+          }
+        } else if (ev.delta?.type === "input_json_delta") {
+          if (inToolInput) {
+            toolArgs += ev.delta.partial_json || "";
+          }
+        }
+        break;
+
+      case "content_block_stop":
+        if (inToolInput) {
+          emit(`tool_call:${toolId}|${toolName}|${toolArgs}`);
+          inToolInput = false;
+          toolId = "";
+          toolName = "";
+          toolArgs = "";
+        }
+        break;
+
+      case "message_delta":
+        if (ev.usage) {
+          outTok = ev.usage.output_tokens || 0;
+        }
+        if (ev.delta?.stop_reason) {
+          const reason = ev.delta.stop_reason;
+          emit(`usage:${inTok},${outTok},${inTok + outTok}`);
+          if (reason === "end_turn") emit("stop:done");
+          else if (reason === "max_tokens") emit("stop:max_out");
+          else if (reason === "tool_use") emit("stop:tool");
+          else emit("stop:done");
+        }
+        break;
+    }
+  }
+}

@@ -158,7 +158,9 @@ pub const Opts = struct {
     store: session.SessionStore,
     reg: tools.Registry,
     mode: ModeSink,
-    max_turns: u16 = 8,
+    system_prompt: ?[]const u8 = null,
+    provider_opts: providers.Opts = .{},
+    max_turns: u16 = 0, // 0 = unlimited
     time: ?TimeSrc = null,
     cancel: ?CancelSrc = null,
     compactor: ?Compactor = null,
@@ -277,7 +279,6 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
     if (opts.sid.len == 0) return error.EmptySessionId;
     if (opts.prompt.len == 0) return error.EmptyPrompt;
     if (opts.model.len == 0) return error.EmptyModel;
-    if (opts.max_turns == 0) return error.InvalidMaxTurns;
     if (opts.compactor != null and opts.compact_every == 0) return error.InvalidCompactEvery;
 
     var hist = Hist{
@@ -324,7 +325,7 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
     var turns: u16 = 0;
     var tool_calls: u32 = 0;
 
-    while (turns < opts.max_turns) : (turns += 1) {
+    while (opts.max_turns == 0 or turns < opts.max_turns) : (turns +|= 1) {
         if (isCanceled(opts)) {
             emitCanceled(opts, &append_ct) catch |cancel_err| {
                 return failWithReport(opts, .mode_push, cancel_err);
@@ -339,7 +340,7 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
         defer turn_arena.deinit();
         const turn_alloc = turn_arena.allocator();
 
-        const req_msgs = buildReqMsgs(turn_alloc, hist.items.items) catch |msg_err| {
+        const req_msgs = buildReqMsgs(turn_alloc, hist.items.items, opts.system_prompt) catch |msg_err| {
             return failWithReport(opts, .provider_start, msg_err);
         };
         const req_tools = buildReqTools(turn_alloc, opts.reg) catch |tools_err| {
@@ -351,6 +352,7 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
             .provider = opts.provider_label,
             .msgs = req_msgs,
             .tools = req_tools,
+            .opts = opts.provider_opts,
         }) catch |start_err| {
             return failWithReport(opts, .provider_start, start_err);
         };
@@ -428,7 +430,11 @@ pub fn run(opts: Opts) (Err || anyerror)!RunOut {
         }
     }
 
-    return error.ToolLoopLimit;
+    // max_turns > 0 and exhausted
+    return .{
+        .turns = turns,
+        .tool_calls = tool_calls,
+    };
 }
 
 fn isCanceled(opts: Opts) bool {
@@ -503,15 +509,22 @@ fn freePart(alloc: std.mem.Allocator, part: providers.Part) void {
 fn buildReqMsgs(
     alloc: std.mem.Allocator,
     hist: []const HistItem,
+    system_prompt: ?[]const u8,
 ) ![]providers.Msg {
-    const msgs = try alloc.alloc(providers.Msg, hist.len);
-    const parts = try alloc.alloc(providers.Part, hist.len);
+    const sys: usize = if (system_prompt != null) 1 else 0;
+    const msgs = try alloc.alloc(providers.Msg, hist.len + sys);
+    const parts = try alloc.alloc(providers.Part, hist.len + sys);
+
+    if (system_prompt) |sp| {
+        parts[0] = .{ .text = sp };
+        msgs[0] = .{ .role = .system, .parts = parts[0..1] };
+    }
 
     for (hist, 0..) |item, idx| {
-        parts[idx] = item.part;
-        msgs[idx] = .{
+        parts[sys + idx] = item.part;
+        msgs[sys + idx] = .{
             .role = item.role,
-            .parts = parts[idx .. idx + 1],
+            .parts = parts[sys + idx .. sys + idx + 1],
         };
     }
 
@@ -546,10 +559,18 @@ fn runTool(opts: Opts, tc: providers.ToolCall) (Err || anyerror)!providers.ToolR
     var parse_arena = std.heap.ArenaAllocator.init(opts.alloc);
     defer parse_arena.deinit();
 
+    const parsed_args = parseCallArgs(parse_arena.allocator(), entry.kind, tc.args) catch {
+        return .{
+            .id = try opts.alloc.dupe(u8, tc.id),
+            .out = try std.fmt.allocPrint(opts.alloc, "invalid tool arguments for {s}", .{tc.name}),
+            .is_err = true,
+        };
+    };
+
     const call: tools.Call = .{
         .id = tc.id,
         .kind = entry.kind,
-        .args = try parseCallArgs(parse_arena.allocator(), entry.kind, tc.args),
+        .args = parsed_args,
         .src = .model,
         .at_ms = at_ms,
     };

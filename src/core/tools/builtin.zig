@@ -316,14 +316,16 @@ pub const Runtime = struct {
 };
 
 pub fn maskForName(name: []const u8) ?u8 {
-    if (std.mem.eql(u8, name, "read")) return mask_read;
-    if (std.mem.eql(u8, name, "write")) return mask_write;
-    if (std.mem.eql(u8, name, "bash")) return mask_bash;
-    if (std.mem.eql(u8, name, "edit")) return mask_edit;
-    if (std.mem.eql(u8, name, "grep")) return mask_grep;
-    if (std.mem.eql(u8, name, "find")) return mask_find;
-    if (std.mem.eql(u8, name, "ls")) return mask_ls;
-    return null;
+    const map = std.StaticStringMap(u8).initComptime(.{
+        .{ "read", mask_read },
+        .{ "write", mask_write },
+        .{ "bash", mask_bash },
+        .{ "edit", mask_edit },
+        .{ "grep", mask_grep },
+        .{ "find", mask_find },
+        .{ "ls", mask_ls },
+    });
+    return map.get(name);
 }
 
 test "builtin runtime registry exposes all core tools" {

@@ -173,12 +173,12 @@ var active: *const Theme = &dark;
 
 pub fn init() void {
     if (std.posix.getenv("PIZI_THEME")) |val| {
-        if (std.mem.eql(u8, val, "light")) {
-            active = &light;
-            return;
-        }
-        if (std.mem.eql(u8, val, "dark")) {
-            active = &dark;
+        const map = std.StaticStringMap(*const Theme).initComptime(.{
+            .{ "light", &light },
+            .{ "dark", &dark },
+        });
+        if (map.get(val)) |t| {
+            active = t;
             return;
         }
     }

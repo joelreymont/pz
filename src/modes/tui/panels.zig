@@ -49,6 +49,7 @@ pub const Panels = struct {
     has_usage: bool = false,
     ctx_limit: u64 = 0,
     run_state: RunState = .idle,
+    thinking_label: []const u8 = "",
 
     pub const InitError = std.mem.Allocator.Error || error{InvalidUtf8};
     pub const EventError = std.mem.Allocator.Error || error{InvalidUtf8};
@@ -159,104 +160,89 @@ pub const Panels = struct {
         }
     }
 
-    pub fn renderTools(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
+    /// Render 2-line footer matching pi layout:
+    ///   Line 1: cwd:branch • state [err]
+    ///   Line 2: ↑in ↓out [pct%/Nk]  model
+    /// All text dim unless otherwise noted.
+    pub fn renderFooter(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
         if (rect.w == 0 or rect.h == 0) return;
 
         const x_end = try rectEndX(frm, rect);
         _ = try rectEndY(frm, rect);
         try clearRect(frm, rect);
 
-        var head_x = rect.x;
-        try writePart(frm, &head_x, x_end, rect.y, "TOOLS", .{
-            .fg = theme.get().accent,
-            .bold = true,
-        });
+        const dim_st = frame.Style{ .fg = theme.get().dim };
+        const y1 = rect.y;
 
-        if (rect.h == 1) return;
-
-        const body_h = rect.h - 1;
-        const shown = @min(body_h, self.rows.items.len);
-        const src_start = self.rows.items.len - shown;
-        const dst_start = rect.y + rect.h - shown;
-
-        var row: usize = 0;
-        while (row < shown) : (row += 1) {
-            try drawToolRow(frm, rect, dst_start + row, self.rows.items[src_start + row]);
-        }
-    }
-
-    pub fn renderStatus(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
-        if (rect.w == 0 or rect.h == 0) return;
-
-        const x_end = try rectEndX(frm, rect);
-        _ = try rectEndY(frm, rect);
-        try clearRect(frm, rect);
-
-        const y = rect.y;
-        const label_st = frame.Style{ .fg = theme.get().dim };
-
-        // Measure right side to reserve space
-        var right_cols: usize = 0;
-        if (self.has_usage) {
-            // ↑N ↓N = ~3 + digits + 3 + digits. Add pct if ctx_limit.
-            right_cols = usageCols(self);
-        }
-
-        const gap: usize = 2;
-        const left_limit = if (right_cols > 0 and right_cols + gap < rect.w)
-            x_end - right_cols - gap
-        else
-            x_end;
-
-        // Left: [cwd:branch • ] model • state [err]
-        var x = rect.x;
-
-        if (self.cwd.len > 0) {
-            try writePart(frm, &x, left_limit, y, self.cwd, .{ .fg = theme.get().accent });
-            if (self.branch.len > 0) {
-                try writePart(frm, &x, left_limit, y, ":", label_st);
-                try writePart(frm, &x, left_limit, y, self.branch, .{ .fg = theme.get().muted });
+        // --- Line 1: cwd (branch) ---
+        {
+            var x = rect.x;
+            if (self.cwd.len > 0) {
+                try writePart(frm, &x, x_end, y1, self.cwd, dim_st);
+                if (self.branch.len > 0) {
+                    try writePart(frm, &x, x_end, y1, " (", dim_st);
+                    try writePart(frm, &x, x_end, y1, self.branch, dim_st);
+                    try writePart(frm, &x, x_end, y1, ")", dim_st);
+                }
             }
-            try writePart(frm, &x, left_limit, y, " \xe2\x80\xa2 ", label_st);
         }
 
-        try writePart(frm, &x, left_limit, y, self.model.items, .{
-            .fg = theme.get().border_accent,
-            .bold = true,
-        });
-        try writePart(frm, &x, left_limit, y, " \xe2\x80\xa2 ", label_st);
-        try writePart(frm, &x, left_limit, y, runStateText(self.run_state), runStateStyle(self.run_state));
+        if (rect.h < 2) return;
+        const y2 = rect.y + 1;
 
-        if (self.run_state == .failed and self.last_err.items.len > 0) {
-            try writePart(frm, &x, left_limit, y, " ", label_st);
-            try writePart(frm, &x, left_limit, y, self.last_err.items, .{ .fg = theme.get().err });
-        }
+        // --- Line 2: ↑in ↓out [pct%/Nk]   ...   model ---
+        {
+            var x = rect.x;
 
-        // Right: ↑in ↓out [pct%/Nk]
-        if (self.has_usage and right_cols > 0) {
-            var rx = x_end - right_cols;
+            // Left: usage stats
+            if (self.has_usage) {
+                try writePart(frm, &x, x_end, y2, "\xe2\x86\x91", dim_st);
+                var ib: [16]u8 = undefined;
+                const it = fmtBuf(&ib, "{d}", .{self.usage.in_tok}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, it, dim_st);
 
-            try writePart(frm, &rx, x_end, y, "\xe2\x86\x91", label_st);
-            var ib: [16]u8 = undefined;
-            const it = fmtBuf(&ib, "{d}", .{self.usage.in_tok}) catch return error.NoSpaceLeft;
-            try writePart(frm, &rx, x_end, y, it, .{ .fg = theme.get().accent });
+                try writePart(frm, &x, x_end, y2, " \xe2\x86\x93", dim_st);
+                var ob: [16]u8 = undefined;
+                const ot = fmtBuf(&ob, "{d}", .{self.usage.out_tok}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, ot, dim_st);
 
-            try writePart(frm, &rx, x_end, y, " \xe2\x86\x93", label_st);
-            var ob: [16]u8 = undefined;
-            const ot = fmtBuf(&ob, "{d}", .{self.usage.out_tok}) catch return error.NoSpaceLeft;
-            try writePart(frm, &rx, x_end, y, ot, .{ .fg = theme.get().accent });
+                if (self.ctx_limit > 0) {
+                    const pct = self.usage.tot_tok * 100 / self.ctx_limit;
+                    const pct_fg = if (pct >= 90) theme.get().err else if (pct >= 70) theme.get().warn else theme.get().accent;
 
-            if (self.ctx_limit > 0) {
-                const pct = self.usage.tot_tok * 100 / self.ctx_limit;
-                const pct_fg = if (pct >= 90) theme.get().err else if (pct >= 70) theme.get().warn else theme.get().accent;
+                    try writePart(frm, &x, x_end, y2, " ", dim_st);
+                    var pb: [8]u8 = undefined;
+                    const pt = fmtBuf(&pb, "{d}%", .{pct}) catch return error.NoSpaceLeft;
+                    try writePart(frm, &x, x_end, y2, pt, .{ .fg = pct_fg });
+                    var lb: [16]u8 = undefined;
+                    const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
+                    try writePart(frm, &x, x_end, y2, lt, dim_st);
+                }
+            }
 
-                try writePart(frm, &rx, x_end, y, " ", label_st);
-                var pb: [8]u8 = undefined;
-                const pt = fmtBuf(&pb, "{d}%", .{pct}) catch return error.NoSpaceLeft;
-                try writePart(frm, &rx, x_end, y, pt, .{ .fg = pct_fg });
-                var lb: [16]u8 = undefined;
-                const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
-                try writePart(frm, &rx, x_end, y, lt, label_st);
+            // Thinking label (after usage, before model)
+            if (self.thinking_label.len > 0) {
+                if (x > rect.x) try writePart(frm, &x, x_end, y2, "  ", dim_st);
+                try writePart(frm, &x, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
+            }
+
+            // Right: (provider) model
+            const model_text = self.model.items;
+            const prov_text = self.provider.items;
+            if (model_text.len > 0) {
+                // Calculate right-side width: "(prov) model" or just "model"
+                var right_cols = cpCountSlice(model_text);
+                if (prov_text.len > 0)
+                    right_cols += cpCountSlice(prov_text) + 3; // "(" + prov + ") "
+                if (right_cols < rect.w) {
+                    var rx = x_end - right_cols;
+                    if (prov_text.len > 0) {
+                        try writePart(frm, &rx, x_end, y2, "(", dim_st);
+                        try writePart(frm, &rx, x_end, y2, prov_text, dim_st);
+                        try writePart(frm, &rx, x_end, y2, ") ", dim_st);
+                    }
+                    try writePart(frm, &rx, x_end, y2, model_text, dim_st);
+                }
             }
         }
     }
@@ -367,42 +353,15 @@ fn usageCols(self: *const Panels) usize {
     return c;
 }
 
-fn drawToolRow(frm: *frame.Frame, rect: Rect, y: usize, row: ToolRow) Panels.RenderError!void {
-    const x_end = try rectEndX(frm, rect);
-    var x = rect.x;
-
-    try writePart(frm, &x, x_end, y, toolStateText(row.state), toolStateStyle(row.state));
-    try writePart(frm, &x, x_end, y, " ", .{});
-    try writePart(frm, &x, x_end, y, row.name, .{});
-    try writePart(frm, &x, x_end, y, " #", .{
-        .fg = theme.get().dim,
-    });
-    try writePart(frm, &x, x_end, y, row.id, .{
-        .fg = theme.get().dim,
-    });
-}
-
-fn toolStateText(st: ToolState) []const u8 {
-    return switch (st) {
-        .running => "RUN",
-        .ok => "OK",
-        .failed => "ERR",
-    };
-}
-
-fn toolStateStyle(st: ToolState) frame.Style {
-    return switch (st) {
-        .running => .{
-            .fg = theme.get().warn,
-        },
-        .ok => .{
-            .fg = theme.get().success,
-        },
-        .failed => .{
-            .fg = theme.get().err,
-            .bold = true,
-        },
-    };
+fn cpCountSlice(text: []const u8) usize {
+    var i: usize = 0;
+    var cols: usize = 0;
+    while (i < text.len) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch 1;
+        i += n;
+        cols += 1;
+    }
+    return cols;
 }
 
 fn runStateText(st: RunState) []const u8 {
@@ -564,146 +523,70 @@ test "panels track tool lifecycle and state transitions" {
     try std.testing.expect(ps.state() == .done);
 }
 
-test "panels render tool rows with clipping and styles" {
-    var ps = try Panels.init(std.testing.allocator, "gpt-x", "prov-a");
-    defer ps.deinit();
-
-    try ps.append(.{ .tool_call = .{
-        .id = "c1",
-        .name = "read",
-        .args = "{}",
-    } });
-    try ps.append(.{ .tool_result = .{
-        .id = "c1",
-        .out = "ok",
-        .is_err = false,
-    } });
-    try ps.append(.{ .tool_call = .{
-        .id = "c2",
-        .name = "bash",
-        .args = "{}",
-    } });
-    try ps.append(.{ .tool_call = .{
-        .id = "c3",
-        .name = "edit",
-        .args = "{}",
-    } });
-
-    var frm = try frame.Frame.init(std.testing.allocator, 15, 4);
-    defer frm.deinit(std.testing.allocator);
-
-    try ps.renderTools(&frm, .{
-        .x = 0,
-        .y = 0,
-        .w = 15,
-        .h = 4,
-    });
-
-    try expectPrefix(&frm, 0, "TOOLS");
-    try expectPrefix(&frm, 1, "OK read #c1");
-    try expectPrefix(&frm, 2, "RUN bash #c2");
-    try expectPrefix(&frm, 3, "RUN edit #c3");
-
-    const ok_cell = try frm.cell(0, 1);
-    try std.testing.expect(frame.Color.eql(ok_cell.style.fg, theme.get().success));
-
-    const run_cell = try frm.cell(0, 2);
-    try std.testing.expect(frame.Color.eql(run_cell.style.fg, theme.get().warn));
-}
-
-test "panels render status bar with model and usage" {
-    var ps = try Panels.init(std.testing.allocator, "gpt-5-mini", "claude");
+test "panels render 2-line footer with cwd and model" {
+    var ps = try Panels.initFull(std.testing.allocator, "gpt-4", "prov", "myproj", "main");
     defer ps.deinit();
     ps.ctx_limit = 200000;
 
-    try ps.append(.{ .tool_call = .{
-        .id = "call-9",
-        .name = "read",
-        .args = "{}",
-    } });
     try ps.append(.{ .usage = .{
         .in_tok = 10,
         .out_tok = 20,
         .tot_tok = 180000,
     } });
 
-    var frm = try frame.Frame.init(std.testing.allocator, 72, 1);
+    var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
     defer frm.deinit(std.testing.allocator);
 
-    try ps.renderStatus(&frm, .{ .x = 0, .y = 0, .w = 72, .h = 1 });
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    // Model at col 0
-    const model_cell = try frm.cell(0, 0);
-    try std.testing.expect(model_cell.cp == 'g'); // "gpt-5-mini"
-    try std.testing.expect(frame.Color.eql(model_cell.style.fg, theme.get().border_accent));
-    try std.testing.expect(model_cell.style.bold);
+    // Line 1: "myproj:main" at col 0 with dim color
+    try expectPrefix(&frm, 0, "myproj");
+    const cwd_cell = try frm.cell(0, 0);
+    try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().dim));
 
-    // State "tool" appears after model + " • "
-    // model=10 + " • "=3 = col 13
-    const state_cell = try frm.cell(13, 0);
-    try std.testing.expect(state_cell.cp == 't'); // "tool"
-    try std.testing.expect(frame.Color.eql(state_cell.style.fg, theme.get().warn));
+    // Line 2: model name right-aligned
+    // Find 'g' of "gpt-4" on line 2
+    var found_model = false;
+    var col: usize = 0;
+    while (col < 60) : (col += 1) {
+        const c = try frm.cell(col, 1);
+        if (c.cp == 'g') {
+            const c2 = try frm.cell(col + 1, 1);
+            if (c2.cp == 'p') {
+                found_model = true;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(found_model);
 
-    // Right side: 90% should be in error color (>90%)
-    // Find the '%' sign from right
-    var pct_col: usize = 71;
+    // 90% context should use error color
+    var pct_col: usize = 59;
     while (pct_col > 0) : (pct_col -= 1) {
-        const c = try frm.cell(pct_col, 0);
+        const c = try frm.cell(pct_col, 1);
         if (c.cp == '%') break;
     }
-    // The digit before '%' should be err color (90% > 90)
     if (pct_col > 0) {
-        const digit = try frm.cell(pct_col - 1, 0);
+        const digit = try frm.cell(pct_col - 1, 1);
         try std.testing.expect(frame.Color.eql(digit.style.fg, theme.get().err));
     }
 }
 
-test "panels render status bar with cwd and branch" {
-    var ps = try Panels.initFull(std.testing.allocator, "gpt-4", "prov", "myproj", "main");
-    defer ps.deinit();
-
-    var frm = try frame.Frame.init(std.testing.allocator, 60, 1);
-    defer frm.deinit(std.testing.allocator);
-
-    try ps.renderStatus(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 1 });
-
-    // "myproj" at col 0 with accent color
-    try expectPrefix(&frm, 0, "myproj");
-    const cwd_cell = try frm.cell(0, 0);
-    try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().accent));
-
-    // ":" separator at col 6 with dim color
-    const sep_cell = try frm.cell(6, 0);
-    try std.testing.expectEqual(@as(u21, ':'), sep_cell.cp);
-    try std.testing.expect(frame.Color.eql(sep_cell.style.fg, theme.get().dim));
-
-    // "main" at col 7 with muted color
-    const br_cell = try frm.cell(7, 0);
-    try std.testing.expectEqual(@as(u21, 'm'), br_cell.cp);
-    try std.testing.expect(frame.Color.eql(br_cell.style.fg, theme.get().muted));
-
-    // " . " dot separator at col 11, then model "gpt-4" at col 14
-    // col 11=' ', col 12='•'(3-byte), col 13=' ', col 14='g'
-    const model_cell = try frm.cell(14, 0);
-    try std.testing.expectEqual(@as(u21, 'g'), model_cell.cp);
-    try std.testing.expect(frame.Color.eql(model_cell.style.fg, theme.get().border_accent));
-}
-
-test "panels render status bar cwd only no branch" {
+test "panels render footer cwd only no branch" {
     var ps = try Panels.initFull(std.testing.allocator, "m", "p", "proj", "");
     defer ps.deinit();
 
-    var frm = try frame.Frame.init(std.testing.allocator, 40, 1);
+    var frm = try frame.Frame.init(std.testing.allocator, 40, 2);
     defer frm.deinit(std.testing.allocator);
 
-    try ps.renderStatus(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 1 });
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 2 });
 
-    // "proj" at col 0, no colon
+    // "proj" at col 0
     try expectPrefix(&frm, 0, "proj");
     const cwd_cell = try frm.cell(0, 0);
-    try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().accent));
+    try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().dim));
 
-    // No colon at col 4 - should be space (start of " • ")
+    // No parens at col 4 - should be space (no branch)
     const after = try frm.cell(4, 0);
     try std.testing.expectEqual(@as(u21, ' '), after.cp);
 }
@@ -731,13 +614,7 @@ test "panels render rejects out of bounds rect" {
     var frm = try frame.Frame.init(std.testing.allocator, 2, 2);
     defer frm.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.OutOfBounds, ps.renderTools(&frm, .{
-        .x = 1,
-        .y = 0,
-        .w = 2,
-        .h = 1,
-    }));
-    try std.testing.expectError(error.OutOfBounds, ps.renderStatus(&frm, .{
+    try std.testing.expectError(error.OutOfBounds, ps.renderFooter(&frm, .{
         .x = 0,
         .y = 1,
         .w = 1,

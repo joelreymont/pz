@@ -26,12 +26,12 @@ const Block = struct {
     st: frame.Style,
     spans: std.ArrayListUnmanaged(Span) = .empty,
 
-    fn deinit(self: *Block, alloc: std.mem.Allocator) void {
+    pub fn deinit(self: *Block, alloc: std.mem.Allocator) void {
         self.spans.deinit(alloc);
         self.buf.deinit(alloc);
     }
 
-    fn text(self: *const Block) []const u8 {
+    pub fn text(self: *const Block) []const u8 {
         return self.buf.items;
     }
 
@@ -53,6 +53,8 @@ pub const Transcript = struct {
     blocks: std.ArrayListUnmanaged(Block) = .empty,
     md: markdown.MdRenderer = .{},
     scroll_off: usize = 0,
+    show_tools: bool = true,
+    show_thinking: bool = true,
 
     pub fn scrollUp(self: *Transcript, n: usize) void {
         self.scroll_off +|= n;
@@ -148,7 +150,11 @@ pub const Transcript = struct {
     }
 
     pub fn userText(self: *Transcript, t: []const u8) AppendError!void {
-        try self.pushBlock(.text, t, .{});
+        try self.pushBlock(.text, t, .{ .bg = theme.get().user_msg_bg });
+    }
+
+    pub fn infoText(self: *Transcript, t: []const u8) AppendError!void {
+        try self.pushBlock(.text, t, .{ .fg = theme.get().dim });
     }
 
     pub fn render(self: *const Transcript, frm: *frame.Frame, rect: Rect) RenderError!void {
@@ -158,21 +164,28 @@ pub const Transcript = struct {
         _ = try rectEndY(frm, rect);
         try clearRect(frm, rect);
 
-        // Count total display lines at full width
+        // 1-col left padding matching pi
+        const pad: usize = if (rect.w > 2) 1 else 0;
+        const content_x = rect.x + pad;
+        const avail_w = rect.w - pad;
+
+        // Count total display lines
         var total: usize = 0;
         for (self.blocks.items) |*b| {
-            total += countLines(b.text(), rect.w);
+            if (!self.blockVisible(b)) continue;
+            total += countLines(b.text(), avail_w);
         }
         if (total == 0) return;
 
         // If content overflows, reserve 1 col for scrollbar
-        const has_bar = total > rect.h and rect.w >= 2;
-        const text_w = if (has_bar) rect.w - 1 else rect.w;
+        const has_bar = total > rect.h and avail_w >= 2;
+        const text_w = if (has_bar) avail_w - 1 else avail_w;
 
         // Recount with narrower width if scrollbar present
         if (has_bar) {
             total = 0;
             for (self.blocks.items) |*b| {
+                if (!self.blockVisible(b)) continue;
                 total += countLines(b.text(), text_w);
             }
         }
@@ -191,6 +204,7 @@ pub const Transcript = struct {
 
         var md = markdown.MdRenderer{};
         for (self.blocks.items) |*b| {
+            if (!self.blockVisible(b)) continue;
             const txt = b.text();
             const use_md = b.kind == .text;
             if (use_md) md = .{};
@@ -208,22 +222,22 @@ pub const Transcript = struct {
                 if (row >= rect.h) return;
 
                 const y = rect.y + row;
-                if (use_md) {
-                    _ = try md.renderLine(frm, rect.x, y, line, text_w, b.st);
-                } else if (b.hasSpans()) {
-                    const base_off = @intFromPtr(line.ptr) - @intFromPtr(txt.ptr);
-                    _ = try writeStyled(frm, rect.x, y, line, base_off, b);
-                } else {
-                    _ = try frm.write(rect.x, y, line, b.st);
-                }
 
-                // Fill remaining cols with bg if non-default
+                // Fill bg across full width (including padding) if non-default
                 if (!b.st.bg.isDefault()) {
-                    const line_cols = cpCount(line);
-                    var x = rect.x + line_cols;
-                    while (x < rect.x + text_w) : (x += 1) {
+                    var x = rect.x;
+                    while (x < rect.x + rect.w) : (x += 1) {
                         try frm.set(x, y, ' ', .{ .bg = b.st.bg });
                     }
+                }
+
+                if (use_md) {
+                    _ = try md.renderLine(frm, content_x, y, line, text_w, b.st);
+                } else if (b.hasSpans()) {
+                    const base_off = @intFromPtr(line.ptr) - @intFromPtr(txt.ptr);
+                    _ = try writeStyled(frm, content_x, y, line, base_off, b);
+                } else {
+                    _ = try frm.write(content_x, y, line, b.st);
                 }
 
                 row += 1;
@@ -249,6 +263,12 @@ pub const Transcript = struct {
                 try frm.set(bar_x, rect.y + sy, cp, st);
             }
         }
+    }
+
+    fn blockVisible(self: *const Transcript, b: *const Block) bool {
+        if (!self.show_tools and b.kind == .tool) return false;
+        if (!self.show_thinking and b.kind == .thinking) return false;
+        return true;
     }
 
     fn pushBlock(self: *Transcript, kind: Kind, t: []const u8, st: frame.Style) AppendError!void {
@@ -769,10 +789,12 @@ test "transcript fills tool rows with background color" {
     defer frm.deinit(std.testing.allocator);
     try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 1 });
 
-    // Text region should have tool style
+    // Col 0 is padding (bg filled), col 1 has tool text
     const c0 = try frm.cell(0, 0);
-    try std.testing.expect(frame.Color.eql(c0.style.fg, theme.get().warn));
     try std.testing.expect(frame.Color.eql(c0.style.bg, theme.get().tool_pending_bg));
+    const c1 = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(c1.style.fg, theme.get().warn));
+    try std.testing.expect(frame.Color.eql(c1.style.bg, theme.get().tool_pending_bg));
 
     // Remaining cols should be filled with bg
     const c_last = try frm.cell(29, 0);
@@ -1028,8 +1050,8 @@ test "tool result renders colored text to frame" {
     defer frm.deinit(std.testing.allocator);
     try tr.render(&frm, .{ .x = 0, .y = 0, .w = 80, .h = 1 });
 
-    // The cell at err_pos should have red fg (idx 1)
-    const c = try frm.cell(err_pos, 0);
+    // +1 for left padding
+    const c = try frm.cell(err_pos + 1, 0);
     try std.testing.expectEqual(@as(u21, 'E'), c.cp);
     try std.testing.expect(frame.Color.eql(c.style.fg, .{ .idx = 1 }));
 }
@@ -1130,6 +1152,55 @@ test "render with scroll offset shows earlier content" {
     r1 = try rowAscii(&frm, 1, raw1[0..]);
     try std.testing.expect(std.mem.indexOf(u8, r0, "AAA") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1, "BBB") != null);
+}
+
+test "show_tools hides tool blocks" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .text = "hello" });
+    try tr.append(.{ .tool_call = .{ .id = "c1", .name = "read", .args = "{}" } });
+    try tr.append(.{ .tool_result = .{ .id = "c1", .out = "ok", .is_err = false } });
+    try tr.append(.{ .text = "bye" });
+
+    // 4 blocks visible by default
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 4);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 4 });
+    var raw: [30]u8 = undefined;
+    const r1 = try rowAscii(&frm, 1, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "[tool") != null);
+
+    // Hide tools
+    tr.show_tools = false;
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 4 });
+    const r0h = try rowAscii(&frm, 0, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r0h, "hello") != null);
+    const r1h = try rowAscii(&frm, 1, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r1h, "bye") != null);
+}
+
+test "show_thinking hides thinking blocks" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .text = "before" });
+    try tr.append(.{ .thinking = "hmm" });
+    try tr.append(.{ .text = "after" });
+
+    tr.show_thinking = false;
+    var frm = try frame.Frame.init(std.testing.allocator, 20, 3);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
+
+    var raw: [20]u8 = undefined;
+    const r0 = try rowAscii(&frm, 0, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r0, "before") != null);
+    const r1 = try rowAscii(&frm, 1, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "after") != null);
+    // Row 2 should be blank
+    const r2 = try rowAscii(&frm, 2, raw[0..]);
+    try std.testing.expect(std.mem.indexOf(u8, r2, "thinking") == null);
 }
 
 test "scroll offset clamped to max" {

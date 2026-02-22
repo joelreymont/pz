@@ -223,12 +223,14 @@ fn hasFile(dir: std.fs.Dir, path: []const u8) !bool {
 }
 
 fn parseMode(raw: []const u8, comptime invalid: anytype) @TypeOf(invalid)!args.Mode {
-    if (std.mem.eql(u8, raw, "tui")) return .tui;
-    if (std.mem.eql(u8, raw, "interactive")) return .tui;
-    if (std.mem.eql(u8, raw, "print")) return .print;
-    if (std.mem.eql(u8, raw, "json")) return .json;
-    if (std.mem.eql(u8, raw, "rpc")) return .rpc;
-    return invalid;
+    const map = std.StaticStringMap(args.Mode).initComptime(.{
+        .{ "tui", .tui },
+        .{ "interactive", .tui },
+        .{ "print", .print },
+        .{ "json", .json },
+        .{ "rpc", .rpc },
+    });
+    return map.get(raw) orelse invalid;
 }
 
 fn replaceStr(

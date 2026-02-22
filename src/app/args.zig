@@ -14,6 +14,28 @@ pub const CfgSel = union(enum) {
     path: []const u8,
 };
 
+pub const ThinkingLevel = enum {
+    off,
+    minimal,
+    low,
+    medium,
+    high,
+    xhigh,
+    adaptive,
+
+    pub fn toProviderOpts(self: ThinkingLevel) core.providers.Opts {
+        return switch (self) {
+            .off => .{ .thinking = .off },
+            .adaptive => .{ .thinking = .adaptive },
+            .minimal => .{ .thinking = .budget, .thinking_budget = 1024 },
+            .low => .{ .thinking = .budget, .thinking_budget = 4096 },
+            .medium => .{ .thinking = .budget, .thinking_budget = 10240 },
+            .high => .{ .thinking = .budget, .thinking_budget = 32768 },
+            .xhigh => .{ .thinking = .budget, .thinking_budget = 65536 },
+        };
+    }
+};
+
 pub const Parsed = struct {
     mode: Mode = .tui,
     mode_set: bool = false,
@@ -26,6 +48,10 @@ pub const Parsed = struct {
     provider: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     provider_cmd: ?[]const u8 = null,
+    thinking: ThinkingLevel = .adaptive,
+    verbose: bool = false,
+    system_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -68,6 +94,10 @@ pub const ParseError = error{
     DuplicateSessionDir,
     MissingProviderCmdValue,
     DuplicateProviderCmd,
+    MissingThinkingValue,
+    InvalidThinking,
+    MissingSystemPromptValue,
+    MissingAppendSystemPromptValue,
 };
 
 pub fn parse(argv: []const []const u8) ParseError!Parsed {
@@ -77,168 +107,142 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
     var session_seen = false;
     var tools_seen = false;
 
+    const Flag = enum {
+        help, version, cont, resm, session, no_session,
+        tui, print, mode, prompt, config, no_config,
+        no_tools, tools, model, provider, session_dir, provider_cmd,
+        thinking, verbose, system_prompt, append_system_prompt,
+    };
+    const flag_map = std.StaticStringMap(Flag).initComptime(.{
+        .{ "-h", .help },
+        .{ "--help", .help },
+        .{ "-V", .version },
+        .{ "--version", .version },
+        .{ "-c", .cont },
+        .{ "--continue", .cont },
+        .{ "-r", .resm },
+        .{ "--resume", .resm },
+        .{ "--session", .session },
+        .{ "--no-session", .no_session },
+        .{ "--tui", .tui },
+        .{ "--print", .print },
+        .{ "-m", .mode },
+        .{ "--mode", .mode },
+        .{ "-p", .prompt },
+        .{ "--prompt", .prompt },
+        .{ "-C", .config },
+        .{ "--config", .config },
+        .{ "--no-config", .no_config },
+        .{ "--no-tools", .no_tools },
+        .{ "--tools", .tools },
+        .{ "--model", .model },
+        .{ "--provider", .provider },
+        .{ "--session-dir", .session_dir },
+        .{ "--provider-cmd", .provider_cmd },
+        .{ "--thinking", .thinking },
+        .{ "--verbose", .verbose },
+        .{ "--system-prompt", .system_prompt },
+        .{ "--append-system-prompt", .append_system_prompt },
+    });
+    const mode_map = std.StaticStringMap(Mode).initComptime(.{
+        .{ "tui", .tui },
+        .{ "interactive", .tui },
+        .{ "print", .print },
+        .{ "json", .json },
+        .{ "rpc", .rpc },
+    });
+
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const tok = argv[i];
 
-        if (std.mem.eql(u8, tok, "-h") or std.mem.eql(u8, tok, "--help")) {
-            out.show_help = true;
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "-V") or std.mem.eql(u8, tok, "--version")) {
-            out.show_version = true;
-            continue;
-        }
-
-        if (std.mem.eql(u8, tok, "-c") or std.mem.eql(u8, tok, "--continue")) {
-            try setSession(&out, &session_seen, .cont);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "-r") or std.mem.eql(u8, tok, "--resume")) {
-            try setSession(&out, &session_seen, .resm);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--session")) {
-            if (i + 1 >= argv.len) return error.MissingSessionValue;
-            i += 1;
-            if (argv[i].len == 0) return error.MissingSessionValue;
-            try setSession(&out, &session_seen, .{ .explicit = argv[i] });
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--session=")) {
-            const raw = tok["--session=".len..];
-            if (raw.len == 0) return error.MissingSessionValue;
-            try setSession(&out, &session_seen, .{ .explicit = raw });
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--no-session")) {
-            try setNoSession(&out, session_seen);
-            continue;
+        // Split --flag=value form
+        var flag_name = tok;
+        var eq_val: ?[]const u8 = null;
+        if (std.mem.startsWith(u8, tok, "--")) {
+            if (std.mem.indexOfScalar(u8, tok[2..], '=')) |eq| {
+                flag_name = tok[0 .. eq + 2];
+                eq_val = tok[eq + 3 ..]; // may be empty for --flag=
+            }
         }
 
-        if (std.mem.eql(u8, tok, "--tui")) {
-            try setMode(&out, &mode_seen, .tui);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--print")) {
-            try setMode(&out, &mode_seen, .print);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "-m") or std.mem.eql(u8, tok, "--mode")) {
-            if (i + 1 >= argv.len) return error.MissingModeValue;
-            i += 1;
-            try setMode(&out, &mode_seen, try parseMode(argv[i]));
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--mode=")) {
-            const raw = tok["--mode=".len..];
-            if (raw.len == 0) return error.MissingModeValue;
-            try setMode(&out, &mode_seen, try parseMode(raw));
-            continue;
-        }
-
-        if (std.mem.eql(u8, tok, "-p") or std.mem.eql(u8, tok, "--prompt")) {
-            if (i + 1 >= argv.len) return error.MissingPromptValue;
-            i += 1;
-            try setPrompt(&out, argv[i]);
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--prompt=")) {
-            const raw = tok["--prompt=".len..];
-            if (raw.len == 0) return error.MissingPromptValue;
-            try setPrompt(&out, raw);
-            continue;
-        }
-
-        if (std.mem.eql(u8, tok, "-C") or std.mem.eql(u8, tok, "--config")) {
-            if (i + 1 >= argv.len) return error.MissingConfigValue;
-            i += 1;
-            try setCfg(&out, &cfg_seen, .{ .path = argv[i] });
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--config=")) {
-            const raw = tok["--config=".len..];
-            if (raw.len == 0) return error.MissingConfigValue;
-            try setCfg(&out, &cfg_seen, .{ .path = raw });
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--no-config")) {
-            try setCfg(&out, &cfg_seen, .off);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--no-tools")) {
-            try setTools(&out, &tools_seen, 0);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--tools")) {
-            if (i + 1 >= argv.len) return error.MissingToolsValue;
-            i += 1;
-            try setTools(&out, &tools_seen, try parseToolMask(argv[i]));
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--tools=")) {
-            const raw = tok["--tools=".len..];
-            if (raw.len == 0) return error.MissingToolsValue;
-            try setTools(&out, &tools_seen, try parseToolMask(raw));
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--model")) {
-            if (i + 1 >= argv.len) return error.MissingModelValue;
-            i += 1;
-            try setModel(&out, argv[i]);
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--model=")) {
-            const raw = tok["--model=".len..];
-            if (raw.len == 0) return error.MissingModelValue;
-            try setModel(&out, raw);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--provider")) {
-            if (i + 1 >= argv.len) return error.MissingProviderValue;
-            i += 1;
-            try setProvider(&out, argv[i]);
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--provider=")) {
-            const raw = tok["--provider=".len..];
-            if (raw.len == 0) return error.MissingProviderValue;
-            try setProvider(&out, raw);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--session-dir")) {
-            if (i + 1 >= argv.len) return error.MissingSessionDirValue;
-            i += 1;
-            try setSessionDir(&out, argv[i]);
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--session-dir=")) {
-            const raw = tok["--session-dir=".len..];
-            if (raw.len == 0) return error.MissingSessionDirValue;
-            try setSessionDir(&out, raw);
-            continue;
-        }
-        if (std.mem.eql(u8, tok, "--provider-cmd")) {
-            if (i + 1 >= argv.len) return error.MissingProviderCmdValue;
-            i += 1;
-            try setProviderCmd(&out, argv[i]);
-            continue;
-        }
-        if (std.mem.startsWith(u8, tok, "--provider-cmd=")) {
-            const raw = tok["--provider-cmd=".len..];
-            if (raw.len == 0) return error.MissingProviderCmdValue;
-            try setProviderCmd(&out, raw);
+        if (flag_map.get(flag_name)) |flag| {
+            switch (flag) {
+                .help => out.show_help = true,
+                .version => out.show_version = true,
+                .cont => try setSession(&out, &session_seen, .cont),
+                .resm => try setSession(&out, &session_seen, .resm),
+                .session => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingSessionValue;
+                    if (val.len == 0) return error.MissingSessionValue;
+                    try setSession(&out, &session_seen, .{ .explicit = val });
+                },
+                .no_session => try setNoSession(&out, session_seen),
+                .tui => try setMode(&out, &mode_seen, .tui),
+                .print => try setMode(&out, &mode_seen, .print),
+                .mode => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingModeValue;
+                    if (val.len == 0) return error.MissingModeValue;
+                    try setMode(&out, &mode_seen, try parseMode(val));
+                },
+                .prompt => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingPromptValue;
+                    if (val.len == 0) return error.MissingPromptValue;
+                    try setPrompt(&out, val);
+                },
+                .config => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingConfigValue;
+                    try setCfg(&out, &cfg_seen, .{ .path = val });
+                },
+                .no_config => try setCfg(&out, &cfg_seen, .off),
+                .no_tools => try setTools(&out, &tools_seen, 0),
+                .tools => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingToolsValue;
+                    if (val.len == 0) return error.MissingToolsValue;
+                    try setTools(&out, &tools_seen, try parseToolMask(val));
+                },
+                .model => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingModelValue;
+                    if (val.len == 0) return error.MissingModelValue;
+                    try setModel(&out, val);
+                },
+                .provider => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingProviderValue;
+                    if (val.len == 0) return error.MissingProviderValue;
+                    try setProvider(&out, val);
+                },
+                .session_dir => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingSessionDirValue;
+                    if (val.len == 0) return error.MissingSessionDirValue;
+                    try setSessionDir(&out, val);
+                },
+                .provider_cmd => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingProviderCmdValue;
+                    if (val.len == 0) return error.MissingProviderCmdValue;
+                    try setProviderCmd(&out, val);
+                },
+                .thinking => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingThinkingValue;
+                    if (val.len == 0) return error.MissingThinkingValue;
+                    out.thinking = parseThinking(val) orelse return error.InvalidThinking;
+                },
+                .verbose => out.verbose = true,
+                .system_prompt => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingSystemPromptValue;
+                    if (val.len == 0) return error.MissingSystemPromptValue;
+                    out.system_prompt = val;
+                },
+                .append_system_prompt => {
+                    const val = eq_val orelse takeVal(argv, &i) orelse return error.MissingAppendSystemPromptValue;
+                    if (val.len == 0) return error.MissingAppendSystemPromptValue;
+                    out.append_system_prompt = val;
+                },
+            }
             continue;
         }
 
         if (!isOpt(tok)) {
-            if (i == 0 and !mode_seen and
-                (std.mem.eql(u8, tok, "tui") or
-                    std.mem.eql(u8, tok, "interactive") or
-                    std.mem.eql(u8, tok, "print") or
-                    std.mem.eql(u8, tok, "json") or
-                    std.mem.eql(u8, tok, "rpc")))
-            {
+            if (i == 0 and !mode_seen and mode_map.get(tok) != null) {
                 try setMode(&out, &mode_seen, try parseMode(tok));
                 continue;
             }
@@ -258,17 +262,44 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
     return out;
 }
 
+fn takeVal(argv: []const []const u8, i: *usize) ?[]const u8 {
+    if (i.* + 1 >= argv.len) return null;
+    i.* += 1;
+    return argv[i.*];
+}
+
+fn parseThinking(raw: []const u8) ?ThinkingLevel {
+    const map = std.StaticStringMap(ThinkingLevel).initComptime(.{
+        .{ "off", .off },
+        .{ "none", .off },
+        .{ "disabled", .off },
+        .{ "minimal", .minimal },
+        .{ "min", .minimal },
+        .{ "low", .low },
+        .{ "medium", .medium },
+        .{ "med", .medium },
+        .{ "high", .high },
+        .{ "xhigh", .xhigh },
+        .{ "max", .xhigh },
+        .{ "adaptive", .adaptive },
+        .{ "auto", .adaptive },
+    });
+    return map.get(raw);
+}
+
 fn isOpt(tok: []const u8) bool {
     return tok.len > 0 and tok[0] == '-';
 }
 
 fn parseMode(raw: []const u8) ParseError!Mode {
-    if (std.mem.eql(u8, raw, "tui")) return .tui;
-    if (std.mem.eql(u8, raw, "interactive")) return .tui;
-    if (std.mem.eql(u8, raw, "print")) return .print;
-    if (std.mem.eql(u8, raw, "json")) return .json;
-    if (std.mem.eql(u8, raw, "rpc")) return .rpc;
-    return error.InvalidMode;
+    const map = std.StaticStringMap(Mode).initComptime(.{
+        .{ "tui", .tui },
+        .{ "interactive", .tui },
+        .{ "print", .print },
+        .{ "json", .json },
+        .{ "rpc", .rpc },
+    });
+    return map.get(raw) orelse error.InvalidMode;
 }
 
 fn setMode(out: *Parsed, mode_seen: *bool, mode: Mode) ParseError!void {

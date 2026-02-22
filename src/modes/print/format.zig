@@ -16,6 +16,7 @@ const ToolResultOut = struct {
 pub const Formatter = struct {
     alloc: std.mem.Allocator,
     out: std.Io.AnyWriter,
+    verbose: bool = false,
     text_seen: bool = false,
     text_ended_nl: bool = false,
     thinking: std.ArrayListUnmanaged([]const u8) = .{},
@@ -66,8 +67,20 @@ pub const Formatter = struct {
     }
 
     pub fn finish(self: *Formatter) !void {
-        self.sortMeta();
+        if (!self.verbose) {
+            // Errors always shown even in non-verbose mode
+            for (self.errs.items) |text| {
+                try self.out.writeAll("err ");
+                try writeQuoted(self.out, text);
+                try self.out.writeByte('\n');
+            }
+            if (self.text_seen and !self.text_ended_nl) {
+                try self.out.writeByte('\n');
+            }
+            return;
+        }
 
+        self.sortMeta();
         if (!self.hasMeta()) return;
 
         if (self.text_seen and !self.text_ended_nl) {
@@ -284,6 +297,7 @@ fn expectFormatted(evs: []const core.providers.Ev, want: []const u8) !void {
     var buf: [2048]u8 = undefined;
     var fbs = std.io.fixedBufferStream(&buf);
     var formatter = Formatter.init(std.testing.allocator, fbs.writer().any());
+    formatter.verbose = true; // tests check full diagnostic output
     defer formatter.deinit();
 
     for (evs) |ev| try formatter.push(ev);

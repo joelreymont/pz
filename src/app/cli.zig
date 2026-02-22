@@ -13,6 +13,10 @@ pub const Run = struct {
     session: Args.SessionSel = .auto,
     no_session: bool = false,
     tool_mask: u8 = @import("../core/mod.zig").tools.builtin.mask_all,
+    thinking: Args.ThinkingLevel = .adaptive,
+    verbose: bool = false,
+    system_prompt: ?[]const u8 = null,
+    append_system_prompt: ?[]const u8 = null,
 };
 
 pub const Command = union(enum) {
@@ -54,6 +58,10 @@ pub fn parse(
             .session = parsed.session,
             .no_session = parsed.no_session,
             .tool_mask = parsed.tool_mask,
+            .thinking = parsed.thinking,
+            .verbose = parsed.verbose,
+            .system_prompt = parsed.system_prompt,
+            .append_system_prompt = parsed.append_system_prompt,
         },
     };
 }
@@ -89,6 +97,11 @@ pub const help_text =
     \\      --provider-cmd <CMD>    Override provider transport command
     \\      --tools <LIST>          Enable tool subset (read,write,bash,edit,grep,find,ls)
     \\      --no-tools              Disable all built-in tools
+    \\      --thinking <LEVEL>      Thinking mode (off,minimal,low,medium,high,xhigh,adaptive)
+    \\      --verbose               Show metadata in print mode
+    \\      --system-prompt <TEXT>   Override system prompt
+    \\      --append-system-prompt <TEXT>
+    \\                             Append to system prompt
     \\  -h, --help                  Show help
     \\  -V, --version               Show version
 ;
