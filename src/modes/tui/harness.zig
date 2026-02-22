@@ -185,14 +185,17 @@ pub const Ui = struct {
 
 fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     if (cols == 0 or text.len == 0) return text[0..0];
+    const wcwidth = @import("wcwidth.zig").wcwidth;
 
     var i: usize = 0;
     var used: usize = 0;
-    while (i < text.len and used < cols) {
+    while (i < text.len) {
         const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
-        _ = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        const w: usize = wcwidth(cp);
+        if (used + w > cols) break;
         i += n;
-        used += 1;
+        used += w;
     }
     return text[0..i];
 }

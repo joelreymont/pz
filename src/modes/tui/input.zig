@@ -265,7 +265,27 @@ fn mapCsiParam(seq: []const u8) Ev {
     if (seq.len == 4 and std.mem.eql(u8, seq, "1;3A")) {
         return .{ .key = .alt_up };
     }
+    // Kitty keyboard protocol: "N;Mu" where N=codepoint, M=modifiers
+    if (seq.len >= 3 and seq[seq.len - 1] == 'u') {
+        if (parseKittyKey(seq[0 .. seq.len - 1])) |k| return .{ .key = k };
+    }
     return .none;
+}
+
+fn parseKittyKey(params: []const u8) ?editor.Key {
+    // Format: "codepoint;modifiers" — modifiers: 2=shift, 4=shift+ctrl (mod-1 encoding)
+    // Actually kitty uses mod-1: 2=shift, 5=ctrl, 6=shift+ctrl
+    const sep = std.mem.indexOfScalar(u8, params, ';') orelse return null;
+    const cp = std.fmt.parseInt(u21, params[0..sep], 10) catch return null;
+    const mods = std.fmt.parseInt(u8, params[sep + 1 ..], 10) catch return null;
+    // mods is 1-based: actual = mods - 1. Bit 0=shift, bit 2=ctrl
+    const actual = mods -| 1;
+    const shift = actual & 1 != 0;
+    const ctrl = actual & 4 != 0;
+
+    // Shift+Ctrl+P (p=112, P=80)
+    if ((cp == 'p' or cp == 'P') and shift and ctrl) return .shift_ctrl_p;
+    return null;
 }
 
 // ============================================================
@@ -448,4 +468,22 @@ test "parse alt-up" {
     @memcpy(r.buf[0..seq.len], seq);
     r.len = seq.len;
     try expectKey(r.parseOne().?, .alt_up);
+}
+
+test "parse shift-ctrl-p kitty protocol" {
+    var r = Reader.init(-1);
+    // Kitty: ESC[112;6u (p=112, modifier 6=shift+ctrl)
+    const seq = "\x1b[112;6u";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    try expectKey(r.parseOne().?, .shift_ctrl_p);
+}
+
+test "parse shift-ctrl-p kitty uppercase" {
+    var r = Reader.init(-1);
+    // Kitty: ESC[80;6u (P=80, modifier 6=shift+ctrl)
+    const seq = "\x1b[80;6u";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    try expectKey(r.parseOne().?, .shift_ctrl_p);
 }

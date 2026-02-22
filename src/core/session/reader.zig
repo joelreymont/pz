@@ -52,11 +52,12 @@ pub const ReplayReader = struct {
         if (raw_line.len == 0) return error.EmptyReplayLine;
         if (raw_line.len > self.max_line_bytes) return error.ReplayLineTooLong;
 
-        var parsed = schema.decodeSlice(self.arena.allocator(), raw_line) catch |err| switch (err) {
+        const parsed = schema.decodeSlice(self.arena.allocator(), raw_line) catch |err| switch (err) {
             error.UnsupportedVersion => return error.UnsupportedVersion,
             else => return error.MalformedReplayLine,
         };
-        defer parsed.deinit();
+        // Don't deinit parsed — string slices in the Event reference memory
+        // owned by self.arena, which resets at the start of the next next() call.
 
         return parsed.value;
     }

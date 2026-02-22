@@ -19,6 +19,7 @@ pub fn build(b: *std.Build) void {
     b.default_step.dependOn(build_step);
 
     const run_cmd = b.addRunArtifact(exe);
+    run_cmd.stdio = .inherit;
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }

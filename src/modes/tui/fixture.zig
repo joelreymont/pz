@@ -82,25 +82,12 @@ test "e2e text + thinking + text" {
     try renderToVs(&ui, &vs);
 
     // h=8: tx_h=3 (rows 0..2), border 3, editor 4, border 5, footer 6-7
-    // Thinking hidden by default → collapsed "Thinking..." label with italic style
-    var found_label = false;
+    // Thinking hidden by default → thinking block not visible at all
     var r: usize = 0;
     while (r < 3) : (r += 1) {
         const row = try vs.rowText(std.testing.allocator, r);
         defer std.testing.allocator.free(row);
-        if (std.mem.indexOf(u8, row, "Thinking...") != null) {
-            try vs.expectItalic(r, 1, true);
-            try vs.expectFg(r, 1, .{ .rgb = 0x808080 });
-            found_label = true;
-            break;
-        }
-    }
-    try std.testing.expect(found_label);
-    // Full thinking content should NOT appear
-    r = 0;
-    while (r < 3) : (r += 1) {
-        const row = try vs.rowText(std.testing.allocator, r);
-        defer std.testing.allocator.free(row);
+        try std.testing.expect(std.mem.indexOf(u8, row, "Thinking...") == null);
         try std.testing.expect(std.mem.indexOf(u8, row, "analyzing the problem") == null);
     }
 }

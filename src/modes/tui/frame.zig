@@ -119,10 +119,15 @@ pub const Frame = struct {
         var it = (try std.unicode.Utf8View.init(text)).iterator();
         while (col < self.w) {
             const cp = it.nextCodepoint() orelse break;
-            const w: usize = wcwidth(cp);
+            // Skip control chars (ESC, etc) to prevent terminal escape leaking
+            if (cp < 0x20 and cp != '\t') continue;
+            if (cp == 0x7f) continue;
+            // Render tab as space
+            const rcp: u21 = if (cp == '\t') ' ' else cp;
+            const w: usize = if (cp == '\t') 1 else wcwidth(cp);
             if (w == 0) continue;
             if (col + w > self.w) break; // no room for wide char
-            self.cells[y * self.w + col] = .{ .cp = cp, .style = style };
+            self.cells[y * self.w + col] = .{ .cp = rcp, .style = style };
             if (w == 2) {
                 self.cells[y * self.w + col + 1] = .{ .cp = wide_pad, .style = style };
             }

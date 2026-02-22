@@ -40,6 +40,7 @@ const write_params = [_]tools.Tool.Param{
 const bash_params = [_]tools.Tool.Param{
     .{ .name = "cmd", .ty = .string, .required = true, .desc = "Shell command" },
     .{ .name = "cwd", .ty = .string, .required = false, .desc = "Working directory" },
+    .{ .name = "env", .ty = .string, .required = false, .desc = "Environment variables (KEY=VALUE, one per line)" },
 };
 
 const edit_params = [_]tools.Tool.Param{

@@ -44,12 +44,15 @@ pub const Theme = struct {
     thinking_med: Color,
     thinking_high: Color,
     thinking_xhigh: Color,
+    // Messages
+    custom_msg_label: Color,
     // Syntax
     syn_keyword: Color,
     syn_string: Color,
     syn_comment: Color,
     syn_number: Color,
     syn_func: Color,
+    syn_variable: Color,
     syn_type: Color,
     syn_operator: Color,
     syn_punct: Color,
@@ -100,15 +103,18 @@ pub const dark = Theme{
     .thinking_med = .{ .rgb = 0x81a2be },
     .thinking_high = .{ .rgb = 0xb294bb },
     .thinking_xhigh = .{ .rgb = 0xd183e8 },
-    // Syntax
-    .syn_keyword = .{ .rgb = 0xb294bb },
-    .syn_string = .{ .rgb = 0xb5bd68 },
-    .syn_comment = .{ .rgb = 0x666666 },
-    .syn_number = .{ .rgb = 0xde935f },
-    .syn_func = .{ .rgb = 0x8abeb7 },
-    .syn_type = .{ .rgb = 0xf0c674 },
-    .syn_operator = .{ .default = {} },
-    .syn_punct = .{ .rgb = 0x808080 },
+    // Messages
+    .custom_msg_label = .{ .rgb = 0x9575cd },
+    // Syntax (match pi dark.json exactly)
+    .syn_keyword = .{ .rgb = 0x569CD6 },
+    .syn_string = .{ .rgb = 0xCE9178 },
+    .syn_comment = .{ .rgb = 0x6A9955 },
+    .syn_number = .{ .rgb = 0xB5CEA8 },
+    .syn_func = .{ .rgb = 0xDCDCAA },
+    .syn_variable = .{ .rgb = 0x9CDCFE },
+    .syn_type = .{ .rgb = 0x4EC9B0 },
+    .syn_operator = .{ .rgb = 0xD4D4D4 },
+    .syn_punct = .{ .rgb = 0xD4D4D4 },
     // Bash
     .bash_mode = .{ .rgb = 0xb5bd68 },
 };
@@ -156,15 +162,18 @@ pub const light = Theme{
     .thinking_med = .{ .rgb = 0x6c71c4 },
     .thinking_high = .{ .rgb = 0xd33682 },
     .thinking_xhigh = .{ .rgb = 0xd33682 },
-    // Syntax (solarized light palette)
-    .syn_keyword = .{ .rgb = 0x6c71c4 },
-    .syn_string = .{ .rgb = 0x859900 },
-    .syn_comment = .{ .rgb = 0x93a1a1 },
-    .syn_number = .{ .rgb = 0xcb4b16 },
-    .syn_func = .{ .rgb = 0x2aa198 },
-    .syn_type = .{ .rgb = 0xb58900 },
-    .syn_operator = .{ .default = {} },
-    .syn_punct = .{ .rgb = 0x93a1a1 },
+    // Messages
+    .custom_msg_label = .{ .rgb = 0x7e57c2 },
+    // Syntax (light palette)
+    .syn_keyword = .{ .rgb = 0x0000FF },
+    .syn_string = .{ .rgb = 0xA31515 },
+    .syn_comment = .{ .rgb = 0x008000 },
+    .syn_number = .{ .rgb = 0x098658 },
+    .syn_func = .{ .rgb = 0x795E26 },
+    .syn_variable = .{ .rgb = 0x001080 },
+    .syn_type = .{ .rgb = 0x267f99 },
+    .syn_operator = .{ .rgb = 0x000000 },
+    .syn_punct = .{ .rgb = 0x000000 },
     // Bash
     .bash_mode = .{ .rgb = 0x859900 },
 };

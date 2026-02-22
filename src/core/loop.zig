@@ -540,10 +540,62 @@ fn buildReqTools(
         slot.* = .{
             .name = entry.name,
             .desc = entry.spec.desc,
-            .schema = "",
+            .schema = try buildSchema(alloc, entry.spec.params),
         };
     }
     return out;
+}
+
+fn buildSchema(alloc: std.mem.Allocator, params: []const tools.Spec.Param) ![]const u8 {
+    var buf: std.io.Writer.Allocating = .init(alloc);
+    errdefer buf.deinit();
+
+    var js: std.json.Stringify = .{
+        .writer = &buf.writer,
+        .options = .{},
+    };
+
+    try js.beginObject();
+    try js.objectField("type");
+    try js.write("object");
+
+    try js.objectField("properties");
+    try js.beginObject();
+    for (params) |p| {
+        try js.objectField(p.name);
+        try js.beginObject();
+        try js.objectField("type");
+        try js.write(switch (p.ty) {
+            .string => "string",
+            .int => "integer",
+            .bool => "boolean",
+        });
+        try js.objectField("description");
+        try js.write(p.desc);
+        try js.endObject();
+    }
+    try js.endObject();
+
+    // Required array
+    var has_req = false;
+    for (params) |p| {
+        if (p.required) {
+            has_req = true;
+            break;
+        }
+    }
+    if (has_req) {
+        try js.objectField("required");
+        try js.beginArray();
+        for (params) |p| {
+            if (p.required) try js.write(p.name);
+        }
+        try js.endArray();
+    }
+
+    try js.endObject();
+
+    return buf.toOwnedSlice() catch return error.OutOfMemory;
 }
 
 fn runTool(opts: Opts, tc: providers.ToolCall) (Err || anyerror)!providers.ToolResult {

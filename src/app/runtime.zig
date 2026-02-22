@@ -8,6 +8,7 @@ const tui_render = @import("../modes/tui/render.zig");
 const tui_term = @import("../modes/tui/term.zig");
 const tui_input = @import("../modes/tui/input.zig");
 const tui_editor = @import("../modes/tui/editor.zig");
+const tui_frame = @import("../modes/tui/frame.zig");
 const tui_theme = @import("../modes/tui/theme.zig");
 const args_mod = @import("args.zig");
 
@@ -486,19 +487,8 @@ fn runTui(
     ui.pn.thinking_label = thinkingLabel(thinking);
     ui.border_fg = thinkingBorderFg(thinking);
 
-    // Startup info: show discovered context files
-    {
-        const ctx_paths = try core.context.discoverPaths(alloc);
-        defer {
-            for (ctx_paths) |p| alloc.free(p);
-            alloc.free(ctx_paths);
-        }
-        for (ctx_paths) |p| {
-            const msg = try std.fmt.allocPrint(alloc, "  {s}", .{p});
-            defer alloc.free(msg);
-            try ui.tr.infoText(msg);
-        }
-    }
+    // Startup info matching pi's display
+    try showStartup(alloc, &ui);
 
     try ui.draw(out);
     if (run_cmd.prompt) |prompt| {
@@ -807,6 +797,13 @@ fn runTui(
                         .paste_image => {
                             if (pre) |p| alloc.free(p);
                             pasteImage(alloc, &ui);
+                            try ui.draw(out);
+                        },
+                        .reverse_cycle_model => {
+                            if (pre) |p| alloc.free(p);
+                            model = try reverseCycleModel(alloc, model, &model_owned);
+                            ui.pn.ctx_limit = modelCtxWindow(model);
+                            try ui.setModel(model);
                             try ui.draw(out);
                         },
                         .none => {
@@ -1866,6 +1863,20 @@ fn cycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8) ![
     return new;
 }
 
+fn reverseCycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8) ![]const u8 {
+    var next_idx: usize = model_cycle.len - 1;
+    for (model_cycle, 0..) |m, i| {
+        if (std.mem.eql(u8, cur, m)) {
+            next_idx = if (i == 0) model_cycle.len - 1 else i - 1;
+            break;
+        }
+    }
+    const new = try alloc.dupe(u8, model_cycle[next_idx]);
+    if (model_owned.*) |old| alloc.free(old);
+    model_owned.* = new;
+    return new;
+}
+
 fn cycleThinking(cur: args_mod.ThinkingLevel) args_mod.ThinkingLevel {
     return switch (cur) {
         .adaptive => .off,
@@ -1893,6 +1904,63 @@ fn thinkingBorderFg(level: args_mod.ThinkingLevel) @import("../modes/tui/frame.z
         .xhigh => t.thinking_xhigh,
         .adaptive => t.thinking_med,
     };
+}
+
+fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
+    const t = tui_theme.get();
+
+    // Version line: "pz" in accent, "v0.0.0" in dim
+    try ui.tr.styledText(" pz", .{ .fg = t.accent });
+    try ui.tr.styledText(" v" ++ cli.version, .{ .fg = t.dim });
+
+    // Hotkeys — key in dim, description in muted
+    const keys = [_][2][]const u8{
+        .{ "escape", "to interrupt" },
+        .{ "ctrl+c", "to clear" },
+        .{ "ctrl+c twice", "to exit" },
+        .{ "ctrl+d", "to exit (empty)" },
+        .{ "ctrl+z", "to suspend" },
+        .{ "ctrl+k", "to delete to end" },
+        .{ "shift+tab", "to cycle thinking level" },
+        .{ "ctrl+p/shift+ctrl+p", "to cycle models" },
+        .{ "ctrl+l", "to select model" },
+        .{ "ctrl+o", "to expand tools" },
+        .{ "ctrl+t", "to expand thinking" },
+        .{ "ctrl+g", "for external editor" },
+        .{ "/", "for commands" },
+        .{ "!", "to run bash" },
+        .{ "!!", "to run bash (no context)" },
+        .{ "alt+enter", "to queue follow-up" },
+        .{ "alt+up", "to edit all queued messages" },
+        .{ "ctrl+v", "to paste image" },
+    };
+    for (keys) |kv| {
+        // key in dim, description in muted (matching pi)
+        const line = try std.fmt.allocPrint(alloc, " \x1b[38;2;102;102;102m{s}\x1b[38;2;128;128;128m {s}\x1b[0m", .{ kv[0], kv[1] });
+        defer alloc.free(line);
+        try ui.tr.pushAnsiText(line);
+    }
+
+    // Context section
+    const ctx_paths = try core.context.discoverPaths(alloc);
+    defer {
+        for (ctx_paths) |p| alloc.free(p);
+        alloc.free(ctx_paths);
+    }
+    if (ctx_paths.len > 0) {
+        try ui.tr.styledText("", .{}); // blank line
+        try ui.tr.styledText("[Context]", .{ .fg = t.md_heading });
+        const home = std.posix.getenv("HOME") orelse "";
+        for (ctx_paths) |p| {
+            // Shorten home prefix to ~/
+            const display = if (home.len > 0 and std.mem.startsWith(u8, p, home))
+                try std.fmt.allocPrint(alloc, "  ~{s}", .{p[home.len..]})
+            else
+                try std.fmt.allocPrint(alloc, "  {s}", .{p});
+            defer alloc.free(display);
+            try ui.tr.infoText(display);
+        }
+    }
 }
 
 fn showCost(alloc: std.mem.Allocator, ui: *tui_harness.Ui) void {
@@ -2026,8 +2094,11 @@ fn runBashMode(
 fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
     const ed = std.posix.getenv("EDITOR") orelse std.posix.getenv("VISUAL") orelse "vi";
 
-    // Write current text to temp file
-    const tmp = "/tmp/pz-edit.txt";
+    // Write current text to unique temp file
+    var tmp_buf: [64]u8 = undefined;
+    const ts: u64 = @intCast(std.time.nanoTimestamp());
+    const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts}) catch return null;
+    defer std.fs.deleteFileAbsolute(tmp) catch {};
     {
         const f = std.fs.createFileAbsolute(tmp, .{}) catch return null;
         defer f.close();
@@ -2477,7 +2548,7 @@ test "runtime tui rejects blank-only stdin input" {
     defer cfg.cfg.deinit(std.testing.allocator);
 
     var in_fbs = std.io.fixedBufferStream("\n\r\n\n");
-    var out_buf: [2048]u8 = undefined;
+    var out_buf: [16384]u8 = undefined;
     var out_fbs = std.io.fixedBufferStream(&out_buf);
 
     try std.testing.expectError(

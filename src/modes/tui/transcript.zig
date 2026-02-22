@@ -103,10 +103,21 @@ pub const Transcript = struct {
                 }
                 try self.pushBlock(.text, t, .{});
             },
-            .thinking => |t| try self.pushFmt(.thinking, "[thinking] {s}", .{t}, .{
-                .fg = theme.get().thinking_fg,
-                .italic = true,
-            }),
+            .thinking => |t| {
+                // Coalesce consecutive thinking events
+                if (self.blocks.items.len > 0) {
+                    const last = &self.blocks.items[self.blocks.items.len - 1];
+                    if (last.kind == .thinking) {
+                        try ensureUtf8(t);
+                        try last.buf.appendSlice(self.alloc, t);
+                        return;
+                    }
+                }
+                try self.pushBlock(.thinking, t, .{
+                    .fg = theme.get().thinking_fg,
+                    .italic = true,
+                });
+            },
             .tool_call => |tc| try self.pushFmt(.tool, "[tool {s}#{s}] {s}", .{
                 tc.name,
                 tc.id,
@@ -154,7 +165,15 @@ pub const Transcript = struct {
     }
 
     pub fn infoText(self: *Transcript, t: []const u8) AppendError!void {
-        try self.pushBlock(.text, t, .{ .fg = theme.get().dim });
+        try self.pushBlock(.meta, t, .{ .fg = theme.get().dim });
+    }
+
+    pub fn styledText(self: *Transcript, t: []const u8, st: frame.Style) AppendError!void {
+        try self.pushBlock(.meta, t, st);
+    }
+
+    pub fn pushAnsiText(self: *Transcript, ansi_text: []const u8) AppendError!void {
+        try self.pushAnsi(.meta, "", .{}, ansi_text, .{});
     }
 
     pub fn render(self: *const Transcript, frm: *frame.Frame, rect: Rect) RenderError!void {
@@ -265,15 +284,13 @@ pub const Transcript = struct {
         }
     }
 
-    const thinking_label = "Thinking...";
-
     fn blockVisible(self: *const Transcript, b: *const Block) bool {
         if (!self.show_tools and b.kind == .tool) return false;
+        if (!self.show_thinking and b.kind == .thinking) return false;
         return true;
     }
 
-    fn blockDisplayText(self: *const Transcript, b: *const Block) []const u8 {
-        if (!self.show_thinking and b.kind == .thinking) return thinking_label;
+    fn blockDisplayText(_: *const Transcript, b: *const Block) []const u8 {
         return b.text();
     }
 
@@ -385,18 +402,16 @@ pub const WrapIter = struct {
             const cp_end = @min(i + n, self.text.len);
             const cp = std.unicode.utf8Decode(self.text[i..cp_end]) catch 0xFFFD;
 
-            cols += wc.wcwidth(cp);
+            const cw: usize = if (cp == '\t') 1 else wc.wcwidth(cp);
+            cols += cw;
             if (cols > self.w) {
                 // Need to break - look backward for space
                 var brk = i;
                 var scan = i;
-                // Scan backward from current position to find space
                 var found_space = false;
                 while (scan > start) {
                     scan -= 1;
-                    // Walk back to find a space
                     if (self.text[scan] == ' ' or self.text[scan] == '\t') {
-                        // Break after this space: exclude space from line
                         brk = scan;
                         found_space = true;
                         break;
@@ -407,9 +422,10 @@ pub const WrapIter = struct {
                     self.pos = brk + 1; // skip the space
                     return line;
                 } else {
-                    // Hard break at w columns
-                    const line = self.text[start..i];
-                    self.pos = i;
+                    // Hard break — must advance at least one codepoint
+                    const end = if (i == start) cp_end else i;
+                    const line = self.text[start..end];
+                    self.pos = end;
                     return line;
                 }
             }
@@ -462,10 +478,15 @@ fn writeStyled(
         const cp_len = std.unicode.utf8CodepointSequenceLength(cp) catch 1;
         const st = blk.styleAt(base_off + byte_pos);
         byte_pos += cp_len;
-        const w: usize = wcwidth(cp);
+        // Skip control chars to prevent terminal escape leaking
+        if (cp < 0x20 and cp != '\t') continue;
+        if (cp == 0x7f) continue;
+        // Render tab as space
+        const rcp: u21 = if (cp == '\t') ' ' else cp;
+        const w: usize = if (cp == '\t') 1 else wcwidth(cp);
         if (w == 0) continue;
         if (col + w > frm.w) break;
-        frm.cells[y * frm.w + col] = .{ .cp = cp, .style = st };
+        frm.cells[y * frm.w + col] = .{ .cp = rcp, .style = st };
         if (w == 2) {
             frm.cells[y * frm.w + col + 1] = .{ .cp = frame.Frame.wide_pad, .style = st };
         }
@@ -776,8 +797,8 @@ test "transcript appends provider events and renders fixed-height tail" {
     const r1 = try rowAscii(&frm, 1, raw1[0..]);
     const r2 = try rowAscii(&frm, 2, raw2[0..]);
 
-    // Thinking hidden by default → collapsed "Thinking..." label
-    try std.testing.expect(std.mem.indexOf(u8, r0, "Thinking...") != null);
+    // Thinking hidden by default → 3 visible blocks: one, tool, three
+    try std.testing.expect(std.mem.indexOf(u8, r0, "one") != null);
     try std.testing.expect(std.mem.indexOf(u8, r1, "[tool read#c1] {}") != null);
     try std.testing.expect(std.mem.indexOf(u8, r2, "three") != null);
 }
@@ -857,6 +878,24 @@ test "word wrap hard breaks long words" {
     const l1 = it.next().?;
     try std.testing.expectEqualStrings("abcde", l0);
     try std.testing.expectEqualStrings("fghij", l1);
+    try std.testing.expect(it.next() == null);
+}
+
+test "word wrap wide char in narrow terminal does not hang" {
+    // Wide CJK char (width=2) in width=1 terminal — must not infinite loop
+    var it = wrapIter("中", 1);
+    const l0 = it.next().?;
+    try std.testing.expectEqualStrings("中", l0);
+    try std.testing.expect(it.next() == null);
+}
+
+test "word wrap tabs count as width 1" {
+    // Tab is whitespace → acts as a break point and counts as 1 col
+    var it = wrapIter("a\tb\tc", 3);
+    const l0 = it.next().?;
+    try std.testing.expectEqualStrings("a", l0); // breaks at tab
+    const l1 = it.next().?;
+    try std.testing.expectEqualStrings("b\tc", l1); // b + tab + c = 3 cols, fits
     try std.testing.expect(it.next() == null);
 }
 
@@ -1187,7 +1226,7 @@ test "show_tools hides tool blocks" {
     try std.testing.expect(std.mem.indexOf(u8, r1h, "bye") != null);
 }
 
-test "thinking collapsed by default shows label with style" {
+test "thinking hidden by default, visible when toggled" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
@@ -1195,37 +1234,27 @@ test "thinking collapsed by default shows label with style" {
     try tr.append(.{ .thinking = "deep reasoning here" });
     try tr.append(.{ .text = "after" });
 
-    // Default: show_thinking=false → collapsed label
-    var frm = try frame.Frame.init(std.testing.allocator, 20, 3);
+    // Default: show_thinking=false → thinking block completely hidden
+    var frm = try frame.Frame.init(std.testing.allocator, 20, 2);
     defer frm.deinit(std.testing.allocator);
-    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 3 });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 20, .h = 2 });
 
     var raw: [20]u8 = undefined;
     const r0 = try rowAscii(&frm, 0, raw[0..]);
     try std.testing.expect(std.mem.indexOf(u8, r0, "before") != null);
     const r1 = try rowAscii(&frm, 1, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1, "Thinking...") != null);
-    // Full content NOT shown
-    try std.testing.expect(std.mem.indexOf(u8, r1, "deep reasoning") == null);
+    try std.testing.expect(std.mem.indexOf(u8, r1, "after") != null);
 
-    // Verify style: collapsed thinking label has italic + thinking_fg
-    const t = theme.get();
-    const c_think = try frm.cell(1, 1); // col 1 = first char after padding
-    try std.testing.expect(c_think.style.italic);
-    try std.testing.expect(frame.Color.eql(c_think.style.fg, t.thinking_fg));
-
-    const r2 = try rowAscii(&frm, 2, raw[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r2, "after") != null);
-
-    // Toggle on → full content visible with italic style
+    // Toggle on → thinking text visible with italic style
     tr.show_thinking = true;
     var frm2 = try frame.Frame.init(std.testing.allocator, 40, 3);
     defer frm2.deinit(std.testing.allocator);
     try tr.render(&frm2, .{ .x = 0, .y = 0, .w = 40, .h = 3 });
     var raw2: [40]u8 = undefined;
     const r1v = try rowAscii(&frm2, 1, raw2[0..]);
-    try std.testing.expect(std.mem.indexOf(u8, r1v, "[thinking]") != null);
-    // Expanded thinking also has italic + thinking_fg
+    try std.testing.expect(std.mem.indexOf(u8, r1v, "deep reasoning") != null);
+    // Expanded thinking has italic + thinking_fg
+    const t = theme.get();
     const c_exp = try frm2.cell(1, 1);
     try std.testing.expect(c_exp.style.italic);
     try std.testing.expect(frame.Color.eql(c_exp.style.fg, t.thinking_fg));

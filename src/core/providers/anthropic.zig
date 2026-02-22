@@ -180,6 +180,9 @@ const SseStream = struct {
             return .{ .err = self.err_text orelse "unknown error" };
         }
 
+        // Reset per-frame arena: previous event strings already consumed by caller.
+        _ = self.arena.reset(.retain_capacity);
+
         while (true) {
             const line = self.body_rdr.takeDelimiter('\n') catch |err| switch (err) {
                 error.ReadFailed => {

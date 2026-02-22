@@ -19,6 +19,7 @@ pub const Key = union(enum) {
     ctrl_t: void,
     ctrl_v: void,
     ctrl_z: void,
+    shift_ctrl_p: void,
     esc: void,
     shift_tab: void,
     alt_enter: void,
@@ -41,6 +42,7 @@ pub const Action = enum {
     queue_followup,
     edit_queued,
     paste_image,
+    reverse_cycle_model,
 };
 
 pub const Editor = struct {
@@ -125,6 +127,7 @@ pub const Editor = struct {
             .ctrl_t => .toggle_thinking,
             .ctrl_v => .paste_image,
             .ctrl_z => .@"suspend",
+            .shift_ctrl_p => .reverse_cycle_model,
             .alt_enter => .queue_followup,
             .alt_up => .edit_queued,
             .esc => blk: {
@@ -309,4 +312,5 @@ test "new keys produce correct actions" {
     try std.testing.expect((try ed.apply(.{ .ctrl_v = {} })) == .paste_image);
     try std.testing.expect((try ed.apply(.{ .alt_enter = {} })) == .queue_followup);
     try std.testing.expect((try ed.apply(.{ .alt_up = {} })) == .edit_queued);
+    try std.testing.expect((try ed.apply(.{ .shift_ctrl_p = {} })) == .reverse_cycle_model);
 }

@@ -68,6 +68,7 @@ pub const Renderer = struct {
         if (self.prev.w != next.w or self.prev.h != next.h) return error.SizeMismatch;
 
         try out.writeAll(decSet(.sync));
+        errdefer out.writeAll(decRst(.sync)) catch {};
 
         if (self.cold) {
             try out.writeAll("\x1b[0m\x1b[2J\x1b[H");
