@@ -2,6 +2,7 @@ const std = @import("std");
 const core = @import("../../core/mod.zig");
 const frame = @import("frame.zig");
 const theme = @import("theme.zig");
+const spinner = @import("spinner.zig");
 
 pub const Rect = struct {
     x: usize,
@@ -37,6 +38,11 @@ pub const ToolView = struct {
     state: ToolState,
 };
 
+pub const InputMode = enum {
+    steering,
+    queue,
+};
+
 pub const Panels = struct {
     alloc: std.mem.Allocator,
     rows: std.ArrayListUnmanaged(ToolRow) = .empty,
@@ -55,6 +61,9 @@ pub const Panels = struct {
     bg_launched: u32 = 0,
     bg_running: u32 = 0,
     bg_done: u32 = 0,
+    bg_spin: u8 = 0,
+    input_mode: InputMode = .steering,
+    queued_msgs: u32 = 0,
     thinking_label: []const u8 = "",
     is_sub: bool = false, // subscription (vs pay-per-token)
 
@@ -129,6 +138,16 @@ pub const Panels = struct {
         self.bg_done = done;
     }
 
+    pub fn setInputStatus(self: *Panels, mode: InputMode, queued: u32) void {
+        self.input_mode = mode;
+        self.queued_msgs = queued;
+    }
+
+    pub fn tickBgSpinner(self: *Panels) void {
+        if (self.bg_running == 0) return;
+        self.bg_spin +%= 1;
+    }
+
     pub fn count(self: *const Panels) usize {
         return self.rows.items.len;
     }
@@ -191,16 +210,34 @@ pub const Panels = struct {
         const dim_st = frame.Style{ .fg = theme.get().dim };
         const y1 = rect.y;
 
-        // --- Line 1: dim(cwd (branch)) ---
+        // --- Line 1: dim(project path + branch) ---
         {
             var x = rect.x;
-            if (self.cwd.len > 0) {
-                try writePart(frm, &x, x_end, y1, self.cwd, dim_st);
-            }
-            if (self.branch.len > 0) {
-                try writePart(frm, &x, x_end, y1, " (", dim_st);
-                try writePart(frm, &x, x_end, y1, self.branch, dim_st);
-                try writePart(frm, &x, x_end, y1, ")", dim_st);
+            if (self.branch.len == 0) {
+                if (self.cwd.len > 0) try writePart(frm, &x, x_end, y1, self.cwd, dim_st);
+            } else {
+                const branch_cols = cpCountSlice(self.branch) + 2; // "(" + branch + ")"
+                const has_cwd = self.cwd.len > 0;
+                const sep_cols: usize = if (has_cwd) 1 else 0;
+                const reserve_cols = branch_cols + sep_cols;
+                if (reserve_cols >= rect.w) {
+                    // Extremely narrow terminal: render branch only.
+                    try writePart(frm, &x, x_end, y1, "(", dim_st);
+                    try writePart(frm, &x, x_end, y1, self.branch, dim_st);
+                    try writePart(frm, &x, x_end, y1, ")", dim_st);
+                } else {
+                    var path_text = self.cwd;
+                    const path_cols = cpCountSlice(path_text);
+                    const max_path_cols = rect.w - reserve_cols;
+                    if (path_cols > max_path_cols) path_text = try clipLeftCols(path_text, max_path_cols);
+                    if (path_text.len > 0) {
+                        try writePart(frm, &x, x_end, y1, path_text, dim_st);
+                        try writePart(frm, &x, x_end, y1, " ", dim_st);
+                    }
+                    try writePart(frm, &x, x_end, y1, "(", dim_st);
+                    try writePart(frm, &x, x_end, y1, self.branch, dim_st);
+                    try writePart(frm, &x, x_end, y1, ")", dim_st);
+                }
             }
         }
 
@@ -212,6 +249,14 @@ pub const Panels = struct {
             var x = rect.x;
 
             // Left: turn count + usage stats
+            try writePart(frm, &x, x_end, y2, "mode ", dim_st);
+            try writePart(frm, &x, x_end, y2, inputModeText(self.input_mode), dim_st);
+            try writePart(frm, &x, x_end, y2, " q", dim_st);
+            var qbuf: [16]u8 = undefined;
+            const qtxt = fmtBuf(&qbuf, "{d}", .{self.queued_msgs}) catch return error.NoSpaceLeft;
+            try writePart(frm, &x, x_end, y2, qtxt, dim_st);
+            try writePart(frm, &x, x_end, y2, " ", dim_st);
+
             if (self.bg_launched > 0) {
                 try writePart(frm, &x, x_end, y2, "bg L", dim_st);
                 var lbuf: [16]u8 = undefined;
@@ -225,6 +270,11 @@ pub const Panels = struct {
                 var dbuf: [16]u8 = undefined;
                 const dtxt = fmtBuf(&dbuf, "{d}", .{self.bg_done}) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, dtxt, dim_st);
+                if (self.bg_running > 0) {
+                    var sbuf: [4]u8 = undefined;
+                    try writePart(frm, &x, x_end, y2, " ", dim_st);
+                    try writePart(frm, &x, x_end, y2, spinner.utf8(self.bg_spin, &sbuf), dim_st);
+                }
                 try writePart(frm, &x, x_end, y2, " ", dim_st);
             }
             if (self.turns > 0) {
@@ -448,6 +498,13 @@ fn digitCols(n: u64) usize {
     return c;
 }
 
+fn inputModeText(mode: InputMode) []const u8 {
+    return switch (mode) {
+        .steering => "steering",
+        .queue => "queue",
+    };
+}
+
 fn usageCols(self: *const Panels) usize {
     // ↑N ↓N = 1+digits + 1 + 1+digits
     var c: usize = 0;
@@ -538,6 +595,26 @@ fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
         used += w;
     }
     return text[0..i];
+}
+
+fn clipLeftCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
+    if (cols == 0 or text.len == 0) return text[0..0];
+    const wc = @import("wcwidth.zig");
+
+    const total = cpCountSlice(text);
+    if (total <= cols) return text;
+    const skip = total - cols;
+
+    var i: usize = 0;
+    var used: usize = 0;
+    while (i < text.len and used < skip) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        used += wc.wcwidth(cp);
+        i += n;
+    }
+    return text[i..];
 }
 
 fn writePart(
@@ -648,10 +725,11 @@ test "panels render 2-line footer with cwd and model" {
 
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    // Line 1: "myproj" at col 0 with dim color (no branch shown)
+    // Line 1: "myproj (main)" with dim color
     try expectPrefix(&frm, 0, "myproj");
     const cwd_cell = try frm.cell(0, 0);
     try std.testing.expect(frame.Color.eql(cwd_cell.style.fg, theme.get().dim));
+    try std.testing.expect(findAsciiSeq(&frm, 0, "(main)"));
 
     // Line 2: model name right-aligned
     // Find 'g' of "gpt-4" on line 2
@@ -698,6 +776,17 @@ test "panels render footer cwd only no branch" {
     // No parens at col 4 - should be space (no branch)
     const after = try frm.cell(4, 0);
     try std.testing.expectEqual(@as(u21, ' '), after.cp);
+}
+
+test "panels footer keeps branch visible with long path" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "/Users/joel/Work/really/long/project/path", "main");
+    defer ps.deinit();
+
+    var frm = try frame.Frame.init(std.testing.allocator, 24, 2);
+    defer frm.deinit(std.testing.allocator);
+
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 24, .h = 2 });
+    try std.testing.expect(findAsciiSeq(&frm, 0, "(main)"));
 }
 
 test "panels footer shows initial 0.0% and (auto) with ctx_limit" {
@@ -752,6 +841,17 @@ fn findAsciiSeq(frm: *const frame.Frame, y: usize, needle: []const u8) bool {
         if (ok) return true;
     }
     return false;
+}
+
+fn firstSpinnerCp(frm: *const frame.Frame, y: usize) ?u21 {
+    var x: usize = 0;
+    while (x < frm.w) : (x += 1) {
+        const c = frm.cell(x, y) catch return null;
+        for (spinner.chars) |sp| {
+            if (c.cp == sp) return c.cp;
+        }
+    }
+    return null;
 }
 
 test "panels validate utf8 model and event fields" {
@@ -845,6 +945,22 @@ test "panels footer shows turn count" {
     try std.testing.expect(findAsciiSeq(&frm, 1, "5 turns"));
 }
 
+test "panels footer shows input mode and queue count" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
+    defer ps.deinit();
+    ps.setInputStatus(.queue, 3);
+
+    var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
+
+    try std.testing.expect(findAsciiSeq(&frm, 1, "mode queue q3"));
+
+    ps.setInputStatus(.steering, 0);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
+    try std.testing.expect(findAsciiSeq(&frm, 1, "mode steering q0"));
+}
+
 test "panels footer shows background job counts" {
     var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
     defer ps.deinit();
@@ -855,4 +971,20 @@ test "panels footer shows background job counts" {
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 50, .h = 2 });
 
     try std.testing.expect(findAsciiSeq(&frm, 1, "bg L3 R1 D2"));
+}
+
+test "panels footer animates background spinner while running" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
+    defer ps.deinit();
+    ps.setBgStatus(2, 1, 1);
+
+    var frm = try frame.Frame.init(std.testing.allocator, 50, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 50, .h = 2 });
+    const first = firstSpinnerCp(&frm, 1) orelse return error.TestUnexpectedResult;
+
+    ps.tickBgSpinner();
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 50, .h = 2 });
+    const second = firstSpinnerCp(&frm, 1) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first != second);
 }

@@ -80,8 +80,20 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_tests.step);
     test_step.dependOn(&run_suite_tests.step);
 
+    const perf_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/perf_tests.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const run_perf_tests = b.addRunArtifact(perf_tests);
+    const perf_step = b.step("perf", "Run performance budget tests");
+    perf_step.dependOn(&run_perf_tests.step);
+
     const check_step = b.step("check", "Compile executable and tests");
     check_step.dependOn(&exe.step);
     check_step.dependOn(&exe_tests.step);
     check_step.dependOn(&suite_tests.step);
+    check_step.dependOn(&perf_tests.step);
 }

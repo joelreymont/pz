@@ -56,6 +56,7 @@ pub const Parsed = struct {
     max_turns: u16 = 0,
     show_help: bool = false,
     show_version: bool = false,
+    show_upgrade: bool = false,
     show_changelog: bool = false,
 };
 
@@ -106,6 +107,30 @@ pub const ParseError = error{
     InvalidMaxTurns,
 };
 
+const mode_map = std.StaticStringMap(Mode).initComptime(.{
+    .{ "tui", .tui },
+    .{ "interactive", .tui },
+    .{ "print", .print },
+    .{ "json", .json },
+    .{ "rpc", .rpc },
+});
+
+const thinking_map = std.StaticStringMap(ThinkingLevel).initComptime(.{
+    .{ "off", .off },
+    .{ "none", .off },
+    .{ "disabled", .off },
+    .{ "minimal", .minimal },
+    .{ "min", .minimal },
+    .{ "low", .low },
+    .{ "medium", .medium },
+    .{ "med", .medium },
+    .{ "high", .high },
+    .{ "xhigh", .xhigh },
+    .{ "max", .xhigh },
+    .{ "adaptive", .adaptive },
+    .{ "auto", .adaptive },
+});
+
 pub fn parse(argv: []const []const u8) ParseError!Parsed {
     var out = Parsed{};
     var mode_seen = false;
@@ -116,6 +141,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
     const Flag = enum {
         help,
         version,
+        upgrade,
         cont,
         resm,
         session,
@@ -145,6 +171,8 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .{ "--help", .help },
         .{ "-V", .version },
         .{ "--version", .version },
+        .{ "--upgrade", .upgrade },
+        .{ "--self-upgrade", .upgrade },
         .{ "-c", .cont },
         .{ "--continue", .cont },
         .{ "-r", .resm },
@@ -174,14 +202,6 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .{ "--changelog", .changelog },
         .{ "--max-turns", .max_turns },
     });
-    const mode_map = std.StaticStringMap(Mode).initComptime(.{
-        .{ "tui", .tui },
-        .{ "interactive", .tui },
-        .{ "print", .print },
-        .{ "json", .json },
-        .{ "rpc", .rpc },
-    });
-
     var i: usize = 0;
     while (i < argv.len) : (i += 1) {
         const tok = argv[i];
@@ -200,6 +220,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
             switch (flag) {
                 .help => out.show_help = true,
                 .version => out.show_version = true,
+                .upgrade => out.show_upgrade = true,
                 .changelog => out.show_changelog = true,
                 .cont => try setSession(&out, &session_seen, .cont),
                 .resm => try setSession(&out, &session_seen, .resm),
@@ -297,7 +318,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         return error.UnknownArg;
     }
 
-    if (out.show_help or out.show_version) return out;
+    if (out.show_help or out.show_version or out.show_upgrade) return out;
     if (mode_seen and out.mode == .print and out.prompt == null) return error.MissingPrintPrompt;
     return out;
 }
@@ -309,22 +330,7 @@ fn takeVal(argv: []const []const u8, i: *usize) ?[]const u8 {
 }
 
 fn parseThinking(raw: []const u8) ?ThinkingLevel {
-    const map = std.StaticStringMap(ThinkingLevel).initComptime(.{
-        .{ "off", .off },
-        .{ "none", .off },
-        .{ "disabled", .off },
-        .{ "minimal", .minimal },
-        .{ "min", .minimal },
-        .{ "low", .low },
-        .{ "medium", .medium },
-        .{ "med", .medium },
-        .{ "high", .high },
-        .{ "xhigh", .xhigh },
-        .{ "max", .xhigh },
-        .{ "adaptive", .adaptive },
-        .{ "auto", .adaptive },
-    });
-    return map.get(raw);
+    return thinking_map.get(raw);
 }
 
 fn isOpt(tok: []const u8) bool {
@@ -332,14 +338,7 @@ fn isOpt(tok: []const u8) bool {
 }
 
 fn parseMode(raw: []const u8) ParseError!Mode {
-    const map = std.StaticStringMap(Mode).initComptime(.{
-        .{ "tui", .tui },
-        .{ "interactive", .tui },
-        .{ "print", .print },
-        .{ "json", .json },
-        .{ "rpc", .rpc },
-    });
-    return map.get(raw) orelse error.InvalidMode;
+    return mode_map.get(raw) orelse error.InvalidMode;
 }
 
 fn setMode(out: *Parsed, mode_seen: *bool, mode: Mode) ParseError!void {
@@ -495,6 +494,14 @@ test "parse help and version flags" {
     try std.testing.expect(short.show_version);
 }
 
+test "parse upgrade flags" {
+    const up = try parse(&.{"--upgrade"});
+    try std.testing.expect(up.show_upgrade);
+
+    const self_up = try parse(&.{"--self-upgrade"});
+    try std.testing.expect(self_up.show_upgrade);
+}
+
 test "errors on unknown arg" {
     try std.testing.expectError(error.UnknownArg, parse(&.{"--wat"}));
 }
@@ -546,6 +553,13 @@ test "errors when print mode has no prompt" {
 test "help bypasses prompt requirement checks" {
     const out = try parse(&.{ "--print", "--help" });
     try std.testing.expect(out.show_help);
+    try std.testing.expectEqual(Mode.print, out.mode);
+    try std.testing.expect(out.prompt == null);
+}
+
+test "upgrade bypasses prompt requirement checks" {
+    const out = try parse(&.{ "--print", "--upgrade" });
+    try std.testing.expect(out.show_upgrade);
     try std.testing.expectEqual(Mode.print, out.mode);
     try std.testing.expect(out.prompt == null);
 }

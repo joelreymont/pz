@@ -18,12 +18,14 @@ pub const Kind = enum {
     grep,
     find,
     ls,
+    ask,
 };
 
 pub const Tool = struct {
     kind: Kind,
     desc: []const u8,
     params: []const Param,
+    schema_json: ?[]const u8 = null,
     out: OutSpec,
     timeout_ms: u32,
     destructive: bool,
@@ -70,6 +72,7 @@ pub const Call = struct {
         grep: GrepArgs,
         find: FindArgs,
         ls: LsArgs,
+        ask: AskArgs,
     };
 
     pub const ReadArgs = struct {
@@ -113,6 +116,23 @@ pub const Call = struct {
     pub const LsArgs = struct {
         path: []const u8 = ".",
         all: bool = false,
+    };
+
+    pub const AskArgs = struct {
+        questions: []const Question,
+
+        pub const Question = struct {
+            id: []const u8,
+            header: []const u8 = "",
+            question: []const u8,
+            options: []const Option,
+            allow_other: bool = true,
+        };
+
+        pub const Option = struct {
+            label: []const u8,
+            description: []const u8 = "",
+        };
     };
 
     pub const Env = struct {

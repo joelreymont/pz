@@ -7,7 +7,7 @@ const Frame = frame_mod.Frame;
 const Style = frame_mod.Style;
 const Color = frame_mod.Color;
 
-pub const Kind = enum { model, session, settings, fork, login, logout };
+pub const Kind = enum { model, session, settings, fork, login, logout, queue };
 
 pub const Overlay = struct {
     items: []const []const u8,
@@ -17,6 +17,10 @@ pub const Overlay = struct {
     scroll: usize = 0,
     title: []const u8 = "Select Model",
     kind: Kind = .model,
+    hint: ?[]const u8 = null,
+    input_label: ?[]const u8 = null,
+    input_text: ?[]const u8 = null,
+    input_cursor: bool = false,
 
     const max_vis: usize = 12;
 
@@ -101,17 +105,31 @@ pub const Overlay = struct {
     pub fn render(self: *const Overlay, frm: *Frame) !void {
         const t = theme_mod.get();
         const items = self.itemSlice();
+        const hint_text = self.hint;
+        const has_hint = hint_text != null and hint_text.?.len > 0;
+        const has_input = self.input_label != null and self.input_text != null;
 
         // Compute box dimensions
         var max_w: usize = wc.strwidth(self.title);
-        const vis_n = @min(items.len, max_vis);
+        var vis_n = @min(items.len, max_vis);
         for (items) |item| {
             const label = if (self.kind == .model) shortLabel(item) else item;
             const lw = wc.strwidth(label);
             if (lw + 4 > max_w) max_w = lw + 4;
         }
+        if (has_hint) {
+            const hw = wc.strwidth(hint_text.?) + 4;
+            if (hw > max_w) max_w = hw;
+        }
+        if (has_input) {
+            const iw = wc.strwidth(self.input_label.?) + 2 + wc.strwidth(self.input_text.?) + if (self.input_cursor) @as(usize, 1) else @as(usize, 0);
+            if (iw + 4 > max_w) max_w = iw + 4;
+        }
+        const extra_rows: usize = (if (has_hint) @as(usize, 1) else @as(usize, 0)) + (if (has_input) @as(usize, 1) else @as(usize, 0));
+        const max_item_rows: usize = if (frm.h > 2 + extra_rows) frm.h - 2 - extra_rows else 0;
+        vis_n = @min(vis_n, max_item_rows);
         const box_w = @min(max_w + 4, frm.w);
-        const box_h = vis_n + 2;
+        const box_h = vis_n + 2 + extra_rows;
 
         if (box_w < 8 or box_h > frm.h) return;
 
@@ -233,6 +251,92 @@ pub const Overlay = struct {
             }
 
             try frm.set(x0 + box_w - 1, y, 0x2502, border_st); // │
+        }
+
+        var extra_y = y0 + 1 + vis_n;
+        if (has_hint) {
+            const hint_st = Style{ .fg = .{ .rgb = 0x969896 } };
+            try frm.set(x0, extra_y, 0x2502, border_st); // │
+            var x = x0 + 1;
+            while (x < x0 + box_w - 1) : (x += 1) {
+                try frm.set(x, extra_y, ' ', Style{ .bg = bg });
+            }
+            x = x0 + 2;
+            const text = hint_text.?;
+            var ti: usize = 0;
+            while (ti < text.len) {
+                if (x >= x0 + box_w - 2) break;
+                const n = std.unicode.utf8ByteSequenceLength(text[ti]) catch break;
+                if (ti + n > text.len) break;
+                const cp = std.unicode.utf8Decode(text[ti .. ti + n]) catch break;
+                const cw = wc.wcwidth(cp);
+                if (x + cw > x0 + box_w - 1) break;
+                try frm.set(x, extra_y, cp, Style{
+                    .fg = hint_st.fg,
+                    .bg = bg,
+                });
+                x += cw;
+                ti += n;
+            }
+            try frm.set(x0 + box_w - 1, extra_y, 0x2502, border_st); // │
+            extra_y += 1;
+        }
+
+        if (has_input) {
+            const inp_bg: Color = .{ .rgb = 0x222426 };
+            const label_st = Style{ .fg = .{ .rgb = 0x81a1c1 }, .bold = true };
+            const text_st = Style{ .fg = .{ .rgb = 0xc5c8c6 } };
+
+            try frm.set(x0, extra_y, 0x2502, border_st); // │
+            var x = x0 + 1;
+            while (x < x0 + box_w - 1) : (x += 1) {
+                try frm.set(x, extra_y, ' ', Style{ .bg = inp_bg });
+            }
+            x = x0 + 2;
+
+            const label = self.input_label.?;
+            var li: usize = 0;
+            while (li < label.len) {
+                if (x >= x0 + box_w - 2) break;
+                const n = std.unicode.utf8ByteSequenceLength(label[li]) catch break;
+                if (li + n > label.len) break;
+                const cp = std.unicode.utf8Decode(label[li .. li + n]) catch break;
+                const cw = wc.wcwidth(cp);
+                if (x + cw > x0 + box_w - 1) break;
+                try frm.set(x, extra_y, cp, Style{ .fg = label_st.fg, .bg = inp_bg, .bold = true });
+                x += cw;
+                li += n;
+            }
+            if (x < x0 + box_w - 2) {
+                try frm.set(x, extra_y, ':', Style{ .fg = label_st.fg, .bg = inp_bg, .bold = true });
+                x += 1;
+            }
+            if (x < x0 + box_w - 2) {
+                try frm.set(x, extra_y, ' ', Style{ .bg = inp_bg });
+                x += 1;
+            }
+
+            const text = self.input_text.?;
+            var ti: usize = 0;
+            while (ti < text.len) {
+                if (x >= x0 + box_w - 2) break;
+                const n = std.unicode.utf8ByteSequenceLength(text[ti]) catch break;
+                if (ti + n > text.len) break;
+                const cp = std.unicode.utf8Decode(text[ti .. ti + n]) catch break;
+                const cw = wc.wcwidth(cp);
+                if (x + cw > x0 + box_w - 1) break;
+                try frm.set(x, extra_y, cp, Style{
+                    .fg = text_st.fg,
+                    .bg = inp_bg,
+                });
+                x += cw;
+                ti += n;
+            }
+            if (self.input_cursor and x < x0 + box_w - 2) {
+                try frm.set(x, extra_y, 0x2588, Style{ .fg = .{ .rgb = 0x81a1c1 }, .bg = inp_bg });
+            }
+            try frm.set(x0 + box_w - 1, extra_y, 0x2502, border_st); // │
+            extra_y += 1;
         }
 
         // Bottom border: └──────┘

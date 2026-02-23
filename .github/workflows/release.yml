@@ -55,15 +55,35 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: checkout
+        uses: actions/checkout@v4
+
       - name: download artifacts
         uses: actions/download-artifact@v4
         with:
           merge-multiple: true
 
+      - name: build release notes
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          awk -v tag="$tag" '
+            $0 ~ "^## \\[" tag "\\]" { in_section=1; next }
+            in_section && $0 ~ "^## \\[" { exit }
+            in_section { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+
+          if [ ! -s RELEASE_NOTES.md ]; then
+            {
+              echo "Release ${tag}"
+              echo
+              echo "See CHANGELOG.md for details."
+            } > RELEASE_NOTES.md
+          fi
+
       - name: create release
         uses: softprops/action-gh-release@v2
         with:
-          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
           files: |
             pz-x86_64-linux.tar.gz
             pz-aarch64-linux.tar.gz

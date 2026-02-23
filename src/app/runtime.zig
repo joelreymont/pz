@@ -1,7 +1,9 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const cli = @import("cli.zig");
 const bg = @import("bg.zig");
 const changelog = @import("changelog.zig");
+const update_mod = @import("update.zig");
 const version_check = @import("version.zig");
 const config = @import("config.zig");
 const core = @import("../core/mod.zig");
@@ -15,6 +17,7 @@ const tui_editor = @import("../modes/tui/editor.zig");
 const tui_frame = @import("../modes/tui/frame.zig");
 const tui_theme = @import("../modes/tui/theme.zig");
 const tui_overlay = @import("../modes/tui/overlay.zig");
+const tui_panels = @import("../modes/tui/panels.zig");
 const tui_pathcomp = @import("../modes/tui/pathcomp.zig");
 const args_mod = @import("args.zig");
 
@@ -172,6 +175,392 @@ const TuiSink = struct {
     }
 };
 
+const AskUiCtx = struct {
+    alloc: std.mem.Allocator,
+    ui: *tui_harness.Ui,
+    out: std.Io.AnyWriter,
+    stdin_fd: std.posix.fd_t,
+    pause: *std.atomic.Value(bool),
+
+    const Answer = struct {
+        id: []const u8,
+        answer: []const u8,
+        index: usize,
+    };
+
+    const StoredAnswer = struct {
+        answer: ?[]u8 = null,
+        index: ?usize = null,
+    };
+
+    const RowKind = union(enum) {
+        option: usize,
+        other: void,
+        prev: void,
+        next: void,
+        submit: void,
+    };
+
+    const RowSet = struct {
+        items: [][]u8,
+        kinds: []RowKind,
+
+        fn deinit(self: *RowSet, alloc: std.mem.Allocator) void {
+            if (self.items.len > 0) {
+                for (self.items) |item| alloc.free(item);
+                alloc.free(self.items);
+            }
+            if (self.kinds.len > 0) alloc.free(self.kinds);
+            self.items = &.{};
+            self.kinds = &.{};
+        }
+
+        fn releaseItems(self: *RowSet) [][]u8 {
+            const out = self.items;
+            self.items = &.{};
+            return out;
+        }
+    };
+
+    fn run(self: *AskUiCtx, args: core.tools.Call.AskArgs) anyerror![]u8 {
+        if (args.questions.len == 0) return error.InvalidArgs;
+
+        self.pause.store(true, .release);
+        defer self.pause.store(false, .release);
+
+        var stored = try self.alloc.alloc(StoredAnswer, args.questions.len);
+        defer {
+            for (stored) |a| {
+                if (a.answer) |txt| self.alloc.free(txt);
+            }
+            self.alloc.free(stored);
+        }
+        for (stored) |*a| a.* = .{};
+
+        var sel_by_q = try self.alloc.alloc(usize, args.questions.len);
+        defer self.alloc.free(sel_by_q);
+        @memset(sel_by_q, 0);
+
+        defer {
+            if (self.ui.ov) |*ov| {
+                ov.deinit(self.alloc);
+                self.ui.ov = null;
+                self.ui.draw(self.out) catch {};
+            }
+        }
+
+        var reader = tui_input.Reader.init(self.stdin_fd);
+        var q_idx: usize = 0;
+        var typing_other = false;
+        var other_ed = tui_editor.Editor.init(self.alloc);
+        defer other_ed.deinit();
+        var status_buf: [240]u8 = undefined;
+        var status_len: usize = 0;
+
+        while (true) {
+            const q = args.questions[q_idx];
+            if (q.id.len == 0 or q.question.len == 0) return error.InvalidArgs;
+
+            if (self.ui.ov) |*cur| {
+                cur.deinit(self.alloc);
+                self.ui.ov = null;
+            }
+
+            var rows = try buildAskRows(self.alloc, q, stored[q_idx], q_idx == 0, q_idx + 1 == args.questions.len);
+            defer rows.deinit(self.alloc);
+            if (rows.items.len == 0) return error.InvalidArgs;
+            if (sel_by_q[q_idx] >= rows.items.len) sel_by_q[q_idx] = 0;
+
+            var title_buf: [256]u8 = undefined;
+            const raw_title = if (q.header.len > 0) q.header else q.question;
+            const title = std.fmt.bufPrint(
+                &title_buf,
+                "[{d}/{d}] {s}",
+                .{ q_idx + 1, args.questions.len, raw_title },
+            ) catch raw_title;
+
+            const hint = if (status_len > 0)
+                status_buf[0..status_len]
+            else if (typing_other)
+                "Type a custom answer. Enter saves it."
+            else
+                q.question;
+
+            var ov = tui_overlay.Overlay.initDyn(
+                self.alloc,
+                rows.releaseItems(),
+                title,
+                .session,
+            );
+            ov.sel = sel_by_q[q_idx];
+            ov.fixScroll();
+            ov.hint = hint;
+            if (typing_other) {
+                ov.input_label = "Type something else";
+                ov.input_text = other_ed.text();
+                ov.input_cursor = true;
+            }
+            self.ui.ov = ov;
+            try self.ui.draw(self.out);
+
+            switch (reader.next()) {
+                .key => |key| {
+                    switch (key) {
+                        .esc, .ctrl_c => {
+                            if (self.ui.ov) |*cur| {
+                                cur.deinit(self.alloc);
+                                self.ui.ov = null;
+                                try self.ui.draw(self.out);
+                            }
+                            const partial = try collectAskAnswers(self.alloc, args.questions, stored);
+                            defer self.alloc.free(partial);
+                            return buildAskResult(self.alloc, true, partial);
+                        },
+                        else => {},
+                    }
+
+                    if (typing_other) {
+                        const act = try other_ed.apply(key);
+                        switch (act) {
+                            .submit => {
+                                const trimmed = std.mem.trim(u8, other_ed.text(), " \t\r\n");
+                                if (trimmed.len == 0) {
+                                    setStatus(&status_buf, &status_len, "Type a non-empty custom answer.");
+                                } else {
+                                    try self.setStoredAnswer(&stored[q_idx], trimmed, q.options.len);
+                                    typing_other = false;
+                                    status_len = 0;
+                                }
+                            },
+                            else => {},
+                        }
+                        continue;
+                    }
+
+                    switch (key) {
+                        .up => {
+                            sel_by_q[q_idx] = if (sel_by_q[q_idx] > 0) sel_by_q[q_idx] - 1 else rows.kinds.len - 1;
+                            status_len = 0;
+                        },
+                        .down => {
+                            sel_by_q[q_idx] = if (sel_by_q[q_idx] + 1 < rows.kinds.len) sel_by_q[q_idx] + 1 else 0;
+                            status_len = 0;
+                        },
+                        .left, .page_up => {
+                            if (q_idx > 0) q_idx -= 1;
+                            status_len = 0;
+                        },
+                        .right, .page_down => {
+                            if (q_idx + 1 < args.questions.len) q_idx += 1;
+                            status_len = 0;
+                        },
+                        .char => |cp| {
+                            if (cp >= '1' and cp <= '9') {
+                                const n: usize = @intCast(cp - '1');
+                                if (n < q.options.len) {
+                                    try self.setStoredAnswer(&stored[q_idx], q.options[n].label, n);
+                                    status_len = 0;
+                                }
+                            }
+                        },
+                        .enter => switch (rows.kinds[sel_by_q[q_idx]]) {
+                            .option => |opt_idx| {
+                                try self.setStoredAnswer(&stored[q_idx], q.options[opt_idx].label, opt_idx);
+                                status_len = 0;
+                            },
+                            .other => {
+                                typing_other = true;
+                                const existing = if (stored[q_idx].index != null and stored[q_idx].index.? == q.options.len and stored[q_idx].answer != null)
+                                    stored[q_idx].answer.?
+                                else
+                                    "";
+                                try other_ed.setText(existing);
+                                status_len = 0;
+                            },
+                            .prev => {
+                                if (q_idx > 0) q_idx -= 1;
+                                status_len = 0;
+                            },
+                            .next => {
+                                if (stored[q_idx].answer == null) {
+                                    setStatus(&status_buf, &status_len, "Pick an answer before moving to the next question.");
+                                } else if (q_idx + 1 < args.questions.len) {
+                                    q_idx += 1;
+                                    status_len = 0;
+                                }
+                            },
+                            .submit => {
+                                if (firstUnanswered(stored)) |miss| {
+                                    q_idx = miss;
+                                    setStatus(&status_buf, &status_len, "Please answer all questions before submitting.");
+                                } else {
+                                    if (self.ui.ov) |*cur| {
+                                        cur.deinit(self.alloc);
+                                        self.ui.ov = null;
+                                        try self.ui.draw(self.out);
+                                    }
+                                    const out_answers = try collectAskAnswers(self.alloc, args.questions, stored);
+                                    defer self.alloc.free(out_answers);
+                                    return buildAskResult(self.alloc, false, out_answers);
+                                }
+                            },
+                        },
+                        else => {},
+                    }
+                },
+                .resize => {
+                    if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
+                        try self.ui.resize(sz.w, sz.h);
+                    }
+                },
+                .none => continue,
+                .err => return error.TerminalSetupFailed,
+                else => {},
+            }
+        }
+    }
+
+    fn setStoredAnswer(self: *AskUiCtx, dst: *StoredAnswer, text: []const u8, index: usize) !void {
+        if (dst.answer) |old| self.alloc.free(old);
+        dst.answer = try self.alloc.dupe(u8, text);
+        dst.index = index;
+    }
+};
+
+fn collectAskAnswers(
+    alloc: std.mem.Allocator,
+    questions: []const core.tools.Call.AskArgs.Question,
+    stored: []const AskUiCtx.StoredAnswer,
+) ![]AskUiCtx.Answer {
+    var ct: usize = 0;
+    for (stored) |a| {
+        if (a.answer != null) ct += 1;
+    }
+    const out = try alloc.alloc(AskUiCtx.Answer, ct);
+    var i: usize = 0;
+    for (questions, stored) |q, a| {
+        const txt = a.answer orelse continue;
+        out[i] = .{
+            .id = q.id,
+            .answer = txt,
+            .index = a.index orelse 0,
+        };
+        i += 1;
+    }
+    return out;
+}
+
+fn firstUnanswered(stored: []const AskUiCtx.StoredAnswer) ?usize {
+    for (stored, 0..) |a, i| {
+        if (a.answer == null) return i;
+    }
+    return null;
+}
+
+fn setStatus(buf: *[240]u8, len: *usize, text: []const u8) void {
+    const n = @min(buf.len, text.len);
+    @memcpy(buf[0..n], text[0..n]);
+    len.* = n;
+}
+
+fn buildAskRows(
+    alloc: std.mem.Allocator,
+    q: core.tools.Call.AskArgs.Question,
+    selected: AskUiCtx.StoredAnswer,
+    is_first: bool,
+    is_last: bool,
+) !AskUiCtx.RowSet {
+    const TmpRow = struct {
+        label: []u8,
+        kind: AskUiCtx.RowKind,
+    };
+
+    var rows: std.ArrayListUnmanaged(TmpRow) = .empty;
+    errdefer {
+        for (rows.items) |r| alloc.free(r.label);
+        rows.deinit(alloc);
+    }
+
+    for (q.options, 0..) |opt, idx| {
+        const is_sel = selected.index != null and selected.index.? == idx;
+        const prefix = if (is_sel) "[x]" else "[ ]";
+        const label = if (opt.description.len == 0)
+            try std.fmt.allocPrint(alloc, "{s} {s}", .{ prefix, opt.label })
+        else
+            try std.fmt.allocPrint(alloc, "{s} {s} - {s}", .{ prefix, opt.label, opt.description });
+        try rows.append(alloc, .{
+            .label = label,
+            .kind = .{ .option = idx },
+        });
+    }
+
+    const has_other = q.allow_other or q.options.len == 0;
+    if (has_other) {
+        const other_idx = q.options.len;
+        const is_sel = selected.index != null and selected.index.? == other_idx;
+        const prefix = if (is_sel) "[x]" else "[ ]";
+        const label = if (is_sel and selected.answer != null)
+            try std.fmt.allocPrint(alloc, "{s} Type something else: {s}", .{ prefix, selected.answer.? })
+        else
+            try std.fmt.allocPrint(alloc, "{s} Type something else", .{prefix});
+        try rows.append(alloc, .{
+            .label = label,
+            .kind = .other,
+        });
+    }
+
+    if (!is_first) {
+        try rows.append(alloc, .{
+            .label = try alloc.dupe(u8, "Previous question"),
+            .kind = .prev,
+        });
+    }
+    try rows.append(alloc, .{
+        .label = try alloc.dupe(u8, if (is_last) "Submit answers" else "Next question"),
+        .kind = if (is_last) .submit else .next,
+    });
+
+    const out_items = try alloc.alloc([]u8, rows.items.len);
+    errdefer alloc.free(out_items);
+    const out_kinds = try alloc.alloc(AskUiCtx.RowKind, rows.items.len);
+    errdefer alloc.free(out_kinds);
+    for (rows.items, 0..) |r, i| {
+        out_items[i] = r.label;
+        out_kinds[i] = r.kind;
+    }
+    rows.deinit(alloc);
+    return .{
+        .items = out_items,
+        .kinds = out_kinds,
+    };
+}
+
+fn buildAskResult(alloc: std.mem.Allocator, cancelled: bool, answers: []const AskUiCtx.Answer) ![]u8 {
+    const OutAnswer = struct {
+        id: []const u8,
+        answer: []const u8,
+        index: usize,
+    };
+    const Out = struct {
+        cancelled: bool,
+        answers: []const OutAnswer,
+    };
+
+    const out_answers = try alloc.alloc(OutAnswer, answers.len);
+    defer alloc.free(out_answers);
+    for (answers, 0..) |ans, i| {
+        out_answers[i] = .{
+            .id = ans.id,
+            .answer = ans.answer,
+            .index = ans.index,
+        };
+    }
+    return std.json.Stringify.valueAlloc(alloc, Out{
+        .cancelled = cancelled,
+        .answers = out_answers,
+    }, .{});
+}
+
 /// Reads stdin on a dedicated thread during streaming. Sets an atomic
 /// flag when ESC is pressed, allowing the core loop's CancelSrc to
 /// detect cancellation without platform-specific non-blocking hacks.
@@ -181,12 +570,20 @@ const InputWatcher = struct {
     stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     thread: ?std.Thread = null,
     fd: std.posix.fd_t,
+    pause: ?*std.atomic.Value(bool) = null,
     /// Buffer for non-ESC bytes consumed during streaming, replayed after join().
     stash: [64]u8 = undefined,
     stash_len: std.atomic.Value(u8) = std.atomic.Value(u8).init(0),
 
     fn init(fd: std.posix.fd_t) InputWatcher {
         return .{ .fd = fd };
+    }
+
+    fn initWithPause(fd: std.posix.fd_t, pause: *std.atomic.Value(bool)) InputWatcher {
+        return .{
+            .fd = fd,
+            .pause = pause,
+        };
     }
 
     /// Start watching stdin for ESC on a background thread.
@@ -218,6 +615,12 @@ const InputWatcher = struct {
 
     fn watchFn(self: *InputWatcher) void {
         while (!self.stop.load(.acquire)) {
+            if (self.pause) |pause| {
+                if (pause.load(.acquire)) {
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                    continue;
+                }
+            }
             // poll with 100ms timeout so join() can stop us promptly.
             var fds = [1]std.posix.pollfd{.{
                 .fd = self.fd,
@@ -312,18 +715,6 @@ pub fn execWithIo(
     defer if (has_provider_rt) provider_rt.deinit();
     defer if (has_native_rt) native_rt.deinit();
 
-    if (run_cmd.cfg.provider_cmd) |provider_cmd| {
-        try provider_rt.init(alloc, provider_cmd);
-        has_provider_rt = true;
-        provider = provider_rt.client.asProvider();
-    } else if (NativeProviderRuntime.init(alloc)) |nr| {
-        native_rt = nr;
-        has_native_rt = true;
-        provider = native_rt.client.asProvider();
-    } else |_| {
-        provider = missing_provider.asProvider();
-    }
-
     var tools_rt = core.tools.builtin.Runtime.init(.{
         .alloc = alloc,
         .tool_mask = run_cmd.tool_mask,
@@ -338,84 +729,117 @@ pub fn execWithIo(
     var fs_store_impl: core.session.fs_store.Store = undefined;
     var null_store_impl = core.session.NullStore.init();
 
-    if (run_cmd.no_session) {
-        sid = try newSid(alloc);
-        store = null_store_impl.asSessionStore();
-    } else {
-        const plan = try resolveSessionPlan(alloc, run_cmd);
-        sid = plan.sid;
-        session_dir_path = plan.dir_path;
-
-        try std.fs.cwd().makePath(plan.dir_path);
-        var session_dir = try std.fs.cwd().openDir(plan.dir_path, .{ .iterate = true });
-        errdefer session_dir.close();
-        fs_store_impl = try core.session.fs_store.Store.init(.{
-            .alloc = alloc,
-            .dir = session_dir,
-            .flush = .{ .always = {} },
-            .replay = .{},
-        });
-        store = fs_store_impl.asSessionStore();
-    }
     defer if (store) |*s| s.deinit();
-    const st = store.?;
-
-    // Build system prompt: --system-prompt overrides, else load AGENTS.md/CLAUDE.md
-    const sys_prompt = try buildSystemPrompt(alloc, run_cmd);
-    defer if (sys_prompt) |sp| alloc.free(sp);
 
     const writer = if (out) |w| w else std.fs.File.stdout().deprecatedWriter().any();
     const reader = if (in) |r| r else std.fs.File.stdin().deprecatedReader().any();
-    switch (run_cmd.mode) {
-        .print => try runPrint(
-            alloc,
-            run_cmd,
-            sid,
-            provider,
-            st,
-            &tools_rt,
-            writer,
-            sys_prompt,
-        ),
-        .json => try runJson(
-            alloc,
-            run_cmd,
-            sid,
-            provider,
-            st,
-            &tools_rt,
-            reader,
-            writer,
-            sys_prompt,
-        ),
-        .tui => try runTui(
-            alloc,
-            run_cmd,
-            &sid,
-            provider,
-            st,
-            &tools_rt,
-            reader,
-            writer,
-            session_dir_path,
-            run_cmd.no_session,
-            sys_prompt,
-            has_native_rt and native_rt.client.isSub(),
-        ),
-        .rpc => try runRpc(
-            alloc,
-            run_cmd,
-            &sid,
-            provider,
-            st,
-            &tools_rt,
-            reader,
-            writer,
-            session_dir_path,
-            run_cmd.no_session,
-            sys_prompt,
-        ),
-    }
+    const ExecState = enum {
+        init_provider,
+        init_store,
+        dispatch,
+        done,
+    };
+    var st: ExecState = .init_provider;
+
+    fsm: while (true) switch (st) {
+        .init_provider => {
+            if (run_cmd.cfg.provider_cmd) |provider_cmd| {
+                try provider_rt.init(alloc, provider_cmd);
+                has_provider_rt = true;
+                provider = provider_rt.client.asProvider();
+            } else if (NativeProviderRuntime.init(alloc)) |nr| {
+                native_rt = nr;
+                has_native_rt = true;
+                provider = native_rt.client.asProvider();
+            } else |_| {
+                provider = missing_provider.asProvider();
+            }
+            st = .init_store;
+            continue :fsm;
+        },
+        .init_store => {
+            if (run_cmd.no_session) {
+                sid = try newSid(alloc);
+                store = null_store_impl.asSessionStore();
+            } else {
+                const plan = try resolveSessionPlan(alloc, run_cmd);
+                sid = plan.sid;
+                session_dir_path = plan.dir_path;
+
+                try std.fs.cwd().makePath(plan.dir_path);
+                var session_dir = try std.fs.cwd().openDir(plan.dir_path, .{ .iterate = true });
+                errdefer session_dir.close();
+                fs_store_impl = try core.session.fs_store.Store.init(.{
+                    .alloc = alloc,
+                    .dir = session_dir,
+                    .flush = .{ .always = {} },
+                    .replay = .{},
+                });
+                store = fs_store_impl.asSessionStore();
+            }
+            st = .dispatch;
+            continue :fsm;
+        },
+        .dispatch => {
+            const sess_store = store.?;
+            const sys_prompt = try buildSystemPrompt(alloc, run_cmd);
+            defer if (sys_prompt) |sp| alloc.free(sp);
+
+            switch (run_cmd.mode) {
+                .print => try runPrint(
+                    alloc,
+                    run_cmd,
+                    sid,
+                    provider,
+                    sess_store,
+                    &tools_rt,
+                    writer,
+                    sys_prompt,
+                ),
+                .json => try runJson(
+                    alloc,
+                    run_cmd,
+                    sid,
+                    provider,
+                    sess_store,
+                    &tools_rt,
+                    reader,
+                    writer,
+                    sys_prompt,
+                ),
+                .tui => try runTui(
+                    alloc,
+                    run_cmd,
+                    &sid,
+                    provider,
+                    sess_store,
+                    &tools_rt,
+                    reader,
+                    writer,
+                    session_dir_path,
+                    run_cmd.no_session,
+                    sys_prompt,
+                    has_native_rt and native_rt.client.isSub(),
+                ),
+                .rpc => try runRpc(
+                    alloc,
+                    run_cmd,
+                    &sid,
+                    provider,
+                    sess_store,
+                    &tools_rt,
+                    reader,
+                    writer,
+                    session_dir_path,
+                    run_cmd.no_session,
+                    sys_prompt,
+                ),
+            }
+            st = .done;
+            continue :fsm;
+        },
+        .done => break :fsm,
+    };
 
     return sid;
 }
@@ -550,7 +974,7 @@ fn runTui(
         break :blk ptr[0..m.len];
     } else &model_cycle;
 
-    const cwd_path = getCwd(alloc) catch "";
+    const cwd_path = getProjectPath(alloc) catch "";
     defer if (cwd_path.len > 0) alloc.free(cwd_path);
     const branch = getGitBranch(alloc) catch "";
     defer if (branch.len > 0) alloc.free(branch);
@@ -590,7 +1014,8 @@ fn runTui(
     }
     defer if (is_tty) tui_term.restore(stdin_fd);
 
-    var watcher = InputWatcher.init(stdin_fd);
+    var ask_pause = std.atomic.Value(bool).init(false);
+    var watcher = InputWatcher.initWithPause(stdin_fd, &ask_pause);
     const cancel = core.loop.CancelSrc.from(InputWatcher, &watcher, InputWatcher.isCanceled);
     const tctx = TurnCtx{
         .alloc = alloc,
@@ -604,6 +1029,16 @@ fn runTui(
     var bg_mgr = try bg.Mgr.init(alloc);
     defer bg_mgr.deinit();
     try syncBgFooter(alloc, &ui, &bg_mgr);
+
+    var ask_ui_ctx = AskUiCtx{
+        .alloc = alloc,
+        .ui = &ui,
+        .out = out,
+        .stdin_fd = stdin_fd,
+        .pause = &ask_pause,
+    };
+    tools_rt.ask_hook = core.tools.builtin.AskHook.from(AskUiCtx, &ask_ui_ctx, AskUiCtx.run);
+    defer tools_rt.ask_hook = null;
     var thinking = run_cmd.thinking;
     var popts = thinking.toProviderOpts();
     var auto_compact_on: bool = true;
@@ -611,9 +1046,11 @@ fn runTui(
     ui.border_fg = thinkingBorderFg(thinking);
 
     // Background version check (TUI only, skip for dev builds)
-    const skip_ver = std.posix.getenv("PZ_SKIP_VERSION_CHECK") != null or
+    const skip_ver = builtin.is_test or
+        std.posix.getenv("PZ_SKIP_VERSION_CHECK") != null or
         std.mem.indexOf(u8, cli.version, "-dev") != null;
     var ver_check = version_check.Check.init(alloc);
+    var ver_notice_done = skip_ver;
     if (!skip_ver) ver_check.spawn();
     defer ver_check.deinit();
 
@@ -631,16 +1068,7 @@ fn runTui(
     };
 
     try ui.draw(out);
-
-    // Check for new version after initial draw
-    if (ver_check.poll()) |new_ver| {
-        const t = tui_theme.get();
-        const ver_msg = try std.fmt.allocPrint(alloc, "Update available: {s}", .{new_ver});
-        defer alloc.free(ver_msg);
-        try ui.tr.styledText(ver_msg, .{ .fg = t.accent });
-        try ui.tr.infoText("  https://github.com/joelreymont/pz/releases");
-        try ui.draw(out);
-    }
+    try maybeShowVersionUpdate(alloc, &ui, &ver_check, &ver_notice_done, out);
     if (run_cmd.prompt) |prompt| {
         var init_cmd_buf: [4096]u8 = undefined;
         var init_cmd_fbs = std.io.fixedBufferStream(&init_cmd_buf);
@@ -749,8 +1177,11 @@ fn runTui(
             for (followup_queue.items) |q| alloc.free(q);
             followup_queue.deinit(alloc);
         }
+        var input_mode: tui_panels.InputMode = .steering;
+        syncInputFooter(&ui, input_mode, followup_queue.items.len);
 
         while (true) {
+            try maybeShowVersionUpdate(alloc, &ui, &ver_check, &ver_notice_done, out);
             if (tui_term.pollResize()) {
                 if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
                     try ui.resize(sz.w, sz.h);
@@ -811,12 +1242,7 @@ fn runTui(
                                     },
                                     .login => {
                                         // Set env var hint in editor for API key entry
-                                        const env_var: []const u8 = if (std.mem.eql(u8, sel, "anthropic"))
-                                            "ANTHROPIC_API_KEY"
-                                        else if (std.mem.eql(u8, sel, "openai"))
-                                            "OPENAI_API_KEY"
-                                        else
-                                            "GOOGLE_API_KEY";
+                                        const env_var = provider_env_map.get(sel) orelse "GOOGLE_API_KEY";
                                         const msg = try std.fmt.allocPrint(alloc, "Paste {s} API key (or set {s} env var):", .{ sel, env_var });
                                         defer alloc.free(msg);
                                         try ui.tr.infoText(msg);
@@ -839,6 +1265,14 @@ fn runTui(
                                             const msg2 = try std.fmt.allocPrint(alloc, "logged out of {s}", .{sel});
                                             defer alloc.free(msg2);
                                             try ui.tr.infoText(msg2);
+                                        }
+                                        ui.ov.?.deinit(alloc);
+                                        ui.ov = null;
+                                    },
+                                    .queue => {
+                                        if (try dequeueQueuedIntoEditor(alloc, &ui, &followup_queue, ui.ov.?.sel)) {
+                                            syncInputFooter(&ui, input_mode, followup_queue.items.len);
+                                            try ui.tr.infoText("(editing queued message)");
                                         }
                                         ui.ov.?.deinit(alloc);
                                         ui.ov = null;
@@ -918,6 +1352,19 @@ fn runTui(
                                 continue;
                             },
                             else => {},
+                        }
+                    }
+
+                    if (key == .enter and input_mode == .queue) {
+                        const queued_text = ui.editorText();
+                        if (shouldQueueSubmit(queued_text)) {
+                            try queueFollowup(alloc, &followup_queue, queued_text);
+                            ui.ed.clear();
+                            ui.updatePreview();
+                            syncInputFooter(&ui, input_mode, followup_queue.items.len);
+                            try ui.tr.infoText("(queued message)");
+                            try ui.draw(out);
+                            continue;
                         }
                     }
 
@@ -1096,6 +1543,7 @@ fn runTui(
                                 if (watcher.isCanceled()) break;
                                 const fq = followup_queue.orderedRemove(0);
                                 defer alloc.free(fq);
+                                syncInputFooter(&ui, input_mode, followup_queue.items.len);
                                 try ui.tr.userText(fq);
                                 if (!watcher.start()) try ui.tr.infoText("[ESC cancel unavailable]");
                                 const fq_err = tctx.run(.{
@@ -1188,38 +1636,30 @@ fn runTui(
                         },
                         .queue_followup => {
                             if (pre) |p| alloc.free(p);
-                            // Queue current text as follow-up, clear editor
                             const snap2 = ui.editorText();
                             if (snap2.len > 0) {
-                                const queued = try alloc.dupe(u8, snap2);
-                                followup_queue.append(alloc, queued) catch |err| {
-                                    alloc.free(queued);
-                                    return err;
-                                };
+                                try queueFollowup(alloc, &followup_queue, snap2);
                                 ui.ed.clear();
-                                try ui.tr.infoText("(queued follow-up)");
+                                ui.updatePreview();
+                                syncInputFooter(&ui, input_mode, followup_queue.items.len);
+                                try ui.tr.infoText("(queued message)");
                             }
                             try ui.draw(out);
                         },
                         .edit_queued => {
                             if (pre) |p| alloc.free(p);
-                            // Show queued messages in editor (join with newlines)
-                            if (followup_queue.items.len > 0) {
-                                var total: usize = 0;
-                                for (followup_queue.items) |q| total += q.len + 1;
-                                const joined = try alloc.alloc(u8, total);
-                                var off: usize = 0;
-                                for (followup_queue.items) |q| {
-                                    @memcpy(joined[off .. off + q.len], q);
-                                    joined[off + q.len] = '\n';
-                                    off += q.len + 1;
-                                }
-                                // Clear queue, set editor
-                                for (followup_queue.items) |q| alloc.free(q);
-                                followup_queue.items.len = 0;
-                                try ui.ed.setText(joined[0..if (total > 0) total - 1 else 0]);
-                                alloc.free(joined);
+                            if (try showQueueOverlay(alloc, &ui, followup_queue.items)) {
+                                try ui.draw(out);
+                            } else {
+                                try ui.tr.infoText("(queue is empty)");
+                                try ui.draw(out);
                             }
+                        },
+                        .toggle_queue_mode => {
+                            if (pre) |p| alloc.free(p);
+                            input_mode = if (input_mode == .steering) .queue else .steering;
+                            syncInputFooter(&ui, input_mode, followup_queue.items.len);
+                            try ui.tr.infoText(if (input_mode == .queue) "(input mode: queue)" else "(input mode: steering)");
                             try ui.draw(out);
                         },
                         .paste_image => {
@@ -1289,7 +1729,12 @@ fn runTui(
                         try ui.draw(out);
                     }
                 },
-                .none => {},
+                .none => {
+                    if (ui.pn.bg_running > 0) {
+                        ui.pn.tickBgSpinner();
+                        try ui.draw(out);
+                    }
+                },
                 .err => {
                     try ui.tr.infoText("[stdin read error — exiting]");
                     try ui.draw(out);
@@ -1303,6 +1748,7 @@ fn runTui(
         var cmd_ct: usize = 0;
         while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 64 * 1024)) |raw_line| {
             defer alloc.free(raw_line);
+            try maybeShowVersionUpdate(alloc, &ui, &ver_check, &ver_notice_done, out);
 
             if (tui_term.pollResize()) {
                 if (tui_term.size(std.posix.STDOUT_FILENO)) |sz| {
@@ -1475,13 +1921,14 @@ fn runRpc(
         }
         const cmd = normalizeRpcCmd(raw_cmd);
 
-        const RpcCmd = enum { prompt, model, provider, tools, bg, new, @"resume", session, tree, fork, compact, help, commands, quit, exit };
+        const RpcCmd = enum { prompt, model, provider, tools, bg, upgrade, new, @"resume", session, tree, fork, compact, help, commands, quit, exit };
         const rpc_map = std.StaticStringMap(RpcCmd).initComptime(.{
             .{ "prompt", .prompt },
             .{ "model", .model },
             .{ "provider", .provider },
             .{ "tools", .tools },
             .{ "bg", .bg },
+            .{ "upgrade", .upgrade },
             .{ "new", .new },
             .{ "resume", .@"resume" },
             .{ "session", .session },
@@ -1531,7 +1978,7 @@ fn runRpc(
                 });
             },
             .model => {
-                if (std.mem.eql(u8, raw_cmd, "set_model")) {
+                if (isSetModelAlias(raw_cmd)) {
                     if (req.provider) |prov| {
                         if (prov.len > 0) {
                             const prov_dup = try alloc.dupe(u8, prov);
@@ -1615,6 +2062,24 @@ fn runRpc(
                 defer alloc.free(msg);
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_bg",
+                    .id = req.id,
+                    .cmd = raw_cmd,
+                    .msg = msg,
+                });
+            },
+            .upgrade => {
+                const msg = update_mod.run(alloc) catch |err| {
+                    try writeJsonLine(alloc, out, .{
+                        .type = "rpc_error",
+                        .id = req.id,
+                        .cmd = raw_cmd,
+                        .msg = @errorName(err),
+                    });
+                    continue;
+                };
+                defer alloc.free(msg);
+                try writeJsonLine(alloc, out, .{
+                    .type = "rpc_upgrade",
                     .id = req.id,
                     .cmd = raw_cmd,
                     .msg = msg,
@@ -1730,12 +2195,12 @@ fn runRpc(
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_help",
                     .id = req.id,
-                    .commands = "prompt,model,provider,tools,bg,new,resume,session,tree,fork,compact,quit",
+                    .commands = "prompt,model,provider,tools,bg,upgrade,new,resume,session,tree,fork,compact,quit",
                 });
             },
             .commands => {
                 const commands = [_][]const u8{
-                    "prompt", "model", "provider", "tools", "bg", "new", "resume", "session", "tree", "fork", "compact", "help", "quit",
+                    "prompt", "model", "provider", "tools", "bg", "upgrade", "new", "resume", "session", "tree", "fork", "compact", "help", "quit",
                 };
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_commands",
@@ -1795,7 +2260,7 @@ fn handleSlashCommand(
     const cmd = if (sp) |i| body[0..i] else body;
     const arg = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
 
-    const Cmd = enum { help, quit, exit, session, model, provider, tools, bg, new, @"resume", tree, fork, compact, @"export", settings, hotkeys, login, logout, clear, cost, copy, name, reload, share, changelog };
+    const Cmd = enum { help, quit, exit, session, model, provider, tools, bg, upgrade, new, @"resume", tree, fork, compact, @"export", settings, hotkeys, login, logout, clear, cost, copy, name, reload, share, changelog };
     const cmd_map = std.StaticStringMap(Cmd).initComptime(.{
         .{ "help", .help },
         .{ "quit", .quit },
@@ -1805,6 +2270,7 @@ fn handleSlashCommand(
         .{ "provider", .provider },
         .{ "tools", .tools },
         .{ "bg", .bg },
+        .{ "upgrade", .upgrade },
         .{ "new", .new },
         .{ "resume", .@"resume" },
         .{ "tree", .tree },
@@ -1840,6 +2306,7 @@ fn handleSlashCommand(
                 \\  /provider <id>     Set/show provider
                 \\  /tools [list|all]  Set/show tools
                 \\  /bg <subcommand>   Background jobs
+                \\  /upgrade           Self-update to latest release
                 \\  /clear             Clear transcript
                 \\  /copy              Copy last response
                 \\  /export [path]     Export to markdown
@@ -1926,6 +2393,14 @@ fn handleSlashCommand(
             defer alloc.free(bg_out);
             try out.writeAll(bg_out);
         },
+        .upgrade => {
+            const msg = update_mod.run(alloc) catch |err| {
+                try writeTextLine(alloc, out, "upgrade failed: {s}\n", .{@errorName(err)});
+                return .handled;
+            };
+            defer alloc.free(msg);
+            try out.writeAll(msg);
+        },
         .new => {
             const next_sid = try newSid(alloc);
             alloc.free(sid.*);
@@ -1995,7 +2470,7 @@ fn handleSlashCommand(
         .hotkeys => {
             try out.writeAll(
                 \\Keyboard shortcuts:
-                \\  Enter          Submit message
+                \\  Enter          Submit message (queue in mode=queue)
                 \\  ESC            Clear input / Cancel
                 \\  Ctrl+C         Clear input / Quit
                 \\  Ctrl+D         Quit (when input empty)
@@ -2021,8 +2496,9 @@ fn handleSlashCommand(
                 \\  Ctrl+T         Toggle thinking blocks
                 \\  Ctrl+G         External editor
                 \\  Ctrl+V         Paste image
-                \\  Alt+Enter      Queue follow-up
-                \\  Alt+Up         Edit queued messages
+                \\  Alt+Enter      Queue message
+                \\  Alt+Up         Pick queued message to edit
+                \\  Alt+Down       Toggle input mode (steering/queue)
                 \\  Page Up/Down   Scroll transcript (half page)
                 \\  Scroll Up/Down Scroll transcript
                 \\  !cmd           Run bash (include)
@@ -2107,79 +2583,76 @@ fn handleSlashCommand(
 fn runBgCommand(alloc: std.mem.Allocator, bg_mgr: *bg.Mgr, arg: []const u8) ![]u8 {
     const body = std.mem.trim(u8, arg, " \t");
     if (body.len == 0) {
-        return alloc.dupe(u8, "usage: /bg run <cmd>|list|show <id>|stop <id>\n");
+        return alloc.dupe(u8, bg_usage);
     }
 
     const sp = std.mem.indexOfAny(u8, body, " \t");
     const sub = if (sp) |i| body[0..i] else body;
     const rest = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
 
-    if (std.mem.eql(u8, sub, "run")) {
-        if (rest.len == 0) {
-            return alloc.dupe(u8, "usage: /bg run <cmd>\n");
-        }
-        const id = try bg_mgr.start(rest, null);
-        const v = (try bg_mgr.view(alloc, id)) orelse return error.InternalError;
-        defer bg.deinitView(alloc, v);
-        return std.fmt.allocPrint(alloc, "bg started id={d} pid={d} log={s}\n", .{
-            v.id,
-            v.pid,
-            v.log_path,
-        });
-    }
-
-    if (std.mem.eql(u8, sub, "list")) {
-        const jobs = try bg_mgr.list(alloc);
-        defer bg.deinitViews(alloc, jobs);
-        if (jobs.len == 0) return alloc.dupe(u8, "no background jobs\n");
-
-        var out = std.ArrayList(u8).empty;
-        errdefer out.deinit(alloc);
-        try out.appendSlice(alloc, "id pid state code log cmd\n");
-        for (jobs) |j| {
-            const code = j.code orelse -1;
-            const line = try std.fmt.allocPrint(alloc, "{d} {d} {s} {d} {s} {s}\n", .{
-                j.id,
-                j.pid,
-                bg.stateName(j.state),
-                code,
-                j.log_path,
-                j.cmd,
+    switch (bg_sub_map.get(sub) orelse return alloc.dupe(u8, bg_usage)) {
+        .run => {
+            if (rest.len == 0) {
+                return alloc.dupe(u8, "usage: /bg run <cmd>\n");
+            }
+            const id = try bg_mgr.start(rest, null);
+            const v = (try bg_mgr.view(alloc, id)) orelse return error.InternalError;
+            defer bg.deinitView(alloc, v);
+            return std.fmt.allocPrint(alloc, "bg started id={d} pid={d} log={s}\n", .{
+                v.id,
+                v.pid,
+                v.log_path,
             });
-            defer alloc.free(line);
-            try out.appendSlice(alloc, line);
-        }
-        return out.toOwnedSlice(alloc);
+        },
+        .list => {
+            const jobs = try bg_mgr.list(alloc);
+            defer bg.deinitViews(alloc, jobs);
+            if (jobs.len == 0) return alloc.dupe(u8, "no background jobs\n");
+
+            var out = std.ArrayList(u8).empty;
+            errdefer out.deinit(alloc);
+            try out.appendSlice(alloc, "id pid state code log cmd\n");
+            for (jobs) |j| {
+                const code = j.code orelse -1;
+                const line = try std.fmt.allocPrint(alloc, "{d} {d} {s} {d} {s} {s}\n", .{
+                    j.id,
+                    j.pid,
+                    bg.stateName(j.state),
+                    code,
+                    j.log_path,
+                    j.cmd,
+                });
+                defer alloc.free(line);
+                try out.appendSlice(alloc, line);
+            }
+            return out.toOwnedSlice(alloc);
+        },
+        .show => {
+            const id = parseBgId(rest) catch return alloc.dupe(u8, "usage: /bg show <id>\n");
+            const v = (try bg_mgr.view(alloc, id)) orelse return alloc.dupe(u8, "bg: not found\n");
+            defer bg.deinitView(alloc, v);
+
+            return std.fmt.allocPrint(alloc, "id={d}\npid={d}\nstate={s}\ncode={?d}\nstarted_ms={d}\nended_ms={?d}\nlog={s}\ncmd={s}\n", .{
+                v.id,
+                v.pid,
+                bg.stateName(v.state),
+                v.code,
+                v.started_at_ms,
+                v.ended_at_ms,
+                v.log_path,
+                v.cmd,
+            });
+        },
+        .stop => {
+            const id = parseBgId(rest) catch return alloc.dupe(u8, "usage: /bg stop <id>\n");
+            const stop = try bg_mgr.stop(id);
+            return switch (stop) {
+                .sent => std.fmt.allocPrint(alloc, "bg stop sent id={d}\n", .{id}),
+                .already_done => std.fmt.allocPrint(alloc, "bg already done id={d}\n", .{id}),
+                .not_found => std.fmt.allocPrint(alloc, "bg not found id={d}\n", .{id}),
+            };
+        },
     }
-
-    if (std.mem.eql(u8, sub, "show")) {
-        const id = parseBgId(rest) catch return alloc.dupe(u8, "usage: /bg show <id>\n");
-        const v = (try bg_mgr.view(alloc, id)) orelse return alloc.dupe(u8, "bg: not found\n");
-        defer bg.deinitView(alloc, v);
-
-        return std.fmt.allocPrint(alloc, "id={d}\npid={d}\nstate={s}\ncode={?d}\nstarted_ms={d}\nended_ms={?d}\nlog={s}\ncmd={s}\n", .{
-            v.id,
-            v.pid,
-            bg.stateName(v.state),
-            v.code,
-            v.started_at_ms,
-            v.ended_at_ms,
-            v.log_path,
-            v.cmd,
-        });
-    }
-
-    if (std.mem.eql(u8, sub, "stop")) {
-        const id = parseBgId(rest) catch return alloc.dupe(u8, "usage: /bg stop <id>\n");
-        const stop = try bg_mgr.stop(id);
-        return switch (stop) {
-            .sent => std.fmt.allocPrint(alloc, "bg stop sent id={d}\n", .{id}),
-            .already_done => std.fmt.allocPrint(alloc, "bg already done id={d}\n", .{id}),
-            .not_found => std.fmt.allocPrint(alloc, "bg not found id={d}\n", .{id}),
-        };
-    }
-
-    return alloc.dupe(u8, "usage: /bg run <cmd>|list|show <id>|stop <id>\n");
 }
 
 fn parseBgId(text: []const u8) !u64 {
@@ -2224,6 +2697,28 @@ fn syncBgFooter(alloc: std.mem.Allocator, ui: *tui_harness.Ui, bg_mgr: *bg.Mgr) 
     }
     const done: u32 = launched -| running;
     ui.pn.setBgStatus(launched, running, done);
+}
+
+fn maybeShowVersionUpdate(
+    alloc: std.mem.Allocator,
+    ui: *tui_harness.Ui,
+    check: *version_check.Check,
+    done: *bool,
+    out: std.Io.AnyWriter,
+) !void {
+    if (done.*) return;
+    if (check.poll()) |new_ver| {
+        const t = tui_theme.get();
+        const ver_msg = try std.fmt.allocPrint(alloc, "Update available: {s}", .{new_ver});
+        defer alloc.free(ver_msg);
+        try ui.tr.styledText(ver_msg, .{ .fg = t.accent });
+        try ui.tr.infoText("  /upgrade or pz --upgrade");
+        try ui.tr.infoText("  https://github.com/joelreymont/pz/releases");
+        try ui.draw(out);
+        done.* = true;
+        return;
+    }
+    if (check.isDone()) done.* = true;
 }
 
 fn shareGist(alloc: std.mem.Allocator, md_path: []const u8) ![]u8 {
@@ -2335,6 +2830,10 @@ fn normalizeRpcCmd(raw: []const u8) []const u8 {
         .{ "steer", "prompt" },
     });
     return map.get(raw) orelse raw;
+}
+
+fn isSetModelAlias(raw: []const u8) bool {
+    return set_model_alias_map.get(raw) != null;
 }
 
 const SessStats = struct {
@@ -2540,6 +3039,7 @@ fn toolMaskCsvAlloc(alloc: std.mem.Allocator, mask: u8) ![]u8 {
         "grep",
         "find",
         "ls",
+        "ask",
     };
     const bits = [_]u8{
         core.tools.builtin.mask_read,
@@ -2549,6 +3049,7 @@ fn toolMaskCsvAlloc(alloc: std.mem.Allocator, mask: u8) ![]u8 {
         core.tools.builtin.mask_grep,
         core.tools.builtin.mask_find,
         core.tools.builtin.mask_ls,
+        core.tools.builtin.mask_ask,
     };
 
     var need_sep = false;
@@ -2723,9 +3224,19 @@ fn resolveSessionPlan(alloc: std.mem.Allocator, run_cmd: cli.Run) !core.session.
     };
 }
 
-fn getCwd(alloc: std.mem.Allocator) ![]u8 {
+fn getProjectPath(alloc: std.mem.Allocator) ![]u8 {
+    if (runCmdTrimAlloc(alloc, &.{ "jj", "root" }, 4096)) |root| {
+        return shortenHomePath(alloc, root);
+    }
+    if (runCmdTrimAlloc(alloc, &.{ "git", "rev-parse", "--show-toplevel" }, 4096)) |root| {
+        return shortenHomePath(alloc, root);
+    }
+
     const full = try std.fs.cwd().realpathAlloc(alloc, ".");
-    // Shorten home prefix to ~/ (matching pi)
+    return shortenHomePath(alloc, full);
+}
+
+fn shortenHomePath(alloc: std.mem.Allocator, full: []u8) ![]u8 {
     const home = std.posix.getenv("HOME") orelse "";
     if (home.len > 0 and std.mem.startsWith(u8, full, home)) {
         const short = try std.fmt.allocPrint(alloc, "~{s}", .{full[home.len..]});
@@ -2736,8 +3247,15 @@ fn getCwd(alloc: std.mem.Allocator) ![]u8 {
 }
 
 fn getGitBranch(alloc: std.mem.Allocator) ![]u8 {
-    // Try jj bookmark first (jj always detaches HEAD)
-    if (getJjBookmark(alloc)) |b| return b;
+    if (getJjBranch(alloc)) |b| return b;
+
+    if (runCmdTrimAlloc(alloc, &.{ "git", "branch", "--show-current" }, 512)) |branch| {
+        return branch;
+    }
+    if (runCmdTrimAlloc(alloc, &.{ "git", "rev-parse", "--abbrev-ref", "HEAD" }, 512)) |branch| {
+        if (!std.mem.eql(u8, branch, "HEAD")) return branch;
+        alloc.free(branch);
+    }
 
     const head = std.fs.cwd().readFileAlloc(alloc, ".git/HEAD", 256) catch return error.NotFound;
     defer alloc.free(head);
@@ -2750,50 +3268,78 @@ fn getGitBranch(alloc: std.mem.Allocator) ![]u8 {
     return try alloc.dupe(u8, "detached");
 }
 
-fn getJjBookmark(alloc: std.mem.Allocator) ?[]u8 {
-    // Check if .jj/ exists (jj-managed repo)
-    std.fs.cwd().access(".jj", .{}) catch return null;
-
-    // Run jj log to get bookmarks for current change
-    const argv = [_][]const u8{ "jj", "log", "--no-graph", "-r", "@", "-T", "bookmarks" };
-    var child = std.process.Child.init(argv[0..], alloc);
-    child.stdout_behavior = .Pipe;
-    child.stderr_behavior = .Ignore;
-    child.spawn() catch return null;
-    const stdout = child.stdout.?.readToEndAlloc(alloc, 4096) catch {
-        _ = child.wait() catch |err| {
-            std.debug.print("warning: child wait failed: {s}\n", .{@errorName(err)});
-        };
-        return null;
-    };
-    _ = child.wait() catch {
-        alloc.free(stdout);
-        return null;
-    };
-
-    const trimmed = std.mem.trimRight(u8, stdout, "\n\r ");
-    if (trimmed.len == 0) {
-        alloc.free(stdout);
-        return null;
+fn getJjBranch(alloc: std.mem.Allocator) ?[]u8 {
+    const current = runCmdTrimAlloc(alloc, &.{ "jj", "log", "--no-graph", "-r", "@", "-T", "bookmarks" }, 4096);
+    if (current) |raw| {
+        defer alloc.free(raw);
+        if (parseJjBookmark(raw)) |name| {
+            return alloc.dupe(u8, name) catch null;
+        }
     }
 
-    // May have multiple bookmarks separated by space; take first, strip trailing *
+    const parent = runCmdTrimAlloc(alloc, &.{ "jj", "log", "--no-graph", "-r", "@-", "-T", "bookmarks" }, 4096);
+    if (parent) |raw| {
+        defer alloc.free(raw);
+        if (parseJjBookmark(raw)) |name| {
+            return alloc.dupe(u8, name) catch null;
+        }
+    }
+
+    return null;
+}
+
+fn parseJjBookmark(raw: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return null;
+
     var it = std.mem.splitScalar(u8, trimmed, ' ');
-    const first = it.next() orelse {
-        alloc.free(stdout);
-        return null;
-    };
+    const first = it.next() orelse return null;
     const name = if (first.len > 0 and first[first.len - 1] == '*')
         first[0 .. first.len - 1]
     else
         first;
+    if (name.len == 0) return null;
+    if (looksLikeHexCommit(name)) return null;
+    return name;
+}
 
-    const result = alloc.dupe(u8, name) catch {
-        alloc.free(stdout);
-        return null;
-    };
-    alloc.free(stdout);
-    return result;
+fn looksLikeHexCommit(text: []const u8) bool {
+    if (text.len < 12) return false;
+    for (text) |c| {
+        if ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')) {
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+fn runCmdTrimAlloc(alloc: std.mem.Allocator, argv: []const []const u8, max_bytes: usize) ?[]u8 {
+    const result = std.process.Child.run(.{
+        .allocator = alloc,
+        .argv = argv,
+        .max_output_bytes = max_bytes,
+    }) catch return null;
+    defer alloc.free(result.stderr);
+    defer alloc.free(result.stdout);
+    if (result.term.Exited != 0) return null;
+    const trimmed = std.mem.trim(u8, result.stdout, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return alloc.dupe(u8, trimmed) catch null;
+}
+
+test "parseJjBookmark extracts first bookmark" {
+    const got = parseJjBookmark("main feature") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("main", got);
+}
+
+test "parseJjBookmark strips working-copy marker" {
+    const got = parseJjBookmark("trunk*") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("trunk", got);
+}
+
+test "parseJjBookmark rejects detached hash" {
+    try std.testing.expect(parseJjBookmark("44693e6218c0b15a85acf5d2af52149b09dc4c76") == null);
 }
 
 const default_model = "claude-opus-4-6";
@@ -2856,8 +3402,45 @@ const model_cycle = [_][]const u8{
 };
 
 const provider_args = [_][]const u8{ "anthropic", "openai", "google" };
-const tool_args = [_][]const u8{ "all", "none", "read", "write", "bash", "edit", "grep", "find", "ls" };
+const tool_args = [_][]const u8{ "all", "none", "read", "write", "bash", "edit", "grep", "find", "ls", "ask" };
 const bg_args = [_][]const u8{ "run", "list", "show", "stop" };
+const bg_usage = "usage: /bg run <cmd>|list|show <id>|stop <id>\n";
+const BgSub = enum {
+    run,
+    list,
+    show,
+    stop,
+};
+const bg_sub_map = std.StaticStringMap(BgSub).initComptime(.{
+    .{ "run", .run },
+    .{ "list", .list },
+    .{ "show", .show },
+    .{ "stop", .stop },
+});
+const set_model_alias_map = std.StaticStringMap(void).initComptime(.{
+    .{ "set_model", {} },
+});
+
+const arg_src_kind_map = std.StaticStringMap(enum {
+    model,
+    provider,
+    tools,
+    bg,
+    auth_provider,
+}).initComptime(.{
+    .{ "model", .model },
+    .{ "provider", .provider },
+    .{ "tools", .tools },
+    .{ "bg", .bg },
+    .{ "login", .auth_provider },
+    .{ "logout", .auth_provider },
+});
+
+const provider_env_map = std.StaticStringMap([]const u8).initComptime(.{
+    .{ "anthropic", "ANTHROPIC_API_KEY" },
+    .{ "openai", "OPENAI_API_KEY" },
+    .{ "google", "GOOGLE_API_KEY" },
+});
 
 /// Resolve arg completion source based on current editor text.
 fn resolveArgSrc(text: []const u8, models: []const []const u8) ?[]const []const u8 {
@@ -2865,12 +3448,13 @@ fn resolveArgSrc(text: []const u8, models: []const []const u8) ?[]const []const 
     const body = text[1..];
     const sp = std.mem.indexOfScalar(u8, body, ' ') orelse return null;
     const cmd = body[0..sp];
-    if (std.mem.eql(u8, cmd, "model")) return models;
-    if (std.mem.eql(u8, cmd, "provider")) return &provider_args;
-    if (std.mem.eql(u8, cmd, "tools")) return &tool_args;
-    if (std.mem.eql(u8, cmd, "bg")) return &bg_args;
-    if (std.mem.eql(u8, cmd, "login") or std.mem.eql(u8, cmd, "logout")) return &provider_args;
-    return null;
+    const kind = arg_src_kind_map.get(cmd) orelse return null;
+    return switch (kind) {
+        .model => models,
+        .provider, .auth_provider => &provider_args,
+        .tools => &tool_args,
+        .bg => &bg_args,
+    };
 }
 
 fn cycleModel(alloc: std.mem.Allocator, cur: []const u8, model_owned: *?[]u8, cycle: []const []const u8) ![]const u8 {
@@ -2947,7 +3531,7 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool) 
         .{ "ctrl+c", "to clear" },
         .{ "ctrl+c twice", "to exit" },
         .{ "ctrl+d", "to exit (empty)" },
-        .{ "ctrl+z", "to suspend" },
+        .{ "ctrl+z", "to undo" },
         .{ "up/down", "for input history" },
         .{ "ctrl+a/e", "to start/end of line" },
         .{ "ctrl+k/u", "to delete to end/all" },
@@ -2962,8 +3546,9 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool) 
         .{ "/", "for commands" },
         .{ "!", "to run bash" },
         .{ "!!", "to run bash (no context)" },
-        .{ "alt+enter", "to queue follow-up" },
-        .{ "alt+up", "to edit all queued messages" },
+        .{ "alt+enter", "to queue message" },
+        .{ "alt+up", "to pick queued message for editing" },
+        .{ "alt+down", "to toggle input mode" },
         .{ "ctrl+v", "to paste image" },
         .{ "drop files", "to attach" },
     };
@@ -3163,6 +3748,109 @@ fn autoCompact(
     try ui.tr.infoText("[session compacted]");
 }
 
+fn syncInputFooter(ui: *tui_harness.Ui, mode: tui_panels.InputMode, queued_len: usize) void {
+    const max_u32 = std.math.maxInt(u32);
+    const queued: u32 = if (queued_len > max_u32) max_u32 else @intCast(queued_len);
+    ui.pn.setInputStatus(mode, queued);
+}
+
+fn queueFollowup(
+    alloc: std.mem.Allocator,
+    queue: *std.ArrayListUnmanaged([]u8),
+    text: []const u8,
+) !void {
+    if (text.len == 0) return;
+    const queued = try alloc.dupe(u8, text);
+    errdefer alloc.free(queued);
+    try queue.append(alloc, queued);
+}
+
+fn shouldQueueSubmit(text: []const u8) bool {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return false;
+    if (trimmed[0] == '/') return false;
+    return parseBashCmd(trimmed) == null;
+}
+
+fn showQueueOverlay(
+    alloc: std.mem.Allocator,
+    ui: *tui_harness.Ui,
+    queue: []const []const u8,
+) !bool {
+    if (queue.len == 0) return false;
+
+    const items = try alloc.alloc([]u8, queue.len);
+    errdefer alloc.free(items);
+    var filled: usize = 0;
+    errdefer {
+        for (items[0..filled]) |it| alloc.free(it);
+    }
+
+    for (queue, 0..) |msg, idx| {
+        items[idx] = try queueItemLabel(alloc, idx, msg);
+        filled = idx + 1;
+    }
+
+    var ov = tui_overlay.Overlay.initDyn(alloc, items, "Queued Messages", .queue);
+    ov.hint = "Up/Down select, Enter edit, Esc close";
+    ui.ov = ov;
+    return true;
+}
+
+fn dequeueQueuedIntoEditor(
+    alloc: std.mem.Allocator,
+    ui: *tui_harness.Ui,
+    queue: *std.ArrayListUnmanaged([]u8),
+    idx: usize,
+) !bool {
+    if (idx >= queue.items.len) return false;
+    const msg = queue.orderedRemove(idx);
+    defer alloc.free(msg);
+    try ui.ed.setText(msg);
+    ui.updatePreview();
+    return true;
+}
+
+fn queueItemLabel(alloc: std.mem.Allocator, idx: usize, msg: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, msg, " \t\r\n");
+    const source = if (trimmed.len > 0) trimmed else msg;
+    var one_line = source;
+    var has_more = false;
+    if (std.mem.indexOfScalar(u8, source, '\n')) |nl| {
+        one_line = source[0..nl];
+        has_more = true;
+    }
+    const clip = utf8Prefix(one_line, 56);
+    if (clip.truncated) has_more = true;
+    const suffix = if (has_more) " ..." else "";
+    if (clip.text.len == 0) {
+        return std.fmt.allocPrint(alloc, "#{d} (empty)", .{idx + 1});
+    }
+    return std.fmt.allocPrint(alloc, "#{d} {s}{s}", .{ idx + 1, clip.text, suffix });
+}
+
+const Utf8Clip = struct {
+    text: []const u8,
+    truncated: bool,
+};
+
+fn utf8Prefix(text: []const u8, max_cp: usize) Utf8Clip {
+    if (max_cp == 0 or text.len == 0) return .{ .text = text[0..0], .truncated = text.len > 0 };
+    var i: usize = 0;
+    var count: usize = 0;
+    while (i < text.len and count < max_cp) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
+        if (i + n > text.len) break;
+        _ = std.unicode.utf8Decode(text[i .. i + n]) catch break;
+        i += n;
+        count += 1;
+    }
+    return .{
+        .text = text[0..i],
+        .truncated = i < text.len,
+    };
+}
+
 const BashCmd = struct {
     cmd: []const u8,
     include: bool, // true = !cmd (include in context), false = !!cmd (exclude)
@@ -3360,10 +4048,20 @@ const TurnCtx = struct {
     };
 
     fn run(self: *const TurnCtx, opts: TurnOpts) !void {
+        const prompt_hint = if (needsAskHint(opts.prompt))
+            try std.fmt.allocPrint(
+                self.alloc,
+                "{s}\n\nUse the `ask` tool for clarifying questions (1-3 concise questions with options) before final planning output.",
+                .{opts.prompt},
+            )
+        else
+            null;
+        defer if (prompt_hint) |p| self.alloc.free(p);
+
         _ = try core.loop.run(.{
             .alloc = self.alloc,
             .sid = opts.sid,
-            .prompt = opts.prompt,
+            .prompt = prompt_hint orelse opts.prompt,
             .model = opts.model,
             .provider_label = opts.provider_label,
             .provider = self.provider,
@@ -3377,6 +4075,163 @@ const TurnCtx = struct {
         });
     }
 };
+
+fn needsAskHint(prompt: []const u8) bool {
+    return std.ascii.indexOfIgnoreCase(prompt, "ask me questions") != null or
+        std.ascii.indexOfIgnoreCase(prompt, "ask questions") != null;
+}
+
+test "buildAskRows includes type-something-else and next navigation" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+
+    const opts = [_]core.tools.Call.AskArgs.Option{
+        .{ .label = "A" },
+        .{ .label = "B", .description = "desc" },
+    };
+    const q: core.tools.Call.AskArgs.Question = .{
+        .id = "scope",
+        .question = "Pick scope",
+        .options = opts[0..],
+        .allow_other = true,
+    };
+    var rows = try buildAskRows(std.testing.allocator, q, .{}, true, false);
+    defer rows.deinit(std.testing.allocator);
+
+    const Snap = struct {
+        row0: []const u8,
+        row1: []const u8,
+        row2: []const u8,
+        row3: []const u8,
+    };
+    const snap = Snap{
+        .row0 = rows.items[0],
+        .row1 = rows.items[1],
+        .row2 = rows.items[2],
+        .row3 = rows.items[3],
+    };
+    try oh.snap(@src(),
+        \\app.runtime.test.buildAskRows includes type-something-else and next navigation.Snap
+        \\  .row0: []const u8
+        \\    "[ ] A"
+        \\  .row1: []const u8
+        \\    "[ ] B - desc"
+        \\  .row2: []const u8
+        \\    "[ ] Type something else"
+        \\  .row3: []const u8
+        \\    "Next question"
+    ).expectEqual(snap);
+}
+
+test "buildAskRows renders custom answer selection and submit controls" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+
+    const opts = [_]core.tools.Call.AskArgs.Option{
+        .{ .label = "A" },
+        .{ .label = "B" },
+    };
+    const q: core.tools.Call.AskArgs.Question = .{
+        .id = "scope",
+        .question = "Pick scope",
+        .options = opts[0..],
+        .allow_other = true,
+    };
+    const custom = try std.testing.allocator.dupe(u8, "My custom answer");
+    defer std.testing.allocator.free(custom);
+
+    var rows = try buildAskRows(std.testing.allocator, q, .{
+        .answer = custom,
+        .index = 2,
+    }, false, true);
+    defer rows.deinit(std.testing.allocator);
+
+    const Snap = struct {
+        row0: []const u8,
+        row1: []const u8,
+        row2: []const u8,
+        row3: []const u8,
+        row4: []const u8,
+    };
+    const snap = Snap{
+        .row0 = rows.items[0],
+        .row1 = rows.items[1],
+        .row2 = rows.items[2],
+        .row3 = rows.items[3],
+        .row4 = rows.items[4],
+    };
+    try oh.snap(@src(),
+        \\app.runtime.test.buildAskRows renders custom answer selection and submit controls.Snap
+        \\  .row0: []const u8
+        \\    "[ ] A"
+        \\  .row1: []const u8
+        \\    "[ ] B"
+        \\  .row2: []const u8
+        \\    "[x] Type something else: My custom answer"
+        \\  .row3: []const u8
+        \\    "Previous question"
+        \\  .row4: []const u8
+        \\    "Submit answers"
+    ).expectEqual(snap);
+}
+
+test "firstUnanswered returns first missing answer index" {
+    const a0 = try std.testing.allocator.dupe(u8, "one");
+    defer std.testing.allocator.free(a0);
+    const a2 = try std.testing.allocator.dupe(u8, "three");
+    defer std.testing.allocator.free(a2);
+
+    const stored = [_]AskUiCtx.StoredAnswer{
+        .{ .answer = a0, .index = 0 },
+        .{},
+        .{ .answer = a2, .index = 2 },
+    };
+    try std.testing.expectEqual(@as(?usize, 1), firstUnanswered(stored[0..]));
+}
+
+test "collectAskAnswers builds expected ask JSON payload" {
+    const opts = [_]core.tools.Call.AskArgs.Option{
+        .{ .label = "A" },
+        .{ .label = "B" },
+    };
+    const qs = [_]core.tools.Call.AskArgs.Question{
+        .{
+            .id = "scope",
+            .question = "Pick scope",
+            .options = opts[0..],
+            .allow_other = true,
+        },
+        .{
+            .id = "detail",
+            .question = "Add detail",
+            .options = opts[0..],
+            .allow_other = true,
+        },
+    };
+
+    var stored = [_]AskUiCtx.StoredAnswer{
+        .{},
+        .{},
+    };
+    stored[0].answer = try std.testing.allocator.dupe(u8, "A");
+    stored[0].index = 0;
+    stored[1].answer = try std.testing.allocator.dupe(u8, "custom");
+    stored[1].index = 2;
+    defer {
+        if (stored[0].answer) |a| std.testing.allocator.free(a);
+        if (stored[1].answer) |a| std.testing.allocator.free(a);
+    }
+
+    const out_answers = try collectAskAnswers(std.testing.allocator, qs[0..], stored[0..]);
+    defer std.testing.allocator.free(out_answers);
+    const payload = try buildAskResult(std.testing.allocator, false, out_answers);
+    defer std.testing.allocator.free(payload);
+
+    try std.testing.expectEqualStrings(
+        "{\"cancelled\":false,\"answers\":[{\"id\":\"scope\",\"answer\":\"A\",\"index\":0},{\"id\":\"detail\",\"answer\":\"custom\",\"index\":2}]}",
+        payload,
+    );
+}
 
 test "parseBashCmd single bang" {
     const r = parseBashCmd("!ls -la").?;
@@ -3400,6 +4255,102 @@ test "parseBashCmd empty cmd returns null" {
 test "parseBashCmd no bang returns null" {
     try std.testing.expect(parseBashCmd("hello") == null);
     try std.testing.expect(parseBashCmd("/quit") == null);
+}
+
+test "shouldQueueSubmit excludes commands and includes prompts" {
+    try std.testing.expect(!shouldQueueSubmit(""));
+    try std.testing.expect(!shouldQueueSubmit("   \t\n"));
+    try std.testing.expect(!shouldQueueSubmit("/help"));
+    try std.testing.expect(!shouldQueueSubmit(" /help"));
+    try std.testing.expect(!shouldQueueSubmit("!ls -la"));
+    try std.testing.expect(!shouldQueueSubmit("!!echo hi"));
+    try std.testing.expect(shouldQueueSubmit("explain this bug"));
+}
+
+test "queueItemLabel snapshots preview formatting" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+
+    const one = try queueItemLabel(std.testing.allocator, 0, "first line\nsecond line");
+    defer std.testing.allocator.free(one);
+
+    const two = try queueItemLabel(std.testing.allocator, 1, "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz");
+    defer std.testing.allocator.free(two);
+
+    const three = try queueItemLabel(std.testing.allocator, 2, "   ");
+    defer std.testing.allocator.free(three);
+
+    const Snap = struct {
+        one: []const u8,
+        two: []const u8,
+        three: []const u8,
+    };
+    try oh.snap(@src(),
+        \\app.runtime.test.queueItemLabel snapshots preview formatting.Snap
+        \\  .one: []const u8
+        \\    "#1 first line ..."
+        \\  .two: []const u8
+        \\    "#2 abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyzabcd ..."
+        \\  .three: []const u8
+        \\    "#3    "
+    ).expectEqual(Snap{
+        .one = one,
+        .two = two,
+        .three = three,
+    });
+}
+
+test "showQueueOverlay and dequeueQueuedIntoEditor edit selected message" {
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
+    defer ui.deinit();
+
+    var queue: std.ArrayListUnmanaged([]u8) = .empty;
+    defer {
+        for (queue.items) |q| std.testing.allocator.free(q);
+        queue.deinit(std.testing.allocator);
+    }
+    try queueFollowup(std.testing.allocator, &queue, "one");
+    try queueFollowup(std.testing.allocator, &queue, "two");
+    try queueFollowup(std.testing.allocator, &queue, "three");
+
+    try std.testing.expect(try showQueueOverlay(std.testing.allocator, &ui, queue.items));
+    try std.testing.expect(ui.ov != null);
+    try std.testing.expect(ui.ov.?.kind == .queue);
+    try std.testing.expect(ui.ov.?.dyn_items != null);
+    try std.testing.expectEqual(@as(usize, 3), ui.ov.?.dyn_items.?.len);
+
+    ui.ov.?.sel = 1;
+    try std.testing.expect(try dequeueQueuedIntoEditor(std.testing.allocator, &ui, &queue, ui.ov.?.sel));
+    try std.testing.expectEqualStrings("two", ui.ed.text());
+    try std.testing.expectEqual(@as(usize, 2), queue.items.len);
+    try std.testing.expectEqualStrings("one", queue.items[0]);
+    try std.testing.expectEqualStrings("three", queue.items[1]);
+
+    ui.ov.?.deinit(std.testing.allocator);
+    ui.ov = null;
+}
+
+test "syncInputFooter tracks mode and clamps queue size" {
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 60, 10, "m", "p");
+    defer ui.deinit();
+
+    syncInputFooter(&ui, .queue, 12);
+    try std.testing.expect(ui.pn.input_mode == .queue);
+    try std.testing.expectEqual(@as(u32, 12), ui.pn.queued_msgs);
+
+    syncInputFooter(&ui, .steering, @as(usize, std.math.maxInt(u32)) + 10);
+    try std.testing.expect(ui.pn.input_mode == .steering);
+    try std.testing.expectEqual(std.math.maxInt(u32), ui.pn.queued_msgs);
+}
+
+test "needsAskHint detects ask-question prompts" {
+    try std.testing.expect(needsAskHint("ask me questions before planning"));
+    try std.testing.expect(needsAskHint("Please ASK QUESTIONS first."));
+}
+
+test "needsAskHint ignores regular prompts" {
+    try std.testing.expect(!needsAskHint("build a parser for this input"));
+    try std.testing.expect(!needsAskHint("summarize the codebase"));
 }
 
 fn eofReader() std.Io.AnyReader {
@@ -4099,6 +5050,65 @@ test "runtime tui bg command starts and lists background jobs" {
     try std.testing.expect(std.mem.indexOf(u8, written, "bg L1 R1 D0") != null);
 }
 
+test "runtime parity harness snapshot for slash + bg flow" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("sess");
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .tui,
+        .prompt = null,
+        .cfg = .{
+            .mode = .tui,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "p"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = try std.testing.allocator.dupe(u8, "cat >/dev/null; printf 'text:noop\\nstop:done\\n'"),
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var in_fbs = std.io.fixedBufferStream("/help\n/tools all\n/bg run sleep 1\n/bg list\n/quit\n");
+    var out_buf: [32768]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    const sid = try execWithIo(
+        std.testing.allocator,
+        cfg,
+        in_fbs.reader().any(),
+        out_fbs.writer().any(),
+    );
+    defer std.testing.allocator.free(sid);
+
+    const written = out_fbs.getWritten();
+    const Snap = struct {
+        has_help: bool,
+        has_tools_set: bool,
+        has_bg_started: bool,
+        has_bg_list_header: bool,
+        has_bg_footer: bool,
+    };
+    try oh.snap(@src(),
+        \\app.runtime.test.runtime parity harness snapshot for slash + bg flow.Snap
+        \\  .has_help: bool = true
+        \\  .has_tools_set: bool = true
+        \\  .has_bg_started: bool = true
+        \\  .has_bg_list_header: bool = true
+        \\  .has_bg_footer: bool = true
+    ).expectEqual(Snap{
+        .has_help = std.mem.indexOf(u8, written, "/help") != null,
+        .has_tools_set = std.mem.indexOf(u8, written, "tools set to read,write,bash,edit,grep,find,ls,ask") != null,
+        .has_bg_started = std.mem.indexOf(u8, written, "bg started id=1") != null,
+        .has_bg_list_header = std.mem.indexOf(u8, written, "id pid state code log cmd") != null,
+        .has_bg_footer = std.mem.indexOf(u8, written, "bg L1 R1 D0") != null,
+    });
+}
+
 test "runtime rpc accepts type envelope aliases and echoes ids" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4229,6 +5239,53 @@ test "runtime bg command validates usage and missing ids" {
     const bad_sub = try runBgCommand(std.testing.allocator, &mgr, "wat");
     defer std.testing.allocator.free(bad_sub);
     try std.testing.expectEqualStrings("usage: /bg run <cmd>|list|show <id>|stop <id>\n", bad_sub);
+}
+
+test "parseCmdToolMask fuzz smoke does not panic" {
+    var prng = std.Random.DefaultPrng.init(0x5EED_F00D);
+    const rnd = prng.random();
+
+    var buf: [64]u8 = undefined;
+    var i: usize = 0;
+    while (i < 2000) : (i += 1) {
+        const n = rnd.intRangeAtMost(usize, 0, buf.len);
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const pick = rnd.intRangeAtMost(u8, 0, 9);
+            buf[j] = switch (pick) {
+                0 => ',',
+                1 => ' ',
+                2 => 'r',
+                3 => 'w',
+                4 => 'b',
+                5 => 'a',
+                6 => 's',
+                7 => 'l',
+                8 => 'g',
+                else => 'x',
+            };
+        }
+        _ = parseCmdToolMask(buf[0..n]) catch {};
+    }
+}
+
+test "resolveArgSrc maps slash command names to completion sources" {
+    const models = [_][]const u8{ "m1", "m2" };
+
+    const model_src = resolveArgSrc("/model ", &models) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("m1", model_src[0]);
+
+    const provider_src = resolveArgSrc("/provider ", &models) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("anthropic", provider_src[0]);
+
+    const login_src = resolveArgSrc("/login ", &models) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("openai", login_src[1]);
+
+    const bg_src = resolveArgSrc("/bg ", &models) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("run", bg_src[0]);
+
+    try std.testing.expect(resolveArgSrc("/unknown ", &models) == null);
+    try std.testing.expect(resolveArgSrc("plain", &models) == null);
 }
 
 test "runtime bg command run show list workflow" {

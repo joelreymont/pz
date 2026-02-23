@@ -21,14 +21,14 @@ Full feature parity with pi, plus some extras:
 - **Image rendering** — Kitty graphics protocol support in terminal
 - **24 slash commands** — `/model`, `/fork`, `/export`, `/compact`, `/share`, `/tree`, and more
 - **Autocomplete dropdown** — fuzzy-filtered command and file path completion
-- **7 built-in tools** — `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`
+- **8 built-in tools** — `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `ask`
 - **Session management** — persist, resume, fork, name, export, share as gist
 - **OAuth + API key auth** — automatic token refresh, multi-provider support
 - **Thinking modes** — adaptive and budget-capped extended thinking
 - **Prompt caching** — automatic cache_control on system messages
 - **Headless modes** — `--print`, `--json`, and `rpc` for scripting and integration
 - **Zero-alloc hot path** — rendering and input handling avoid heap allocations
-- **525 tests** — unit, integration, snapshot, and property tests
+- **582 tests** — unit, integration, snapshot, and property tests
 
 ## Build
 
@@ -59,6 +59,11 @@ echo '{"prompt":"hello"}' | pz --json
 ```
 zig build test
 ```
+
+## Changelog
+
+- `CHANGELOG.md` for release-by-release notes
+- `pz --changelog` or `/changelog` in TUI for in-app change visibility
 
 ## Config
 

@@ -11,6 +11,7 @@ const overlay_mod = @import("overlay.zig");
 const cmdprev_mod = @import("cmdprev.zig");
 const pathcomp_mod = @import("pathcomp.zig");
 const imgproto_mod = @import("imgproto.zig");
+const spinner = @import("spinner.zig");
 
 pub const Ui = struct {
     alloc: std.mem.Allocator,
@@ -412,8 +413,6 @@ pub const Ui = struct {
         try self.drawBorderPlain(y, null);
     }
 
-    const spin_chars = [_]u21{ 0x280B, 0x2819, 0x2839, 0x2838, 0x283C, 0x2834, 0x2826, 0x2827, 0x2807, 0x280F };
-
     fn drawBorderWithStatus(self: *Ui, y: usize) !void {
         const active = self.pn.run_state == .streaming or self.pn.run_state == .tool;
         if (active) self.spin +%= 1;
@@ -421,7 +420,7 @@ pub const Ui = struct {
         const label: ?[]const u8 = switch (self.pn.run_state) {
             .streaming, .tool => blk: {
                 const prefix: []const u8 = if (self.pn.run_state == .tool) " running tool " else " streaming ";
-                const sc = spin_chars[self.spin % spin_chars.len];
+                const sc = spinner.cp(self.spin);
                 break :blk std.fmt.bufPrint(&lbl_buf, "{s}{u} ", .{ prefix, sc }) catch prefix;
             },
             .canceled => " canceled ",

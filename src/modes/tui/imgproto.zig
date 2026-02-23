@@ -6,13 +6,21 @@ pub const ImageCap = enum {
     iterm,
 };
 
+const term_cap_map = std.StaticStringMap(ImageCap).initComptime(.{
+    .{ "xterm-kitty", .kitty },
+});
+
+const term_program_cap_map = std.StaticStringMap(ImageCap).initComptime(.{
+    .{ "WezTerm", .kitty },
+});
+
 pub fn detect() ImageCap {
     if (std.posix.getenv("KITTY_WINDOW_ID") != null) return .kitty;
     if (std.posix.getenv("TERM")) |term| {
-        if (std.mem.eql(u8, term, "xterm-kitty")) return .kitty;
+        if (term_cap_map.get(term)) |cap| return cap;
     }
     if (std.posix.getenv("TERM_PROGRAM")) |tp| {
-        if (std.mem.eql(u8, tp, "WezTerm")) return .kitty;
+        if (term_program_cap_map.get(tp)) |cap| return cap;
         if (std.mem.indexOf(u8, tp, "iTerm") != null) return .iterm;
     }
     if (std.posix.getenv("LC_TERMINAL")) |lt| {

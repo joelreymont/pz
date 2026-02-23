@@ -548,10 +548,14 @@ fn buildReqTools(
         alloc.free(out);
     }
     for (reg.entries, out) |entry, *slot| {
+        const schema = if (entry.spec.schema_json) |raw_schema|
+            try alloc.dupe(u8, raw_schema)
+        else
+            try buildSchema(alloc, entry.spec.params);
         slot.* = .{
             .name = entry.name,
             .desc = entry.spec.desc,
-            .schema = try buildSchema(alloc, entry.spec.params),
+            .schema = schema,
         };
         built += 1;
     }
@@ -748,6 +752,9 @@ fn parseCallArgs(
         },
         .ls => .{
             .ls = try parseArgs(tools.Call.LsArgs, alloc, raw),
+        },
+        .ask => .{
+            .ask = try parseArgs(tools.Call.AskArgs, alloc, raw),
         },
     };
 }

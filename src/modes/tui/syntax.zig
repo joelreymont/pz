@@ -54,28 +54,32 @@ pub const Lang = enum {
     unknown,
 
     pub fn detect(hint: []const u8) Lang {
-        const map = .{
-            .{ "zig", Lang.zig },
-            .{ "python", Lang.python },
-            .{ "py", Lang.python },
-            .{ "bash", Lang.bash },
-            .{ "sh", Lang.bash },
-            .{ "shell", Lang.bash },
-            .{ "zsh", Lang.bash },
-            .{ "json", Lang.json },
-            .{ "javascript", Lang.javascript },
-            .{ "js", Lang.javascript },
-            .{ "jsx", Lang.javascript },
-            .{ "ts", Lang.javascript },
-            .{ "typescript", Lang.javascript },
-            .{ "tsx", Lang.javascript },
-        };
-        inline for (map) |entry| {
-            if (std.mem.eql(u8, hint, entry[0])) return entry[1];
-        }
-        return .unknown;
+        return lang_detect_map.get(hint) orelse .unknown;
     }
 };
+
+const lang_detect_map = std.StaticStringMap(Lang).initComptime(.{
+    .{ "zig", .zig },
+    .{ "python", .python },
+    .{ "py", .python },
+    .{ "bash", .bash },
+    .{ "sh", .bash },
+    .{ "shell", .bash },
+    .{ "zsh", .bash },
+    .{ "json", .json },
+    .{ "javascript", .javascript },
+    .{ "js", .javascript },
+    .{ "jsx", .javascript },
+    .{ "ts", .javascript },
+    .{ "typescript", .javascript },
+    .{ "tsx", .javascript },
+});
+
+const json_lit_map = std.StaticStringMap(void).initComptime(.{
+    .{ "true", {} },
+    .{ "false", {} },
+    .{ "null", {} },
+});
 
 pub fn tokenize(line: []const u8, lang: Lang, buf: []Token) []const Token {
     return switch (lang) {
@@ -370,9 +374,7 @@ fn tokenizeJson(line: []const u8, buf: []Token) []const Token {
             const start = i;
             while (i < line.len and isIdentChar(line[i])) : (i += 1) {}
             const word = line[start..i];
-            const kind: Kind = if (std.mem.eql(u8, word, "true") or
-                std.mem.eql(u8, word, "false") or
-                std.mem.eql(u8, word, "null")) .keyword else .text;
+            const kind: Kind = if (json_lit_map.get(word) != null) .keyword else .text;
             buf[n] = .{ .start = start, .end = i, .kind = kind };
             n += 1;
             continue;

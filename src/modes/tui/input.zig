@@ -442,6 +442,10 @@ fn mapCsiParam(seq: []const u8) Ev {
     if (seq.len == 4 and std.mem.eql(u8, seq, "1;3A")) {
         return .{ .key = .alt_up };
     }
+    // "1;3B" = Alt+Down
+    if (seq.len == 4 and std.mem.eql(u8, seq, "1;3B")) {
+        return .{ .key = .alt_down };
+    }
     // "1;5D" = Ctrl+Left, "1;5C" = Ctrl+Right
     if (seq.len == 4 and std.mem.eql(u8, seq[0..3], "1;5")) {
         return switch (seq[3]) {
@@ -706,6 +710,14 @@ test "parse alt-up" {
     @memcpy(r.buf[0..seq.len], seq);
     r.len = seq.len;
     try expectKey(r.parseOne().?, .alt_up);
+}
+
+test "parse alt-down" {
+    var r = Reader.init(-1);
+    const seq = "\x1b[1;3B";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    try expectKey(r.parseOne().?, .alt_down);
 }
 
 test "parse shift-ctrl-p kitty protocol" {

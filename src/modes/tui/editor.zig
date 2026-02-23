@@ -30,6 +30,7 @@ pub const Key = union(enum) {
     shift_tab: void,
     alt_enter: void,
     alt_up: void,
+    alt_down: void,
     alt_b: void,
     alt_f: void,
     ctrl_left: void,
@@ -59,6 +60,7 @@ pub const Action = enum {
     ext_editor,
     queue_followup,
     edit_queued,
+    toggle_queue_mode,
     paste_image,
     reverse_cycle_model,
     tab_complete,
@@ -281,6 +283,7 @@ pub const Editor = struct {
             .shift_ctrl_p => .reverse_cycle_model,
             .alt_enter => .queue_followup,
             .alt_up => .edit_queued,
+            .alt_down => .toggle_queue_mode,
             .alt_b, .ctrl_left => blk: {
                 self.wordLeft();
                 break :blk .none;
@@ -718,6 +721,7 @@ test "new keys produce correct actions" {
     try std.testing.expect((try ed.apply(.{ .ctrl_v = {} })) == .paste_image);
     try std.testing.expect((try ed.apply(.{ .alt_enter = {} })) == .queue_followup);
     try std.testing.expect((try ed.apply(.{ .alt_up = {} })) == .edit_queued);
+    try std.testing.expect((try ed.apply(.{ .alt_down = {} })) == .toggle_queue_mode);
     try std.testing.expect((try ed.apply(.{ .shift_ctrl_p = {} })) == .reverse_cycle_model);
 }
 

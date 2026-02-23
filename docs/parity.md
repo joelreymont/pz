@@ -1,114 +1,96 @@
-# pz Feature Parity
+# Pi Parity Spec
 
-Tracks user-visible harness parity targets and proof points.
+## Scope
 
-## Runtime Modes
+This document defines user-visible behavior parity targets between `pz` and `pi`.
+Parity is measured at the terminal UX and command semantics level, not internal implementation.
 
-- [x] `tui` interactive mode
-  - Proof: `src/app/runtime.zig` tests
-- [x] `print` headless mode
-  - Proof: `src/app/runtime.zig`, `src/modes/print/run.zig`
-- [x] `json` headless event stream mode
-  - Proof: `src/app/runtime.zig:test \"runtime json mode emits JSON lines for loop events\"`
-- [x] `rpc` stdin/stdout command mode
-  - Proof: `src/app/runtime.zig:test \"runtime rpc mode handles session model prompt and quit commands\"`
+## Command Semantics
 
-## Session Surface
+### Slash Commands
 
-- [x] default auto session creation
-- [x] `--continue` / `--resume`
-- [x] `--session <ID|PATH>`
-- [x] `--no-session`
-- [x] runtime slash/RPC session controls: `new`, `resume`, `session`, `tree`, `fork`, `compact`
-  - Proof: `src/app/args.zig`, `src/app/runtime.zig`
+`pz` must preserve command intent and output classes for:
 
-## Model/Provider Surface
+1. `/help`
+2. `/model`
+3. `/provider`
+4. `/tools`
+5. `/bg run|list|show|stop`
+6. `/session`
+7. `/new`
+8. `/resume`
+9. `/fork`
+10. `/compact`
+11. `/settings`
+12. `/upgrade`
 
-- [x] `--model <MODEL>`
-- [x] `--provider <PROVIDER>`
-- [x] `--provider-cmd <CMD>`
-- [x] auto-import pi defaults from `~/.pi/agent/settings.json`
-  - Proof: `src/app/config.zig:test "config auto imports pi settings from home"`
-- [x] `/model` and `/provider` commands in TUI
-- [x] `model` and `provider` commands in RPC
-- [x] `/tools` and `tools` commands for live tool-surface control
-  - Proof: `src/app/runtime.zig:test \"runtime tui tools command updates tool availability per turn\"`
-  - Proof: `src/app/runtime.zig:test \"runtime rpc tools command updates tool availability per turn\"`
-- [x] provider label forwarded into provider request payload
-  - Proof: `src/app/args.zig`, `src/app/config.zig`, `src/app/runtime.zig`, `src/core/providers/first_provider.zig`
-- [x] TUI status renders model + provider identity
-  - Proof: `src/modes/tui/panels.zig:test \"panels render model status and usage indicators\"`
+For each command:
 
-## Tools
+1. Success emits a deterministic, parseable line/message.
+2. Invalid usage emits stable usage text.
+3. State-changing commands update footer/status immediately.
 
-- [x] core built-ins: `read`, `write`, `bash`, `edit`
-- [x] extra built-ins: `grep`, `find`, `ls`
-- [x] `--tools <LIST>` and `--no-tools` masking
-  - Proof: `src/core/tools/*`, `src/app/args.zig`, `src/app/runtime.zig`
+## Background Jobs
 
-## TUI Display Parity
+### Lifecycle
 
-- [x] startup banner with version, keybindings, context, skills
-- [x] cost display ($N.NNN) and subscription indicator (sub)
-- [x] prompt caching (cache_control on last system block)
-- [x] jj bookmark / git branch in footer
-- [x] user prompt echo in transcript
-- [x] thinking visible by default
-- [x] model selector overlay (ctrl+l)
-- [x] tool call display as `$ command`
-- [x] ESC cancellation during streaming (InputWatcher thread)
-- [x] --max-turns flag
-- [x] `/export [path]` session export to markdown
-- [x] `/session` rich info (message counts, file, ID)
-- [x] `/cost` detailed breakdown (tokens, cache, cost)
-- [x] bracketed paste mode (multi-line paste, file drop)
-- [x] streaming/tool status indicator on border line
-- [x] input history (up/down arrow navigation)
-- [x] hardware cursor positioned on editor line
-- [x] max_tokens stop reason feedback in transcript
-- [x] emacs keybindings (ctrl+a/e/u/w)
-- [x] word movement (alt+b/f, ctrl+left/right)
-- [x] turn counter in footer
-- [x] `/settings` shows system prompt preview
-- [x] slash command tab completion
-- [x] editor horizontal scrolling (long input)
-- [x] Page Up/Down keyboard transcript scrolling
-- [x] portable clipboard (pbcopy/xclip/xsel/wl-copy)
-- [x] kill ring (ctrl+k/u/w + ctrl+y/alt+y)
-- [x] undo/redo (ctrl+z / ctrl+shift+z)
-- [x] jump-to-char (ctrl+])
-- [x] multi-line editor with visual word-wrap (up to 8 rows)
-- [x] slash command preview dropdown with fuzzy matching
-- [x] per-command argument completion (model, provider, tools)
-- [x] file path completion (Tab for paths, @ mention dropdown)
-- [x] inline image rendering (Kitty + iTerm2 protocols)
-- [x] model selector overlay (ctrl+l)
-- [x] session selector overlay (/resume)
-- [x] settings overlay (/settings)
-- [x] fork message selector overlay (/fork)
-- [x] login/logout overlays with provider selection
-- [x] `/login <provider> <key>` direct API key login
+1. Start returns `id`, `pid`, and log path.
+2. Running jobs update footer counters.
+3. Exit emits completion notification with final state and code/error.
+4. Stopping a done/missing job is explicit (`already done`/`not found`).
 
-## Slash Commands
+### Crash Recovery
 
-- [x] `/help`, `/quit`, `/exit`
-- [x] `/session`, `/settings`, `/hotkeys`
-- [x] `/model <id>`, `/provider <id>`, `/tools [list|all]`
-- [x] `/clear`, `/copy`, `/cost`
-- [x] `/export [path]` — export to markdown
-- [x] `/name <name>`, `/new`, `/resume [id]`, `/tree`, `/fork [id]`
-- [x] `/compact`, `/reload`
-- [x] `/login`, `/logout`
-- [x] `/share` — GitHub gist via `gh gist create`
-  - Proof: `src/app/runtime.zig:shareGist`
-- [x] `/changelog` — changelog display (placeholder)
-  - Proof: `src/app/runtime.zig:handleSlashCommand`
-- [x] scoped models — `--models` flag, `enabled_models` config, pi settings import
-  - Proof: `src/app/config.zig:test "config models flag sets enabled_models"`
+1. Launch and exit are persisted in append-only journal entries.
+2. On restart, unclosed launch entries are replayed.
+3. Replayed stale jobs are terminated and marked cleaned.
+4. Journal replay after recovery contains no stale active entries.
 
-## Explicit Non-Parity (By Design)
+## Status/Footer
 
-- [ ] SDK integration
-- [ ] extension/plugin ecosystem
+Footer must expose:
 
-These are out of scope for Zig-first `pz` unless explicitly requested.
+1. Project path (with home shortening)
+2. Active branch/bookmark
+3. Model and provider
+4. Thinking level indicator
+5. Turn/token/cost/context utilization
+6. Background counters (`L`, `R`, `D`) and spinner while running
+
+## Rendering Parity
+
+Deterministic rendering requirements:
+
+1. Stable frame output for fixed terminal size and seed.
+2. Spinner/state transitions produce predictable frame deltas.
+3. Overlay navigation (up/down/enter/esc) is deterministic.
+4. Prompt/tool/result transcript ordering is stable.
+
+## Ask Tool Parity
+
+`ask` tool behavior:
+
+1. Accepts one or more questions with options.
+2. In TUI, renders a per-question overlay with previous/next navigation and a final submit action.
+3. Each question can choose an option or `Type something else` and enter custom text inline.
+4. `Esc`/`Ctrl-C` cancels the questionnaire and returns to the prompt.
+5. Returns structured JSON with `cancelled` and `answers`.
+6. In non-interactive mode, returns explicit unsupported error.
+
+## Error Surface
+
+All user-facing failures must be typed and explicit:
+
+1. No silent fallback for missing tools/invalid args.
+2. No swallowed bg process errors.
+3. Recovery/cleanup failures must still produce deterministic output.
+
+## Test Contract
+
+Parity test coverage must include:
+
+1. Unit tests for parser/tool dispatch and structured errors.
+2. Snapshot tests for footer/render states.
+3. Integration tests for slash commands and bg lifecycle.
+4. Journal replay/recovery tests.
+5. Ask tool interactive + non-interactive behavior tests.

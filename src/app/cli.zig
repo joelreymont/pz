@@ -27,6 +27,7 @@ pub const Command = union(enum) {
     help: []const u8,
     version: []const u8,
     changelog: []const u8,
+    upgrade,
     run: Run,
 
     pub fn deinit(self: *Command, alloc: std.mem.Allocator) void {
@@ -49,6 +50,7 @@ pub fn parse(
     if (parsed.show_help) return .{ .help = help_text };
     if (parsed.show_version) return .{ .version = version_text };
     if (parsed.show_changelog) return .{ .changelog = changelog_text };
+    if (parsed.show_upgrade) return .upgrade;
 
     var cfg = try config.discover(alloc, dir, parsed, env);
     errdefer cfg.deinit(alloc);
@@ -101,7 +103,7 @@ pub const help_text =
     \\      --provider <PROVIDER>   Override provider id
     \\      --session-dir <PATH>    Override session directory
     \\      --provider-cmd <CMD>    Override provider transport command
-    \\      --tools <LIST>          Enable tool subset (read,write,bash,edit,grep,find,ls)
+    \\      --tools <LIST>          Enable tool subset (read,write,bash,edit,grep,find,ls,ask)
     \\      --no-tools              Disable all built-in tools
     \\      --thinking <LEVEL>      Thinking mode (off,minimal,low,medium,high,xhigh,adaptive)
     \\      --max-turns <N>          Limit agent loop turns (0=unlimited)
@@ -110,6 +112,7 @@ pub const help_text =
     \\      --append-system-prompt <TEXT>
     \\                             Append to system prompt
     \\      --changelog             Show changelog
+    \\      --upgrade               Self-update to latest release
     \\  -h, --help                  Show help
     \\  -V, --version               Show version
 ;
@@ -134,6 +137,15 @@ test "cli returns help and version commands" {
         .version => |txt| try std.testing.expectEqualStrings(version_text, txt),
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "cli returns upgrade command" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var cmd = try parse(std.testing.allocator, tmp.dir, &.{"--upgrade"}, .{});
+    defer cmd.deinit(std.testing.allocator);
+    try std.testing.expect(cmd == .upgrade);
 }
 
 test "cli mode dispatch uses config mode when mode flag absent" {

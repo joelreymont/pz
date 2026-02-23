@@ -1,4 +1,5 @@
 const std = @import("std");
+const journal_mod = @import("job_journal.zig");
 
 pub const State = enum {
     running,
@@ -72,6 +73,11 @@ const Job = struct {
 };
 
 pub const Mgr = struct {
+    pub const Opts = struct {
+        state_dir: ?[]const u8 = null,
+        recover: bool = true,
+    };
+
     alloc: std.mem.Allocator,
     mu: std.Thread.Mutex = .{},
     jobs: std.ArrayListUnmanaged(Job) = .empty,
@@ -79,17 +85,36 @@ pub const Mgr = struct {
     next_id: u64 = 1,
     wake_r: std.posix.fd_t,
     wake_w: std.posix.fd_t,
+    journal: journal_mod.Journal,
 
     pub fn init(alloc: std.mem.Allocator) !Mgr {
+        return initWithOpts(alloc, .{});
+    }
+
+    pub fn initWithOpts(alloc: std.mem.Allocator, opts: Opts) !Mgr {
         const pipe = try std.posix.pipe2(.{
             .NONBLOCK = true,
             .CLOEXEC = true,
         });
-        return .{
+        errdefer {
+            std.posix.close(pipe[0]);
+            std.posix.close(pipe[1]);
+        }
+
+        var out: Mgr = .{
             .alloc = alloc,
             .wake_r = pipe[0],
             .wake_w = pipe[1],
+            .journal = try journal_mod.Journal.init(alloc, .{
+                .state_dir = opts.state_dir,
+            }),
         };
+        errdefer out.journal.deinit();
+
+        if (opts.recover) {
+            try out.recoverStale();
+        }
+        return out;
     }
 
     pub fn deinit(self: *Mgr) void {
@@ -97,6 +122,7 @@ pub const Mgr = struct {
         for (self.jobs.items) |job| {
             if (job.state == .running) {
                 _ = std.posix.kill(@as(std.posix.pid_t, @intCast(job.pid)), std.posix.SIG.KILL) catch {};
+                self.journal.appendCleanup(job.id, "shutdown_kill") catch {};
             }
         }
         self.mu.unlock();
@@ -129,6 +155,7 @@ pub const Mgr = struct {
 
         std.posix.close(self.wake_r);
         std.posix.close(self.wake_w);
+        self.journal.deinit();
         self.* = undefined;
     }
 
@@ -186,6 +213,8 @@ pub const Mgr = struct {
         const pid: i32 = @intCast(child.id);
         const started_at_ms = std.time.milliTimestamp();
 
+        try self.journal.appendLaunch(id, pid, cmd_dup, log_path, started_at_ms);
+
         self.mu.lock();
         const idx = self.jobs.items.len;
         self.jobs.append(self.alloc, .{
@@ -204,6 +233,7 @@ pub const Mgr = struct {
             self.mu.unlock();
             _ = child.kill() catch {};
             _ = child.wait() catch {};
+            self.journal.appendCleanup(id, "start_append_fail") catch {};
             self.alloc.destroy(ctx);
             self.alloc.free(cmd_dup);
             self.alloc.free(log_path);
@@ -214,6 +244,7 @@ pub const Mgr = struct {
         const thr = std.Thread.spawn(.{}, waitThread, .{ctx}) catch |spawn_err| {
             _ = child.kill() catch {};
             _ = child.wait() catch {};
+            self.journal.appendCleanup(id, "start_spawn_fail") catch {};
 
             self.mu.lock();
             if (idx < self.jobs.items.len and self.jobs.items[idx].id == id) {
@@ -234,6 +265,7 @@ pub const Mgr = struct {
         } else {
             self.mu.unlock();
             thr.join();
+            self.journal.appendCleanup(id, "start_internal_error") catch {};
             return error.InternalError;
         }
         self.mu.unlock();
@@ -366,9 +398,37 @@ pub const Mgr = struct {
             job.err_name = @errorName(wait_err);
         }
 
+        self.journal.appendExit(
+            id,
+            stateName(job.state),
+            job.code,
+            ended_at_ms,
+            job.err_name,
+        ) catch {};
+
         self.done.append(self.alloc, job.id) catch {};
         const b = [_]u8{1};
         _ = std.posix.write(self.wake_w, &b) catch {};
+    }
+
+    fn recoverStale(self: *Mgr) !void {
+        const active = try self.journal.replayActive(self.alloc);
+        defer journal_mod.deinitActives(self.alloc, active);
+
+        for (active) |job| {
+            const pid: std.posix.pid_t = @intCast(job.pid);
+            std.posix.kill(pid, std.posix.SIG.TERM) catch |err| switch (err) {
+                error.ProcessNotFound => {},
+                else => {},
+            };
+            // Give TERM a chance, then force kill to avoid lingering jobs.
+            std.Thread.sleep(150 * std.time.ns_per_ms);
+            std.posix.kill(pid, std.posix.SIG.KILL) catch |err| switch (err) {
+                error.ProcessNotFound => {},
+                else => {},
+            };
+            self.journal.appendCleanup(job.id, "startup_reap") catch {};
+        }
     }
 
     fn findIdxLocked(self: *Mgr, id: u64) ?usize {
@@ -639,4 +699,28 @@ test "bg manager stop sends termination signal" {
     try std.testing.expect(stop == .sent or stop == .already_done);
 
     try std.testing.expect((try mgr.stop(999999)) == .not_found);
+}
+
+test "bg manager recovers and clears stale journal launch entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(state_dir);
+
+    var j = try journal_mod.Journal.init(std.testing.allocator, .{
+        .state_dir = state_dir,
+        .enabled = true,
+    });
+    try j.appendLaunch(99, 999_999, "sleep 30", "/tmp/none.log", 1);
+    j.deinit();
+
+    var mgr = try Mgr.initWithOpts(std.testing.allocator, .{
+        .state_dir = state_dir,
+        .recover = true,
+    });
+    defer mgr.deinit();
+
+    const active = try mgr.journal.replayActive(std.testing.allocator);
+    defer journal_mod.deinitActives(std.testing.allocator, active);
+    try std.testing.expectEqual(@as(usize, 0), active.len);
 }

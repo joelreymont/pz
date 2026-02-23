@@ -36,6 +36,7 @@ pub const cmds = [_]Cmd{
     .{ .name = "share", .desc = "Share as gist" },
     .{ .name = "tools", .desc = "Set/show tools" },
     .{ .name = "tree", .desc = "List sessions" },
+    .{ .name = "upgrade", .desc = "Self-update" },
     .{ .name = "bg", .desc = "Background jobs" },
 };
 

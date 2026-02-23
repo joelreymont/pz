@@ -47,6 +47,10 @@ pub const Check = struct {
         return self.result;
     }
 
+    pub fn isDone(self: *const Check) bool {
+        return self.done.load(.acquire);
+    }
+
     pub fn deinit(self: *Check) void {
         if (self.thread) |t| t.join();
         if (self.result) |r| self.alloc.free(r);

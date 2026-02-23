@@ -64,3 +64,8 @@ See `~/.agents/docs/zig.md`.
 
 Track execution against `PLAN.md`.
 When a plan item is complete, update status in commit message and notes.
+
+## Release Rule
+
+For release work, import and follow `.claude/skills/release/SKILL.md` in addition to this file.
+Release prep must include a `CHANGELOG.md` entry for the new version before tagging.

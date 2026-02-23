@@ -9,6 +9,12 @@ const vscreen = @import("vscreen.zig");
 const Ev = core.providers.Ev;
 const VScreen = vscreen.VScreen;
 const Ui = harness.Ui;
+const FrameSnap = struct {
+    row0: []const u8,
+    row1: []const u8,
+    row8: []const u8,
+    row9: []const u8,
+};
 
 /// Render a Ui into a VScreen via the renderer.
 fn renderToVs(ui: *Ui, vs: *VScreen) !void {
@@ -227,6 +233,70 @@ test "e2e word wrap in narrow terminal" {
         if (row.len > 0) non_empty += 1;
     }
     try std.testing.expect(non_empty >= 2);
+}
+
+test "golden snapshot deterministic frame text" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+
+    var ui = try Ui.init(std.testing.allocator, 40, 10, "m", "p");
+    defer ui.deinit();
+    try ui.onProvider(.{ .text = "hello world" });
+    try ui.onProvider(.{ .stop = .{ .reason = .done } });
+
+    var vs = try VScreen.init(std.testing.allocator, 40, 10);
+    defer vs.deinit();
+    try renderToVs(&ui, &vs);
+
+    const r0_full = try vs.rowText(std.testing.allocator, 0);
+    defer std.testing.allocator.free(r0_full);
+    const r1_full = try vs.rowText(std.testing.allocator, 1);
+    defer std.testing.allocator.free(r1_full);
+    const r8_full = try vs.rowText(std.testing.allocator, 8);
+    defer std.testing.allocator.free(r8_full);
+    const r9_full = try vs.rowText(std.testing.allocator, 9);
+    defer std.testing.allocator.free(r9_full);
+
+    const norm = struct {
+        fn run(text: []const u8, out: []u8) []const u8 {
+            var w: usize = 0;
+            var in_space = false;
+            for (text) |ch| {
+                if (ch == ' ') {
+                    if (in_space) continue;
+                    in_space = true;
+                } else {
+                    in_space = false;
+                }
+                if (w < out.len) {
+                    out[w] = ch;
+                    w += 1;
+                }
+            }
+            return std.mem.trim(u8, out[0..w], " ");
+        }
+    };
+    var n0: [64]u8 = undefined;
+    var n1: [64]u8 = undefined;
+    var n8: [64]u8 = undefined;
+    var n9: [64]u8 = undefined;
+    const snap = FrameSnap{
+        .row0 = norm.run(r0_full, n0[0..]),
+        .row1 = norm.run(r1_full, n1[0..]),
+        .row8 = norm.run(r8_full, n8[0..]),
+        .row9 = norm.run(r9_full, n9[0..]),
+    };
+    try oh.snap(@src(),
+        \\modes.tui.fixture.FrameSnap
+        \\  .row0: []const u8
+        \\    "hello world"
+        \\  .row1: []const u8
+        \\    ""
+        \\  .row8: []const u8
+        \\    ""
+        \\  .row9: []const u8
+        \\    "mode steering q0 1 turn (p) m"
+    ).expectEqual(snap);
 }
 
 test "e2e multiple parallel tool calls" {
