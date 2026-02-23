@@ -22,9 +22,6 @@ jobs:
           - target: aarch64-linux
             os: ubuntu-latest
             artifact: pz-aarch64-linux
-          - target: x86_64-macos
-            os: macos-latest
-            artifact: pz-x86_64-macos
           - target: aarch64-macos
             os: macos-latest
             artifact: pz-aarch64-macos
@@ -70,5 +67,4 @@ jobs:
           files: |
             pz-x86_64-linux.tar.gz
             pz-aarch64-linux.tar.gz
-            pz-x86_64-macos.tar.gz
             pz-aarch64-macos.tar.gz

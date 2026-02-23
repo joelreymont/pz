@@ -49,7 +49,6 @@ If tests fail, stop and report.
 zig build check -Dtarget=x86_64-linux
 zig build check -Dtarget=aarch64-linux
 zig build check -Dtarget=aarch64-macos
-zig build check -Dtarget=x86_64-macos
 ```
 
 ### 5. Update version in build.zig.zon
@@ -79,7 +78,7 @@ gh run list --limit 1
 gh run watch <run_id>
 ```
 
-Wait for all 4 builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos) and the release job to succeed.
+Wait for all 3 builds (x86_64-linux, aarch64-linux, aarch64-macos) and the release job to succeed.
 
 ### 9. Verify release
 
@@ -87,10 +86,9 @@ Wait for all 4 builds (x86_64-linux, aarch64-linux, x86_64-macos, aarch64-macos)
 gh release view vX.Y.Z
 ```
 
-Confirm 4 artifacts are attached:
+Confirm 3 artifacts are attached:
 - pz-x86_64-linux.tar.gz
 - pz-aarch64-linux.tar.gz
-- pz-x86_64-macos.tar.gz
 - pz-aarch64-macos.tar.gz
 
 Report the release URL to the user.
@@ -108,5 +106,5 @@ Fix the issue, then restart from step 3.
 ## Important
 
 - NEVER use `zig build -Dtarget=...` for cross-compile checks — it overwrites the native binary. Use `zig build check -Dtarget=...` instead.
-- The release workflow (`.github/workflows/release.yml`) triggers on `v*` tags and builds ReleaseFast binaries for all 4 targets.
+- The release workflow (`.github/workflows/release.yml`) triggers on `v*` tags and builds ReleaseFast binaries for 3 targets (x86_64-linux, aarch64-linux, aarch64-macos).
 - Version source of truth is `build.zig.zon` `.version` field, baked into the binary via build options.
