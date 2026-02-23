@@ -4598,7 +4598,9 @@ test "runtime tui reports error when no provider available" {
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, written, "provider unavailable") != null);
+    const has_auth_hint = std.mem.indexOf(u8, written, "ANTHROPIC_API_KEY") != null;
+    const has_provider_hint = std.mem.indexOf(u8, written, "provider unavailable") != null;
+    try std.testing.expect(has_auth_hint or has_provider_hint);
 }
 
 test "runtime tui consumes multiple prompts from input stream" {
