@@ -88,10 +88,18 @@ const NativeProviderRuntime = struct {
     }
 };
 
-const missing_provider_msg = "provider_cmd missing; set --provider-cmd or PZ_PROVIDER_CMD";
+const missing_provider_msg = "provider unavailable; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic <key>, or set --provider-cmd/PZ_PROVIDER_CMD";
+
+fn missingProviderMsgForInitErr(err: anyerror) []const u8 {
+    return switch (err) {
+        error.AuthNotFound => "anthropic credentials missing; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic <key>, or set --provider-cmd/PZ_PROVIDER_CMD",
+        else => missing_provider_msg,
+    };
+}
 
 const MissingProvider = struct {
     alloc: std.mem.Allocator,
+    msg: []const u8 = missing_provider_msg,
 
     fn asProvider(self: *MissingProvider) core.providers.Provider {
         return core.providers.Provider.from(MissingProvider, self, MissingProvider.start);
@@ -101,6 +109,7 @@ const MissingProvider = struct {
         const stream = try self.alloc.create(MissingProviderStream);
         stream.* = .{
             .alloc = self.alloc,
+            .msg = self.msg,
         };
         return core.providers.Stream.from(
             MissingProviderStream,
@@ -113,13 +122,14 @@ const MissingProvider = struct {
 
 const MissingProviderStream = struct {
     alloc: std.mem.Allocator,
+    msg: []const u8,
     idx: u8 = 0,
 
     fn next(self: *MissingProviderStream) !?core.providers.Ev {
         defer self.idx +|= 1;
 
         return switch (self.idx) {
-            0 => .{ .err = missing_provider_msg },
+            0 => .{ .err = self.msg },
             1 => .{ .stop = .{ .reason = .err } },
             else => null,
         };
@@ -708,6 +718,7 @@ pub fn execWithIo(
     var native_rt: NativeProviderRuntime = undefined;
     var missing_provider = MissingProvider{
         .alloc = alloc,
+        .msg = missing_provider_msg,
     };
     var provider: core.providers.Provider = undefined;
     var has_provider_rt = false;
@@ -751,7 +762,8 @@ pub fn execWithIo(
                 native_rt = nr;
                 has_native_rt = true;
                 provider = native_rt.client.asProvider();
-            } else |_| {
+            } else |err| {
+                missing_provider.msg = missingProviderMsgForInitErr(err);
                 provider = missing_provider.asProvider();
             }
             st = .init_store;
@@ -4541,14 +4553,23 @@ test "runtime executes tui mode path with provided prompt" {
     }
 }
 
+fn hasAnyAuthFileForTests() bool {
+    const home = std.posix.getenv("HOME") orelse return false;
+    const rels = [_][]const u8{
+        ".pi/agent/auth.json",
+        ".agents/auth.json",
+    };
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    for (rels) |rel| {
+        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, rel }) catch continue;
+        if (std.fs.cwd().access(path, .{})) |_| return true else |_| {}
+    }
+    return false;
+}
+
 test "runtime tui reports error when no provider available" {
     // Skip if auth file exists (native provider would attempt real HTTP)
-    const auth_res = core.providers.auth.load(std.testing.allocator);
-    if (auth_res) |*r| {
-        var result = r.*;
-        result.deinit();
-        return error.SkipZigTest;
-    } else |_| {}
+    if (hasAnyAuthFileForTests()) return error.SkipZigTest;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -4577,7 +4598,7 @@ test "runtime tui reports error when no provider available" {
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
-    try std.testing.expect(std.mem.indexOf(u8, written, "provider_cmd missing") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "provider unavailable") != null);
 }
 
 test "runtime tui consumes multiple prompts from input stream" {

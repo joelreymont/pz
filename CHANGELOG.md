@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.3] - 2026-02-23
+
+### Changed
+- Native provider auth now accepts environment credentials, with `ANTHROPIC_OAUTH_TOKEN` taking precedence over `ANTHROPIC_API_KEY`.
+
+### Fixed
+- Resolved startup failure on machines configured only with `ANTHROPIC_API_KEY` where native provider init previously fell back to `provider_cmd` error.
+- Improved missing-provider diagnostic text to direct users to Anthropic auth env vars, `/login anthropic <key>`, or `--provider-cmd`.
+- Removed a non-deterministic runtime test skip guard allocation path that could leak under `zig build test`.
+
+### Tests
+- Added auth unit tests for env credential precedence and file auth parsing/missing-file behavior.
+- Updated runtime no-provider test expectation for the new provider-unavailable diagnostic.
+
 ## [0.1.2] - 2026-02-23
 
 ### Added

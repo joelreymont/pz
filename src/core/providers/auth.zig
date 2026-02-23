@@ -31,6 +31,9 @@ const AuthEntry = struct {
 const client_id = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const token_url_host = "console.anthropic.com";
 const token_url_path = "/v1/oauth/token";
+const anthropic_oauth_env = "ANTHROPIC_OAUTH_TOKEN";
+const anthropic_api_key_env = "ANTHROPIC_API_KEY";
+const oauth_no_expiry: i64 = std.math.maxInt(i64);
 
 const AuthFile = struct {
     anthropic: ?AuthEntry = null,
@@ -65,16 +68,54 @@ pub fn load(alloc: std.mem.Allocator) !Result {
     errdefer arena.deinit();
     const ar = arena.allocator();
 
+    if (authFromEnv(.{
+        .oauth = readEnv(ar, anthropic_oauth_env),
+        .api_key = readEnv(ar, anthropic_api_key_env),
+    })) |auth| {
+        return .{ .arena = arena, .auth = auth };
+    }
+
     const home = std.process.getEnvVarOwned(ar, "HOME") catch return error.AuthNotFound;
+    return .{
+        .arena = arena,
+        .auth = try loadFileAuth(ar, home),
+    };
+}
+
+const EnvAuth = struct {
+    oauth: ?[]const u8 = null,
+    api_key: ?[]const u8 = null,
+};
+
+fn readEnv(ar: std.mem.Allocator, key: []const u8) ?[]const u8 {
+    return std.process.getEnvVarOwned(ar, key) catch null;
+}
+
+fn authFromEnv(env: EnvAuth) ?Auth {
+    if (env.oauth) |token| {
+        if (token.len > 0) return .{ .oauth = .{
+            .access = token,
+            .refresh = "",
+            .expires = oauth_no_expiry,
+        } };
+    }
+    if (env.api_key) |key| {
+        if (key.len > 0) return .{ .api_key = key };
+    }
+    return null;
+}
+
+fn loadFileAuth(alloc: std.mem.Allocator, home: []const u8) !Auth {
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const ar = arena.allocator();
+
     const path = findAuthFile(ar, home) catch return error.AuthNotFound;
-
     const raw = std.fs.cwd().readFileAlloc(ar, path, 1024 * 1024) catch return error.AuthNotFound;
-
     const parsed = std.json.parseFromSlice(AuthFile, ar, raw, .{
         .allocate = .alloc_always,
         .ignore_unknown_fields = true,
     }) catch return error.AuthNotFound;
-
     const entry = parsed.value.anthropic orelse return error.AuthNotFound;
 
     const AuthType = enum { oauth, api_key };
@@ -82,25 +123,27 @@ pub fn load(alloc: std.mem.Allocator) !Result {
         .{ "oauth", .oauth },
         .{ "api_key", .api_key },
     });
-
     const typ = entry.type orelse return error.AuthNotFound;
     const resolved = auth_map.get(typ) orelse return error.AuthNotFound;
-    switch (resolved) {
-        .oauth => {
-            const token = entry.access orelse return error.AuthNotFound;
-            const refresh_tok = entry.refresh orelse return error.AuthNotFound;
-            const expires = entry.expires orelse 0;
-            return .{ .arena = arena, .auth = .{ .oauth = .{
-                .access = token,
-                .refresh = refresh_tok,
-                .expires = expires,
-            } } };
+    return switch (resolved) {
+        .oauth => blk: {
+            const access = entry.access orelse return error.AuthNotFound;
+            const refresh = entry.refresh orelse return error.AuthNotFound;
+            const access_duped = try alloc.dupe(u8, access);
+            errdefer alloc.free(access_duped);
+            const refresh_duped = try alloc.dupe(u8, refresh);
+            errdefer alloc.free(refresh_duped);
+            break :blk .{ .oauth = .{
+                .access = access_duped,
+                .refresh = refresh_duped,
+                .expires = entry.expires orelse 0,
+            } };
         },
-        .api_key => {
+        .api_key => blk: {
             const key = entry.key orelse return error.AuthNotFound;
-            return .{ .arena = arena, .auth = .{ .api_key = key } };
+            break :blk .{ .api_key = try alloc.dupe(u8, key) };
         },
-    }
+    };
 }
 
 /// Refresh an expired OAuth token. Returns new OAuth credentials and saves to disk.
@@ -319,17 +362,70 @@ pub fn saveApiKey(alloc: std.mem.Allocator, provider: Provider, key: []const u8)
     try file.writeAll(out);
 }
 
-test "load returns auth or AuthNotFound" {
-    const res = load(std.testing.allocator);
-    if (res) |*r| {
-        // Auth file exists on this machine — verify it parsed
-        var result = r.*;
-        defer result.deinit();
-        switch (result.auth) {
-            .oauth => |o| try std.testing.expect(o.access.len > 0),
-            .api_key => |k| try std.testing.expect(k.len > 0),
-        }
-    } else |err| {
-        try std.testing.expect(err == error.AuthNotFound);
+test "authFromEnv prefers oauth token over api key" {
+    const auth = authFromEnv(.{
+        .oauth = "sk-ant-oat-123",
+        .api_key = "sk-ant-123",
+    }) orelse return error.TestUnexpectedResult;
+    switch (auth) {
+        .oauth => |oauth| {
+            try std.testing.expectEqualStrings("sk-ant-oat-123", oauth.access);
+            try std.testing.expectEqualStrings("", oauth.refresh);
+            try std.testing.expectEqual(@as(i64, oauth_no_expiry), oauth.expires);
+        },
+        else => return error.TestUnexpectedResult,
     }
+}
+
+test "authFromEnv uses api key when oauth token is missing" {
+    const auth = authFromEnv(.{
+        .oauth = null,
+        .api_key = "sk-ant-123",
+    }) orelse return error.TestUnexpectedResult;
+    switch (auth) {
+        .api_key => |key| try std.testing.expectEqualStrings("sk-ant-123", key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "loadFileAuth parses anthropic api_key entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath(".pi/agent");
+    try tmp.dir.writeFile(.{
+        .sub_path = ".pi/agent/auth.json",
+        .data =
+        \\{
+        \\  "anthropic": {
+        \\    "type": "api_key",
+        \\    "key": "sk-ant-file"
+        \\  }
+        \\}
+        ,
+    });
+
+    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(home);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const auth = try loadFileAuth(arena.allocator(), home);
+    switch (auth) {
+        .api_key => |key| try std.testing.expectEqualStrings("sk-ant-file", key),
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "loadFileAuth returns AuthNotFound when file is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const home = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(home);
+
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const res = loadFileAuth(arena.allocator(), home);
+    try std.testing.expectError(error.AuthNotFound, res);
 }
