@@ -16,7 +16,7 @@ Flow: `main → app.run → runtime.exec → core.loop → provider/tools → mo
 
 **core/**: `loop.zig` (agent loop) · `context.zig` (AGENTS.md discovery)
 
-**core/providers/**: `contract.zig` (Provider/Stream vtables, Req, Msg, Part, Ev, Role, StopReason) · `anthropic.zig` (HTTPS+SSE) · `proc_transport.zig` (subprocess stdin/stdout) · `first_provider.zig` (retry+fallback) · `retry.zig` · `stream_parse.zig` · `streaming.zig` · `types.zig` (error taxonomy) · `auth.zig`
+**core/providers/**: `contract.zig` (Provider/Stream vtables, Req, Msg, Part, Ev, Role, StopReason) · `anthropic.zig` (HTTPS+SSE) · `openai.zig` (HTTPS+SSE Responses API) · `proc_transport.zig` (subprocess stdin/stdout) · `first_provider.zig` (retry+fallback) · `retry.zig` · `stream_parse.zig` · `streaming.zig` · `types.zig` (error taxonomy) · `auth.zig`
 
 **core/tools/**: `builtin.zig` (registry, bitmask dispatch, 7 tools) · `registry.zig` (comptime registry) · `runtime.zig` (event wrapper) · `read.zig` · `write.zig` · `bash.zig` · `edit.zig` · `grep.zig` · `find.zig` · `ls.zig` · `output.zig` (truncation)
 
@@ -43,7 +43,7 @@ Provider.start(Req) → Stream.next() → ?Ev
 Ev = text | thinking | tool_call | tool_result | usage | stop | err
 ```
 
-Impls: `anthropic.zig` (HTTPS+SSE), `proc_transport.zig` (subprocess, --provider-cmd)
+Impls: `anthropic.zig` (HTTPS+SSE), `openai.zig` (HTTPS+SSE), `proc_transport.zig` (subprocess, --provider-cmd)
 
 ## Tool Dispatch
 

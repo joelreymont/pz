@@ -75,26 +75,65 @@ const ProviderRuntime = struct {
     }
 };
 
-const NativeProviderRuntime = struct {
-    client: core.providers.anthropic.Client,
+const NativeProviderKind = enum { anthropic, openai };
+const native_provider_kind_map = std.StaticStringMap(NativeProviderKind).initComptime(.{
+    .{ "anthropic", .anthropic },
+    .{ "openai", .openai },
+});
 
-    fn init(alloc: std.mem.Allocator) !NativeProviderRuntime {
-        return .{
-            .client = try core.providers.anthropic.Client.init(alloc),
+fn parseNativeProviderKind(provider: []const u8) ?NativeProviderKind {
+    return native_provider_kind_map.get(provider);
+}
+
+const NativeProviderRuntime = union(enum) {
+    anthropic: core.providers.anthropic.Client,
+    openai: core.providers.openai.Client,
+
+    fn init(alloc: std.mem.Allocator, kind: NativeProviderKind) !NativeProviderRuntime {
+        return switch (kind) {
+            .anthropic => .{ .anthropic = try core.providers.anthropic.Client.init(alloc) },
+            .openai => .{ .openai = try core.providers.openai.Client.init(alloc) },
+        };
+    }
+
+    fn asProvider(self: *NativeProviderRuntime) core.providers.Provider {
+        return switch (self.*) {
+            .anthropic => |*client| client.asProvider(),
+            .openai => |*client| client.asProvider(),
+        };
+    }
+
+    fn isSub(self: *const NativeProviderRuntime) bool {
+        return switch (self.*) {
+            .anthropic => |client| client.isSub(),
+            .openai => |client| client.isSub(),
         };
     }
 
     fn deinit(self: *NativeProviderRuntime) void {
-        self.client.deinit();
+        switch (self.*) {
+            .anthropic => |*client| client.deinit(),
+            .openai => |*client| client.deinit(),
+        }
+        self.* = undefined;
     }
 };
 
-const missing_provider_msg = "provider unavailable; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic <key>, or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_provider_msg = "provider unavailable; choose anthropic/openai with credentials or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_anthropic_provider_msg = "anthropic credentials missing; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic, or set --provider-cmd/PZ_PROVIDER_CMD";
+const missing_openai_provider_msg = "openai credentials missing; set OPENAI_API_KEY, run /login openai, or set --provider-cmd/PZ_PROVIDER_CMD";
+const unsupported_native_provider_msg = "native provider unavailable for this provider label; use anthropic/openai or set --provider-cmd/PZ_PROVIDER_CMD";
 
-fn missingProviderMsgForInitErr(err: anyerror) []const u8 {
-    return switch (err) {
-        error.AuthNotFound => "anthropic credentials missing; set ANTHROPIC_API_KEY or ANTHROPIC_OAUTH_TOKEN, run /login anthropic <key>, or set --provider-cmd/PZ_PROVIDER_CMD",
-        else => missing_provider_msg,
+fn missingProviderMsgForInitErr(kind: NativeProviderKind, err: anyerror) []const u8 {
+    return switch (kind) {
+        .anthropic => switch (err) {
+            error.AuthNotFound => missing_anthropic_provider_msg,
+            else => missing_provider_msg,
+        },
+        .openai => switch (err) {
+            error.AuthNotFound => missing_openai_provider_msg,
+            else => missing_provider_msg,
+        },
     };
 }
 
@@ -658,6 +697,320 @@ const InputWatcher = struct {
     }
 };
 
+const TurnCancelFlag = struct {
+    canceled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn clear(self: *TurnCancelFlag) void {
+        self.canceled.store(false, .release);
+    }
+
+    fn request(self: *TurnCancelFlag) void {
+        self.canceled.store(true, .release);
+    }
+
+    fn isCanceled(self: *TurnCancelFlag) bool {
+        return self.canceled.load(.acquire);
+    }
+};
+
+const LiveTurn = struct {
+    const Req = struct {
+        sid: []u8,
+        prompt: []u8,
+        model: []u8,
+        provider_label: []u8,
+        provider_opts: core.providers.Opts,
+        system_prompt: ?[]u8 = null,
+
+        fn deinit(self: *Req, alloc: std.mem.Allocator) void {
+            alloc.free(self.sid);
+            alloc.free(self.prompt);
+            alloc.free(self.model);
+            alloc.free(self.provider_label);
+            if (self.system_prompt) |sp| alloc.free(sp);
+            self.* = undefined;
+        }
+    };
+
+    const ThreadCtx = struct {
+        live: *LiveTurn,
+        tctx: *const TurnCtx,
+        req: Req,
+    };
+
+    alloc: std.mem.Allocator,
+    mu: std.Thread.Mutex = .{},
+    evs: std.ArrayListUnmanaged(core.providers.Ev) = .empty,
+    ev_head: usize = 0,
+    done: bool = false,
+    running: bool = false,
+    err_name: ?[]u8 = null,
+    thr: ?std.Thread = null,
+    wake_r: std.posix.fd_t,
+    wake_w: std.posix.fd_t,
+    cancel_flag: TurnCancelFlag = .{},
+
+    fn init(alloc: std.mem.Allocator) !LiveTurn {
+        const pipe = try std.posix.pipe2(.{
+            .NONBLOCK = true,
+            .CLOEXEC = true,
+        });
+        errdefer {
+            std.posix.close(pipe[0]);
+            std.posix.close(pipe[1]);
+        }
+        return .{
+            .alloc = alloc,
+            .wake_r = pipe[0],
+            .wake_w = pipe[1],
+        };
+    }
+
+    fn deinit(self: *LiveTurn) void {
+        self.requestCancel();
+        if (self.thr) |thr| {
+            thr.join();
+            self.thr = null;
+        }
+        self.mu.lock();
+        for (self.evs.items[self.ev_head..]) |ev| freeProviderEv(self.alloc, ev);
+        self.evs.deinit(self.alloc);
+        if (self.err_name) |name| self.alloc.free(name);
+        self.mu.unlock();
+        std.posix.close(self.wake_r);
+        std.posix.close(self.wake_w);
+        self.* = undefined;
+    }
+
+    fn wakeFd(self: *const LiveTurn) std.posix.fd_t {
+        return self.wake_r;
+    }
+
+    fn isRunning(self: *LiveTurn) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        return self.running;
+    }
+
+    fn requestCancel(self: *LiveTurn) void {
+        self.cancel_flag.request();
+    }
+
+    fn enqueueProvider(self: *LiveTurn, ev: core.providers.Ev) !void {
+        const dup = try dupProviderEv(self.alloc, ev);
+        errdefer freeProviderEv(self.alloc, dup);
+
+        self.mu.lock();
+        self.evs.append(self.alloc, dup) catch |append_err| {
+            self.mu.unlock();
+            return append_err;
+        };
+        self.mu.unlock();
+        self.nudge();
+    }
+
+    fn popProvider(self: *LiveTurn) ?core.providers.Ev {
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        if (self.ev_head >= self.evs.items.len) return null;
+        const ev = self.evs.items[self.ev_head];
+        self.ev_head += 1;
+        if (self.ev_head == self.evs.items.len) {
+            self.evs.items.len = 0;
+            self.ev_head = 0;
+        }
+        return ev;
+    }
+
+    const Completion = struct {
+        err_name: ?[]u8 = null,
+    };
+
+    fn takeCompletion(self: *LiveTurn) ?Completion {
+        var thr: ?std.Thread = null;
+        var out: Completion = .{};
+
+        self.mu.lock();
+        if (!self.done) {
+            self.mu.unlock();
+            return null;
+        }
+        self.done = false;
+        thr = self.thr;
+        self.thr = null;
+        out.err_name = self.err_name;
+        self.err_name = null;
+        self.mu.unlock();
+
+        if (thr) |t| t.join();
+        return out;
+    }
+
+    fn start(self: *LiveTurn, tctx: *const TurnCtx, opts: TurnCtx.TurnOpts) !void {
+        self.mu.lock();
+        if (self.running) {
+            self.mu.unlock();
+            return error.AlreadyRunning;
+        }
+        self.running = true;
+        self.done = false;
+        if (self.err_name) |name| {
+            self.alloc.free(name);
+            self.err_name = null;
+        }
+        for (self.evs.items[self.ev_head..]) |ev| freeProviderEv(self.alloc, ev);
+        self.evs.items.len = 0;
+        self.ev_head = 0;
+        self.mu.unlock();
+
+        self.cancel_flag.clear();
+
+        const ctx = try self.alloc.create(ThreadCtx);
+        errdefer self.alloc.destroy(ctx);
+        ctx.* = .{
+            .live = self,
+            .tctx = tctx,
+            .req = try dupReq(self.alloc, opts),
+        };
+
+        const thr = std.Thread.spawn(.{}, runThread, .{ctx}) catch |spawn_err| {
+            ctx.req.deinit(self.alloc);
+            self.alloc.destroy(ctx);
+            self.mu.lock();
+            self.running = false;
+            self.done = false;
+            self.mu.unlock();
+            return spawn_err;
+        };
+
+        self.mu.lock();
+        self.thr = thr;
+        self.mu.unlock();
+    }
+
+    fn runThread(ctx: *ThreadCtx) void {
+        defer {
+            ctx.req.deinit(ctx.live.alloc);
+            ctx.live.alloc.destroy(ctx);
+        }
+
+        const run_res = ctx.tctx.run(.{
+            .sid = ctx.req.sid,
+            .prompt = ctx.req.prompt,
+            .model = ctx.req.model,
+            .provider_label = ctx.req.provider_label,
+            .provider_opts = ctx.req.provider_opts,
+            .system_prompt = ctx.req.system_prompt,
+        });
+
+        var err_name: ?[]u8 = null;
+        if (run_res) |_| {} else |err| {
+            err_name = ctx.live.alloc.dupe(u8, @errorName(err)) catch null;
+        }
+
+        ctx.live.mu.lock();
+        ctx.live.running = false;
+        ctx.live.done = true;
+        if (ctx.live.err_name) |name| ctx.live.alloc.free(name);
+        ctx.live.err_name = err_name;
+        ctx.live.mu.unlock();
+        ctx.live.nudge();
+    }
+
+    fn nudge(self: *LiveTurn) void {
+        const b = [_]u8{1};
+        _ = std.posix.write(self.wake_w, &b) catch {};
+    }
+};
+
+const LiveTurnSink = struct {
+    live: *LiveTurn,
+
+    fn push(self: *LiveTurnSink, ev: core.loop.ModeEv) !void {
+        switch (ev) {
+            .provider => |pev| try self.live.enqueueProvider(pev),
+            else => {},
+        }
+    }
+};
+
+fn dupReq(alloc: std.mem.Allocator, opts: TurnCtx.TurnOpts) !LiveTurn.Req {
+    const sid = try alloc.dupe(u8, opts.sid);
+    errdefer alloc.free(sid);
+    const prompt = try alloc.dupe(u8, opts.prompt);
+    errdefer alloc.free(prompt);
+    const model = try alloc.dupe(u8, opts.model);
+    errdefer alloc.free(model);
+    const provider_label = try alloc.dupe(u8, opts.provider_label);
+    errdefer alloc.free(provider_label);
+    const system_prompt = if (opts.system_prompt) |sp| try alloc.dupe(u8, sp) else null;
+    errdefer if (system_prompt) |sp| alloc.free(sp);
+
+    return .{
+        .sid = sid,
+        .prompt = prompt,
+        .model = model,
+        .provider_label = provider_label,
+        .provider_opts = opts.provider_opts,
+        .system_prompt = system_prompt,
+    };
+}
+
+fn dupProviderEv(alloc: std.mem.Allocator, ev: core.providers.Ev) !core.providers.Ev {
+    return switch (ev) {
+        .text => |txt| .{ .text = try alloc.dupe(u8, txt) },
+        .thinking => |txt| .{ .thinking = try alloc.dupe(u8, txt) },
+        .tool_call => |tc| blk: {
+            const id = try alloc.dupe(u8, tc.id);
+            errdefer alloc.free(id);
+            const name = try alloc.dupe(u8, tc.name);
+            errdefer alloc.free(name);
+            const args = try alloc.dupe(u8, tc.args);
+            break :blk .{
+                .tool_call = .{
+                    .id = id,
+                    .name = name,
+                    .args = args,
+                },
+            };
+        },
+        .tool_result => |tr| blk: {
+            const id = try alloc.dupe(u8, tr.id);
+            errdefer alloc.free(id);
+            const out = try alloc.dupe(u8, tr.out);
+            break :blk .{
+                .tool_result = .{
+                    .id = id,
+                    .out = out,
+                    .is_err = tr.is_err,
+                },
+            };
+        },
+        .usage => |usage| .{ .usage = usage },
+        .stop => |stop| .{ .stop = stop },
+        .err => |txt| .{ .err = try alloc.dupe(u8, txt) },
+    };
+}
+
+fn freeProviderEv(alloc: std.mem.Allocator, ev: core.providers.Ev) void {
+    switch (ev) {
+        .text => |txt| alloc.free(txt),
+        .thinking => |txt| alloc.free(txt),
+        .tool_call => |tc| {
+            alloc.free(tc.id);
+            alloc.free(tc.name);
+            alloc.free(tc.args);
+        },
+        .tool_result => |tr| {
+            alloc.free(tr.id);
+            alloc.free(tr.out);
+        },
+        .usage, .stop => {},
+        .err => |txt| alloc.free(txt),
+    }
+}
+
 const JsonSink = struct {
     alloc: std.mem.Allocator,
     out: std.Io.AnyWriter,
@@ -759,13 +1112,21 @@ pub fn execWithIo(
                 try provider_rt.init(alloc, provider_cmd);
                 has_provider_rt = true;
                 provider = provider_rt.client.asProvider();
-            } else if (NativeProviderRuntime.init(alloc)) |nr| {
-                native_rt = nr;
-                has_native_rt = true;
-                provider = native_rt.client.asProvider();
-            } else |err| {
-                missing_provider.msg = missingProviderMsgForInitErr(err);
-                provider = missing_provider.asProvider();
+            } else {
+                const provider_name = resolveDefaultProvider(run_cmd.cfg.provider);
+                if (parseNativeProviderKind(provider_name)) |native_kind| {
+                    if (NativeProviderRuntime.init(alloc, native_kind)) |nr| {
+                        native_rt = nr;
+                        has_native_rt = true;
+                        provider = native_rt.asProvider();
+                    } else |err| {
+                        missing_provider.msg = missingProviderMsgForInitErr(native_kind, err);
+                        provider = missing_provider.asProvider();
+                    }
+                } else {
+                    missing_provider.msg = unsupported_native_provider_msg;
+                    provider = missing_provider.asProvider();
+                }
             }
             st = .init_store;
             continue :fsm;
@@ -832,7 +1193,7 @@ pub fn execWithIo(
                     session_dir_path,
                     run_cmd.no_session,
                     sys_prompt,
-                    has_native_rt and native_rt.client.isSub(),
+                    has_native_rt and native_rt.isSub(),
                 ),
                 .rpc => try runRpc(
                     alloc,
@@ -1072,7 +1433,12 @@ fn runTui(
         .cont, .resm, .explicit => true,
         .auto => false,
     };
-    try showStartup(alloc, &ui, is_resumed);
+    if (is_resumed) {
+        const restored = try tryRestoreSessionIntoUi(alloc, &ui, session_dir_path, no_session, sid.*);
+        if (!restored) try showStartup(alloc, &ui, true);
+    } else {
+        try showStartup(alloc, &ui, false);
+    }
 
     // Set terminal title (OSC 0)
     try out.writeAll("\x1b]0;pz\x07");
@@ -1113,6 +1479,9 @@ fn runTui(
         if (cmd == .reload) {
             // Reload context and continue to input loop
         }
+        if (cmd == .resumed) {
+            _ = try tryRestoreSessionIntoUi(alloc, &ui, session_dir_path, no_session, sid.*);
+        }
         if (cmd == .select_model) {
             var cur_idx: usize = 0;
             for (models_list, 0..) |m, i| {
@@ -1145,7 +1514,7 @@ fn runTui(
         if (cmd == .compacted) {
             ui.pn.noteCompaction();
         }
-        if (cmd == .handled or cmd == .compacted or cmd == .clear or cmd == .copy or cmd == .cost or cmd == .reload or cmd == .select_model or cmd == .select_session or cmd == .select_settings or cmd == .select_fork) {
+        if (cmd == .handled or cmd == .compacted or cmd == .resumed or cmd == .clear or cmd == .copy or cmd == .cost or cmd == .reload or cmd == .select_model or cmd == .select_session or cmd == .select_settings or cmd == .select_fork) {
             const cmd_text = init_cmd_fbs.getWritten();
             if (cmd_text.len > 0) {
                 try infoTextSafe(alloc, &ui, cmd_text);
@@ -1181,14 +1550,27 @@ fn runTui(
 
     if (is_tty) {
         // Raw mode already enabled above (before -p prompt path)
-        var reader = tui_input.Reader.initWithNotify(stdin_fd, bg_mgr.wakeFd());
-        var followup_queue: std.ArrayListUnmanaged([]u8) = .empty;
-        defer {
-            for (followup_queue.items) |q| alloc.free(q);
-            followup_queue.deinit(alloc);
-        }
-        var input_mode: tui_panels.InputMode = .steering;
-        syncInputFooter(&ui, input_mode, followup_queue.items.len);
+        var live_turn = try LiveTurn.init(alloc);
+        defer live_turn.deinit();
+        var live_sink_impl = LiveTurnSink{
+            .live = &live_turn,
+        };
+        const live_mode = core.loop.ModeSink.from(LiveTurnSink, &live_sink_impl, LiveTurnSink.push);
+        const live_cancel = core.loop.CancelSrc.from(TurnCancelFlag, &live_turn.cancel_flag, TurnCancelFlag.isCanceled);
+        const live_tctx = TurnCtx{
+            .alloc = alloc,
+            .provider = provider,
+            .store = store,
+            .tools_rt = tools_rt,
+            .mode = live_mode,
+            .max_turns = run_cmd.max_turns,
+            .cancel = live_cancel,
+        };
+        var reader = tui_input.Reader.initWithNotify2(stdin_fd, bg_mgr.wakeFd(), live_turn.wakeFd());
+        var pending = PendingQueue{};
+        defer pending.deinit(alloc);
+        const input_mode: tui_panels.InputMode = .steering;
+        syncInputFooter(&ui, input_mode, pending.total());
 
         while (true) {
             try maybeShowVersionUpdate(alloc, &ui, &ver_check, &ver_notice_done, out);
@@ -1228,7 +1610,10 @@ fn runTui(
                                         const next_sid = try alloc.dupe(u8, sel);
                                         alloc.free(sid.*);
                                         sid.* = next_sid;
-                                        try ui.tr.infoText(sel);
+                                        _ = try tryRestoreSessionIntoUi(alloc, &ui, session_dir_path, no_session, sid.*);
+                                        const msg = try std.fmt.allocPrint(alloc, "resumed session {s}", .{sid.*});
+                                        defer alloc.free(msg);
+                                        try ui.tr.infoText(msg);
                                         ui.ov.?.deinit(alloc);
                                         ui.ov = null;
                                     },
@@ -1256,7 +1641,7 @@ fn runTui(
                                         const msg = try std.fmt.allocPrint(alloc, "Paste {s} API key (or set {s} env var):", .{ sel, env_var });
                                         defer alloc.free(msg);
                                         try ui.tr.infoText(msg);
-                                        // Set editor to /login <provider> so user can paste the key
+                                        // Set editor to /login <provider>; API key or OAuth can follow.
                                         const prompt_text = try std.fmt.allocPrint(alloc, "/login {s} ", .{sel});
                                         defer alloc.free(prompt_text);
                                         try ui.ed.setText(prompt_text);
@@ -1265,14 +1650,9 @@ fn runTui(
                                     },
                                     .logout => {
                                         // Remove credentials for selected provider
-                                        const provider_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
-                                            .{ "anthropic", .anthropic },
-                                            .{ "openai", .openai },
-                                            .{ "google", .google },
-                                        });
-                                        if (provider_map.get(sel)) |prov| {
+                                        if (parseAuthProvider(sel)) |prov| {
                                             try core.providers.auth.logout(alloc, prov);
-                                            const msg2 = try std.fmt.allocPrint(alloc, "logged out of {s}", .{sel});
+                                            const msg2 = try std.fmt.allocPrint(alloc, "logged out of {s}", .{core.providers.auth.providerName(prov)});
                                             defer alloc.free(msg2);
                                             try ui.tr.infoText(msg2);
                                         }
@@ -1280,10 +1660,6 @@ fn runTui(
                                         ui.ov = null;
                                     },
                                     .queue => {
-                                        if (try dequeueQueuedIntoEditor(alloc, &ui, &followup_queue, ui.ov.?.sel)) {
-                                            syncInputFooter(&ui, input_mode, followup_queue.items.len);
-                                            try ui.tr.infoText("(editing queued message)");
-                                        }
                                         ui.ov.?.deinit(alloc);
                                         ui.ov = null;
                                     },
@@ -1365,19 +1741,6 @@ fn runTui(
                         }
                     }
 
-                    if (key == .enter and input_mode == .queue) {
-                        const queued_text = ui.editorText();
-                        if (shouldQueueSubmit(queued_text)) {
-                            try queueFollowup(alloc, &followup_queue, queued_text);
-                            ui.ed.clear();
-                            ui.updatePreview();
-                            syncInputFooter(&ui, input_mode, followup_queue.items.len);
-                            try ui.tr.infoText("(queued message)");
-                            try ui.draw(out);
-                            continue;
-                        }
-                    }
-
                     // Capture editor text before onKey clears it on submit
                     const snap = ui.editorText();
                     var pre: ?[]u8 = if (snap.len > 0) try alloc.dupe(u8, snap) else null;
@@ -1440,6 +1803,9 @@ fn runTui(
                                 }
                                 try ui.draw(out);
                                 continue;
+                            }
+                            if (cmd == .resumed) {
+                                _ = try tryRestoreSessionIntoUi(alloc, &ui, session_dir_path, no_session, sid.*);
                             }
                             if (cmd == .select_model) {
                                 var cur_idx: usize = 0;
@@ -1505,7 +1871,7 @@ fn runTui(
                                 try ui.draw(out);
                                 continue;
                             }
-                            if (cmd == .handled or cmd == .compacted) {
+                            if (cmd == .handled or cmd == .compacted or cmd == .resumed) {
                                 if (cmd == .compacted) ui.pn.noteCompaction();
                                 const cmd_text = cmd_fbs.getWritten();
                                 if (cmd_text.len > 0) {
@@ -1526,9 +1892,16 @@ fn runTui(
                                 continue;
                             }
 
-                            try ui.draw(out);
-                            if (!watcher.start()) try ui.tr.infoText("[ESC cancel unavailable]");
-                            const run_err = tctx.run(.{
+                            if (live_turn.isRunning()) {
+                                try pending.pushSteering(alloc, prompt);
+                                syncInputFooter(&ui, input_mode, pending.total());
+                                live_turn.requestCancel();
+                                try ui.tr.infoText("(queued steering message)");
+                                try ui.draw(out);
+                                continue;
+                            }
+
+                            try live_turn.start(&live_tctx, .{
                                 .sid = sid.*,
                                 .prompt = prompt,
                                 .model = model,
@@ -1536,36 +1909,8 @@ fn runTui(
                                 .provider_opts = popts,
                                 .system_prompt = sys_prompt,
                             });
-                            watcher.join(&reader);
-                            if (watcher.isCanceled()) try ui.tr.infoText("[canceled]");
-                            ui.pn.run_state = .idle;
-                            try run_err;
-                            if (auto_compact_on) try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
+                            ui.pn.run_state = .streaming;
                             try ui.draw(out);
-
-                            // Process queued follow-ups
-                            while (followup_queue.items.len > 0) {
-                                if (watcher.isCanceled()) break;
-                                const fq = followup_queue.orderedRemove(0);
-                                defer alloc.free(fq);
-                                syncInputFooter(&ui, input_mode, followup_queue.items.len);
-                                try ui.tr.userText(fq);
-                                if (!watcher.start()) try ui.tr.infoText("[ESC cancel unavailable]");
-                                const fq_err = tctx.run(.{
-                                    .sid = sid.*,
-                                    .prompt = fq,
-                                    .model = model,
-                                    .provider_label = provider_label,
-                                    .provider_opts = popts,
-                                    .system_prompt = sys_prompt,
-                                });
-                                watcher.join(&reader);
-                                if (watcher.isCanceled()) try ui.tr.infoText("[canceled]");
-                                ui.pn.run_state = .idle;
-                                try fq_err;
-                                if (auto_compact_on) try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
-                                try ui.draw(out);
-                            }
                         },
                         .cancel => {
                             if (pre) |p| alloc.free(p);
@@ -1573,6 +1918,19 @@ fn runTui(
                         },
                         .interrupt => {
                             if (pre) |p| alloc.free(p);
+                            if (live_turn.isRunning()) {
+                                const restored = try pending.restoreToEditor(alloc, &ui);
+                                syncInputFooter(&ui, input_mode, pending.total());
+                                live_turn.requestCancel();
+                                if (restored > 0) {
+                                    const msg = try std.fmt.allocPrint(alloc, "(restored {d} queued message{s})", .{
+                                        restored,
+                                        if (restored == 1) "" else "s",
+                                    });
+                                    defer alloc.free(msg);
+                                    try ui.tr.infoText(msg);
+                                }
+                            }
                             try ui.draw(out);
                         },
                         .cycle_thinking => {
@@ -1645,28 +2003,33 @@ fn runTui(
                             if (pre) |p| alloc.free(p);
                             const snap2 = ui.editorText();
                             if (snap2.len > 0) {
-                                try queueFollowup(alloc, &followup_queue, snap2);
+                                try pending.pushFollowUp(alloc, snap2);
                                 ui.ed.clear();
                                 ui.updatePreview();
-                                syncInputFooter(&ui, input_mode, followup_queue.items.len);
-                                try ui.tr.infoText("(queued message)");
+                                syncInputFooter(&ui, input_mode, pending.total());
+                                try ui.tr.infoText(if (live_turn.isRunning()) "(queued follow-up message)" else "(queued message)");
                             }
                             try ui.draw(out);
                         },
                         .edit_queued => {
                             if (pre) |p| alloc.free(p);
-                            if (try showQueueOverlay(alloc, &ui, followup_queue.items)) {
-                                try ui.draw(out);
-                            } else {
+                            const restored = try pending.restoreToEditor(alloc, &ui);
+                            syncInputFooter(&ui, input_mode, pending.total());
+                            if (restored == 0) {
                                 try ui.tr.infoText("(queue is empty)");
-                                try ui.draw(out);
+                            } else {
+                                const msg = try std.fmt.allocPrint(alloc, "(restored {d} queued message{s})", .{
+                                    restored,
+                                    if (restored == 1) "" else "s",
+                                });
+                                defer alloc.free(msg);
+                                try ui.tr.infoText(msg);
                             }
+                            try ui.draw(out);
                         },
                         .toggle_queue_mode => {
                             if (pre) |p| alloc.free(p);
-                            input_mode = if (input_mode == .steering) .queue else .steering;
-                            syncInputFooter(&ui, input_mode, followup_queue.items.len);
-                            try ui.tr.infoText(if (input_mode == .queue) "(input mode: queue)" else "(input mode: steering)");
+                            try ui.tr.infoText("(use Enter for steering, Alt+Enter for follow-up)");
                             try ui.draw(out);
                         },
                         .paste_image => {
@@ -1716,6 +2079,51 @@ fn runTui(
                     try ui.draw(out);
                 },
                 .notify => {
+                    while (live_turn.popProvider()) |pev| {
+                        defer freeProviderEv(alloc, pev);
+                        try ui.onProvider(pev);
+                    }
+
+                    if (live_turn.takeCompletion()) |done| {
+                        defer if (done.err_name) |name| alloc.free(name);
+
+                        if (done.err_name) |name| {
+                            const msg = try std.fmt.allocPrint(alloc, "[turn failed: {s}]", .{name});
+                            defer alloc.free(msg);
+                            try ui.tr.infoText(msg);
+                        } else if (auto_compact_on) {
+                            try autoCompact(alloc, &ui, sid.*, session_dir_path, no_session);
+                        }
+
+                        if (pending.popNext()) |next_turn| {
+                            defer alloc.free(next_turn.text);
+                            syncInputFooter(&ui, input_mode, pending.total());
+                            live_turn.start(&live_tctx, .{
+                                .sid = sid.*,
+                                .prompt = next_turn.text,
+                                .model = model,
+                                .provider_label = provider_label,
+                                .provider_opts = popts,
+                                .system_prompt = sys_prompt,
+                            }) catch |start_err| {
+                                const detail = try report.inlineMsg(alloc, start_err);
+                                defer alloc.free(detail);
+                                const msg = try std.fmt.allocPrint(alloc, "[queue start failed: {s}]", .{detail});
+                                defer alloc.free(msg);
+                                try ui.tr.infoText(msg);
+                                ui.pn.run_state = .idle;
+                                try flushBgDone(alloc, &ui, &bg_mgr);
+                                try syncBgFooter(alloc, &ui, &bg_mgr);
+                                try ui.draw(out);
+                                continue;
+                            };
+                            ui.pn.run_state = .streaming;
+                            try ui.tr.infoText(if (next_turn.kind == .steering) "(sending queued steering message)" else "(sending queued follow-up message)");
+                        } else {
+                            ui.pn.run_state = .idle;
+                        }
+                    }
+
                     try flushBgDone(alloc, &ui, &bg_mgr);
                     try syncBgFooter(alloc, &ui, &bg_mgr);
                     try ui.draw(out);
@@ -1817,7 +2225,10 @@ fn runTui(
                 cmd_ct += 1;
                 continue;
             }
-            if (cmd == .handled or cmd == .compacted) {
+            if (cmd == .resumed) {
+                _ = try tryRestoreSessionIntoUi(alloc, &ui, session_dir_path, no_session, sid.*);
+            }
+            if (cmd == .handled or cmd == .compacted or cmd == .resumed) {
                 if (cmd == .compacted) ui.pn.noteCompaction();
                 try syncBgFooter(alloc, &ui, &bg_mgr);
                 try ui.setModel(model);
@@ -2251,6 +2662,7 @@ const CmdRes = enum {
     unhandled,
     handled,
     compacted,
+    resumed,
     quit,
     clear,
     copy,
@@ -2346,7 +2758,7 @@ fn handleSlashCommand(
                 \\  /fork [id]         Fork session
                 \\  /compact           Compact session
                 \\  /reload            Reload context files
-                \\  /login             Login (OAuth)
+                \\  /login             Login (OAuth/API key)
                 \\  /logout            Logout
                 \\  /changelog         What's new
                 \\  /hotkeys           Keyboard shortcuts
@@ -2441,6 +2853,7 @@ fn handleSlashCommand(
                 return .handled;
             };
             try writeTextLine(alloc, out, "resumed session {s}\n", .{sid.*});
+            return .resumed;
         },
         .tree => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
@@ -2500,7 +2913,7 @@ fn handleSlashCommand(
         .hotkeys => {
             try out.writeAll(
                 \\Keyboard shortcuts:
-                \\  Enter          Submit message (queue in mode=queue)
+                \\  Enter          Submit message (steer while running)
                 \\  ESC            Clear input / Cancel
                 \\  Ctrl+C         Clear input / Quit
                 \\  Ctrl+D         Quit (when input empty)
@@ -2509,6 +2922,7 @@ fn handleSlashCommand(
                 \\  Up/Down        Input history
                 \\  Ctrl+A         Move to start
                 \\  Ctrl+E         Move to end
+                \\  Ctrl+J         Insert newline
                 \\  Ctrl+K         Delete to end of line
                 \\  Ctrl+U         Delete whole line
                 \\  Ctrl+W         Delete word backward
@@ -2526,9 +2940,8 @@ fn handleSlashCommand(
                 \\  Ctrl+T         Toggle thinking blocks
                 \\  Ctrl+G         External editor
                 \\  Ctrl+V         Paste image
-                \\  Alt+Enter      Queue message
-                \\  Alt+Up         Pick queued message to edit
-                \\  Alt+Down       Toggle input mode (steering/queue)
+                \\  Alt+Enter      Queue follow-up message
+                \\  Alt+Up         Restore queued messages to editor
                 \\  Page Up/Down   Scroll transcript (half page)
                 \\  Scroll Up/Down Scroll transcript
                 \\  !cmd           Run bash (include)
@@ -2556,31 +2969,118 @@ fn handleSlashCommand(
         },
         .login => {
             if (arg.len == 0) return .select_login;
-            // /login <provider> <key> — save API key
+            // /login <provider> [api-key | code#state | callback-url]
             const sp2 = std.mem.indexOfAny(u8, arg, " \t");
-            if (sp2) |i| {
-                const prov_name = arg[0..i];
-                const key = std.mem.trim(u8, arg[i + 1 ..], " \t");
-                if (key.len == 0) {
-                    try out.writeAll("usage: /login <provider> <key>\n");
-                    return .handled;
-                }
-                const prov_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
-                    .{ "anthropic", .anthropic },
-                    .{ "openai", .openai },
-                    .{ "google", .google },
-                });
-                const prov = prov_map.get(prov_name) orelse {
-                    try writeTextLine(alloc, out, "unknown provider: {s}\n", .{prov_name});
+            const prov_name = if (sp2) |i| arg[0..i] else arg;
+            const key = if (sp2) |i| std.mem.trim(u8, arg[i + 1 ..], " \t") else "";
+            const prov = parseAuthProvider(prov_name) orelse {
+                try writeTextLine(alloc, out, "unknown provider: {s}\n", .{prov_name});
+                return .handled;
+            };
+            const kind = classifyLoginInput(prov, key);
+            const oauth_info = core.providers.auth.oauthLoginInfo(prov);
+            if (kind == .oauth_start) {
+                const info = oauth_info orelse unreachable;
+                var listener = core.providers.oauth_callback.Listener.init(alloc, .{
+                    .path = info.callback_path,
+                }) catch |err| {
+                    const em = try report.cli(alloc, "start local oauth callback server", err);
+                    defer alloc.free(em);
+                    try out.writeAll(em);
                     return .handled;
                 };
-                try core.providers.auth.saveApiKey(alloc, prov, key);
-                try writeTextLine(alloc, out, "API key saved for {s}\n", .{prov_name});
-            } else {
-                try out.writeAll("usage: /login <provider> <key>\n");
+                defer listener.deinit();
+
+                const oauth_name = core.providers.auth.providerName(prov);
+                var flow = core.providers.auth.beginOAuthWithRedirect(alloc, prov, listener.redirect_uri) catch |err| {
+                    const em = try report.cli(alloc, info.start_action, err);
+                    defer alloc.free(em);
+                    try out.writeAll(em);
+                    return .handled;
+                };
+                defer flow.deinit(alloc);
+
+                core.providers.auth.openBrowser(alloc, flow.url) catch {
+                    try out.writeAll("could not open browser automatically\n");
+                    try writeTextLine(alloc, out, "auth url: {s}\n", .{flow.url});
+                    try out.writeAll("after authorization, run:\n");
+                    try writeTextLine(alloc, out, "  /login {s} <callback-url>\n", .{oauth_name});
+                    return .handled;
+                };
+                try writeTextLine(alloc, out, "opened browser for {s} oauth\n", .{oauth_name});
+
+                var callback = listener.waitForCodeState(alloc, 5 * 60 * 1000) catch |err| {
+                    const em = try report.cli(alloc, "wait for oauth callback", err);
+                    defer alloc.free(em);
+                    try out.writeAll(em);
+                    try writeTextLine(alloc, out, "auth url: {s}\n", .{flow.url});
+                    try out.writeAll("if your browser showed localhost callback URL, run:\n");
+                    try writeTextLine(alloc, out, "  /login {s} <callback-url>\n", .{oauth_name});
+                    return .handled;
+                };
+                defer callback.deinit(alloc);
+
+                core.providers.auth.completeOAuthFromLocalCallback(
+                    alloc,
+                    prov,
+                    callback,
+                    listener.redirect_uri,
+                    flow.verifier,
+                ) catch |err| {
+                    const em = try report.cli(alloc, info.complete_action, err);
+                    defer alloc.free(em);
+                    try out.writeAll(em);
+                    return .handled;
+                };
+                try writeTextLine(alloc, out, "{s} oauth login complete\n", .{oauth_name});
+                return .handled;
             }
+            if (kind == .oauth_complete) {
+                const info = oauth_info orelse unreachable;
+                const oauth_name = core.providers.auth.providerName(prov);
+                core.providers.auth.completeOAuth(alloc, prov, key) catch |err| {
+                    const em = try report.cli(alloc, info.complete_action, err);
+                    defer alloc.free(em);
+                    try out.writeAll(em);
+                    return .handled;
+                };
+                try writeTextLine(alloc, out, "{s} oauth login complete\n", .{oauth_name});
+                return .handled;
+            }
+            if (key.len == 0) {
+                const env_var = provider_env_map.get(prov_name) orelse "API_KEY";
+                try writeTextLine(alloc, out, "Paste API key: /login {s} <key> (or set {s})\n", .{ prov_name, env_var });
+                return .handled;
+            }
+            try core.providers.auth.saveApiKey(alloc, prov, key);
+            try writeTextLine(alloc, out, "API key saved for {s}\n", .{prov_name});
         },
-        .logout => return .select_logout,
+        .logout => {
+            if (arg.len != 0) {
+                const prov = parseAuthProvider(arg) orelse {
+                    try writeTextLine(alloc, out, "unknown provider: {s}\n", .{arg});
+                    return .handled;
+                };
+                try core.providers.auth.logout(alloc, prov);
+                try writeTextLine(alloc, out, "logged out of {s}\n", .{core.providers.auth.providerName(prov)});
+                return .handled;
+            }
+
+            const logged_in = core.providers.auth.listLoggedIn(alloc) catch try alloc.alloc(core.providers.auth.Provider, 0);
+            defer alloc.free(logged_in);
+            if (logged_in.len == 0) {
+                try out.writeAll("no providers logged in\n");
+                return .handled;
+            }
+
+            const active_name = resolveDefaultProvider(provider.*);
+            if (chooseLogoutProvider(active_name, logged_in)) |prov| {
+                try core.providers.auth.logout(alloc, prov);
+                try writeTextLine(alloc, out, "logged out of {s}\n", .{core.providers.auth.providerName(prov)});
+                return .handled;
+            }
+            return .select_logout;
+        },
         .reload => return .reload,
         .share => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
@@ -3134,6 +3634,85 @@ fn applyResumeSid(
     sid.* = next_sid;
 }
 
+fn mapSessionStopReason(reason: core.session.Event.StopReason) core.providers.StopReason {
+    return switch (reason) {
+        .done => .done,
+        .max_out => .max_out,
+        .tool => .tool,
+        .canceled => .canceled,
+        .err => .err,
+    };
+}
+
+fn restoreSessionIntoUi(
+    alloc: std.mem.Allocator,
+    ui: *tui_harness.Ui,
+    session_dir_path: ?[]const u8,
+    no_session: bool,
+    sid: []const u8,
+) !void {
+    const dir_path = try requireSessionDir(session_dir_path, no_session);
+    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    defer dir.close();
+
+    var rdr = try core.session.ReplayReader.init(alloc, dir, sid, .{});
+    defer rdr.deinit();
+
+    ui.clearTranscript();
+    ui.pn.resetSessionView();
+
+    while (try rdr.next()) |ev| {
+        switch (ev.data) {
+            .noop => {},
+            .prompt => |p| try ui.tr.userText(p.text),
+            .text => |t| try ui.onProvider(.{ .text = t.text }),
+            .thinking => |t| try ui.onProvider(.{ .thinking = t.text }),
+            .tool_call => |tc| try ui.onProvider(.{ .tool_call = .{
+                .id = tc.id,
+                .name = tc.name,
+                .args = tc.args,
+            } }),
+            .tool_result => |tr| try ui.onProvider(.{ .tool_result = .{
+                .id = tr.id,
+                .out = tr.out,
+                .is_err = tr.is_err,
+            } }),
+            .usage => |u| try ui.onProvider(.{ .usage = .{
+                .in_tok = u.in_tok,
+                .out_tok = u.out_tok,
+                .tot_tok = u.tot_tok,
+                .cache_read = u.cache_read,
+                .cache_write = u.cache_write,
+            } }),
+            .stop => |stop| try ui.onProvider(.{ .stop = .{
+                .reason = mapSessionStopReason(stop.reason),
+            } }),
+            .err => |msg| try ui.onProvider(.{ .err = msg.text }),
+        }
+    }
+
+    ui.pn.run_state = .idle;
+    ui.tr.scrollToBottom();
+}
+
+fn tryRestoreSessionIntoUi(
+    alloc: std.mem.Allocator,
+    ui: *tui_harness.Ui,
+    session_dir_path: ?[]const u8,
+    no_session: bool,
+    sid: []const u8,
+) !bool {
+    restoreSessionIntoUi(alloc, ui, session_dir_path, no_session, sid) catch |err| {
+        const detail = try report.inlineMsg(alloc, err);
+        defer alloc.free(detail);
+        const msg = try std.fmt.allocPrint(alloc, "[resume restore failed: {s}]", .{detail});
+        defer alloc.free(msg);
+        try ui.tr.infoText(msg);
+        return false;
+    };
+    return true;
+}
+
 fn applyForkSid(
     alloc: std.mem.Allocator,
     sid: *([]u8),
@@ -3380,6 +3959,17 @@ test "parseJjBookmark rejects detached hash" {
     try std.testing.expect(parseJjBookmark("44693e6218c0b15a85acf5d2af52149b09dc4c76") == null);
 }
 
+test "parseNativeProviderKind resolves known native providers" {
+    try std.testing.expectEqual(NativeProviderKind.anthropic, parseNativeProviderKind("anthropic").?);
+    try std.testing.expectEqual(NativeProviderKind.openai, parseNativeProviderKind("openai").?);
+    try std.testing.expect(parseNativeProviderKind("google") == null);
+}
+
+test "missingProviderMsgForInitErr is provider-specific" {
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.anthropic, error.AuthNotFound), "ANTHROPIC_API_KEY") != null);
+    try std.testing.expect(std.mem.indexOf(u8, missingProviderMsgForInitErr(.openai, error.AuthNotFound), "OPENAI_API_KEY") != null);
+}
+
 const default_model = "claude-opus-4-6";
 const default_provider = "anthropic";
 
@@ -3479,6 +4069,47 @@ const provider_env_map = std.StaticStringMap([]const u8).initComptime(.{
     .{ "openai", "OPENAI_API_KEY" },
     .{ "google", "GOOGLE_API_KEY" },
 });
+const auth_provider_map = std.StaticStringMap(core.providers.auth.Provider).initComptime(.{
+    .{ "anthropic", .anthropic },
+    .{ "openai", .openai },
+    .{ "google", .google },
+});
+
+fn parseAuthProvider(name: []const u8) ?core.providers.auth.Provider {
+    return auth_provider_map.get(name);
+}
+
+const LoginInputKind = enum {
+    api_key,
+    oauth_start,
+    oauth_complete,
+};
+
+fn classifyLoginInput(prov: core.providers.auth.Provider, key: []const u8) LoginInputKind {
+    if (!core.providers.auth.oauthCapable(prov)) return .api_key;
+    if (key.len == 0) return .oauth_start;
+    if (core.providers.auth.looksLikeApiKey(prov, key)) return .api_key;
+    return .oauth_complete;
+}
+
+fn hasLoggedInProvider(
+    logged_in: []const core.providers.auth.Provider,
+    provider: core.providers.auth.Provider,
+) bool {
+    for (logged_in) |p| if (p == provider) return true;
+    return false;
+}
+
+fn chooseLogoutProvider(
+    active_name: []const u8,
+    logged_in: []const core.providers.auth.Provider,
+) ?core.providers.auth.Provider {
+    if (parseAuthProvider(active_name)) |active| {
+        if (hasLoggedInProvider(logged_in, active)) return active;
+    }
+    if (logged_in.len == 1) return logged_in[0];
+    return null;
+}
 
 /// Resolve arg completion source based on current editor text.
 fn resolveArgSrc(text: []const u8, models: []const []const u8) ?[]const []const u8 {
@@ -3572,6 +4203,7 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool) 
         .{ "ctrl+z", "to undo" },
         .{ "up/down", "for input history" },
         .{ "ctrl+a/e", "to start/end of line" },
+        .{ "ctrl+j", "to insert newline" },
         .{ "ctrl+k/u", "to delete to end/all" },
         .{ "ctrl+w", "to delete word" },
         .{ "alt+b/f", "to move by word" },
@@ -3584,9 +4216,8 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool) 
         .{ "/", "for commands" },
         .{ "!", "to run bash" },
         .{ "!!", "to run bash (no context)" },
-        .{ "alt+enter", "to queue message" },
-        .{ "alt+up", "to pick queued message for editing" },
-        .{ "alt+down", "to toggle input mode" },
+        .{ "alt+enter", "to queue follow-up" },
+        .{ "alt+up", "to restore queued messages" },
         .{ "ctrl+v", "to paste image" },
         .{ "drop files", "to attach" },
     };
@@ -3836,7 +4467,88 @@ fn syncInputFooter(ui: *tui_harness.Ui, mode: tui_panels.InputMode, queued_len: 
     ui.pn.setInputStatus(mode, queued);
 }
 
-fn queueFollowup(
+const PendingKind = enum {
+    steering,
+    follow_up,
+};
+
+const PendingTurn = struct {
+    kind: PendingKind,
+    text: []u8,
+};
+
+const PendingQueue = struct {
+    steering: std.ArrayListUnmanaged([]u8) = .empty,
+    follow_up: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn deinit(self: *PendingQueue, alloc: std.mem.Allocator) void {
+        clearQueueSlice(alloc, &self.steering);
+        clearQueueSlice(alloc, &self.follow_up);
+        self.steering.deinit(alloc);
+        self.follow_up.deinit(alloc);
+    }
+
+    fn total(self: *const PendingQueue) usize {
+        return self.steering.items.len + self.follow_up.items.len;
+    }
+
+    fn pushSteering(self: *PendingQueue, alloc: std.mem.Allocator, text: []const u8) !void {
+        try queueMessage(alloc, &self.steering, text);
+    }
+
+    fn pushFollowUp(self: *PendingQueue, alloc: std.mem.Allocator, text: []const u8) !void {
+        try queueMessage(alloc, &self.follow_up, text);
+    }
+
+    fn popNext(self: *PendingQueue) ?PendingTurn {
+        if (self.steering.items.len > 0) {
+            return .{
+                .kind = .steering,
+                .text = self.steering.orderedRemove(0),
+            };
+        }
+        if (self.follow_up.items.len > 0) {
+            return .{
+                .kind = .follow_up,
+                .text = self.follow_up.orderedRemove(0),
+            };
+        }
+        return null;
+    }
+
+    fn restoreToEditor(self: *PendingQueue, alloc: std.mem.Allocator, ui: *tui_harness.Ui) !usize {
+        const queued_ct = self.total();
+        if (queued_ct == 0) return 0;
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        defer out.deinit(alloc);
+
+        var first = true;
+        for (self.steering.items) |msg| {
+            if (!first) try out.appendSlice(alloc, "\n\n");
+            first = false;
+            try out.appendSlice(alloc, msg);
+        }
+        for (self.follow_up.items) |msg| {
+            if (!first) try out.appendSlice(alloc, "\n\n");
+            first = false;
+            try out.appendSlice(alloc, msg);
+        }
+        const cur = ui.editorText();
+        if (cur.len > 0) {
+            if (!first) try out.appendSlice(alloc, "\n\n");
+            try out.appendSlice(alloc, cur);
+        }
+
+        try ui.ed.setText(out.items);
+        ui.updatePreview();
+        clearQueueSlice(alloc, &self.steering);
+        clearQueueSlice(alloc, &self.follow_up);
+        return queued_ct;
+    }
+};
+
+fn queueMessage(
     alloc: std.mem.Allocator,
     queue: *std.ArrayListUnmanaged([]u8),
     text: []const u8,
@@ -3845,6 +4557,19 @@ fn queueFollowup(
     const queued = try alloc.dupe(u8, text);
     errdefer alloc.free(queued);
     try queue.append(alloc, queued);
+}
+
+fn queueFollowup(
+    alloc: std.mem.Allocator,
+    queue: *std.ArrayListUnmanaged([]u8),
+    text: []const u8,
+) !void {
+    try queueMessage(alloc, queue, text);
+}
+
+fn clearQueueSlice(alloc: std.mem.Allocator, queue: *std.ArrayListUnmanaged([]u8)) void {
+    for (queue.items) |item| alloc.free(item);
+    queue.items.len = 0;
 }
 
 fn showResumeOverlay(alloc: std.mem.Allocator, ui: *tui_harness.Ui, session_dir_path: ?[]const u8) !bool {
@@ -4362,6 +5087,50 @@ test "shouldQueueSubmit excludes commands and includes prompts" {
     try std.testing.expect(shouldQueueSubmit("explain this bug"));
 }
 
+test "pending queue pops steering before follow-up" {
+    var pending = PendingQueue{};
+    defer pending.deinit(std.testing.allocator);
+
+    try pending.pushFollowUp(std.testing.allocator, "follow-1");
+    try pending.pushSteering(std.testing.allocator, "steer-1");
+    try pending.pushFollowUp(std.testing.allocator, "follow-2");
+
+    const one = pending.popNext() orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(one.text);
+    try std.testing.expect(one.kind == .steering);
+    try std.testing.expectEqualStrings("steer-1", one.text);
+
+    const two = pending.popNext() orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(two.text);
+    try std.testing.expect(two.kind == .follow_up);
+    try std.testing.expectEqualStrings("follow-1", two.text);
+
+    const three = pending.popNext() orelse return error.TestUnexpectedResult;
+    defer std.testing.allocator.free(three.text);
+    try std.testing.expect(three.kind == .follow_up);
+    try std.testing.expectEqualStrings("follow-2", three.text);
+
+    try std.testing.expect(pending.popNext() == null);
+}
+
+test "pending queue restore merges steering follow-up and editor text" {
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
+    defer ui.deinit();
+
+    var pending = PendingQueue{};
+    defer pending.deinit(std.testing.allocator);
+
+    try pending.pushSteering(std.testing.allocator, "steer one");
+    try pending.pushSteering(std.testing.allocator, "steer two");
+    try pending.pushFollowUp(std.testing.allocator, "follow one");
+    try ui.ed.setText("existing draft");
+
+    const restored = try pending.restoreToEditor(std.testing.allocator, &ui);
+    try std.testing.expectEqual(@as(usize, 3), restored);
+    try std.testing.expectEqualStrings("steer one\n\nsteer two\n\nfollow one\n\nexisting draft", ui.ed.text());
+    try std.testing.expectEqual(@as(usize, 0), pending.total());
+}
+
 test "queueItemLabel snapshots preview formatting" {
     const OhSnap = @import("ohsnap");
     const oh = OhSnap{};
@@ -4478,6 +5247,136 @@ test "showResumeOverlay returns false when no sessions exist" {
 
     try std.testing.expect(!(try showResumeOverlay(std.testing.allocator, &ui, sess_abs)));
     try std.testing.expect(ui.ov == null);
+}
+
+test "restoreSessionIntoUi replays session history and resets stale ui state" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("sess");
+
+    const file = try tmp.dir.createFile("sess/100.jsonl", .{});
+    defer file.close();
+    const events = [_]core.session.Event{
+        .{ .at_ms = 1, .data = .{ .prompt = .{ .text = "old prompt" } } },
+        .{ .at_ms = 2, .data = .{ .text = .{ .text = "old answer" } } },
+        .{ .at_ms = 3, .data = .{ .tool_call = .{ .id = "call-1", .name = "read", .args = "{\"path\":\"a.txt\"}" } } },
+        .{ .at_ms = 4, .data = .{ .tool_result = .{ .id = "call-1", .out = "ok", .is_err = false } } },
+        .{ .at_ms = 5, .data = .{ .usage = .{ .in_tok = 12, .out_tok = 34, .tot_tok = 46, .cache_read = 1, .cache_write = 2 } } },
+        .{ .at_ms = 6, .data = .{ .stop = .{ .reason = .done } } },
+    };
+    for (events) |ev| {
+        const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
+        defer std.testing.allocator.free(raw);
+        try file.writeAll(raw);
+        try file.writeAll("\n");
+    }
+
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
+    defer ui.deinit();
+
+    try ui.tr.infoText("stale");
+    try ui.onProvider(.{ .tool_call = .{ .id = "stale-1", .name = "ls", .args = "{}" } });
+    ui.pn.cum_tok = 999;
+    ui.pn.has_usage = true;
+    ui.pn.run_state = .failed;
+
+    try restoreSessionIntoUi(std.testing.allocator, &ui, sess_abs, false, "100");
+
+    var saw_stale = false;
+    var saw_prompt = false;
+    var saw_answer = false;
+    for (ui.tr.blocks.items) |blk| {
+        if (std.mem.eql(u8, blk.buf.items, "stale")) saw_stale = true;
+        if (std.mem.eql(u8, blk.buf.items, "old prompt")) saw_prompt = true;
+        if (std.mem.eql(u8, blk.buf.items, "old answer")) saw_answer = true;
+    }
+
+    try std.testing.expect(!saw_stale);
+    try std.testing.expect(saw_prompt);
+    try std.testing.expect(saw_answer);
+    try std.testing.expect(ui.pn.has_usage);
+    try std.testing.expectEqual(@as(u64, 46), ui.pn.cum_tok);
+    try std.testing.expect(ui.pn.state() == .idle);
+    try std.testing.expectEqual(@as(usize, 1), ui.pn.count());
+    const row = ui.pn.tool(0);
+    try std.testing.expectEqualStrings("call-1", row.id);
+    try std.testing.expectEqualStrings("read", row.name);
+    try std.testing.expect(row.state == .ok);
+}
+
+test "runtime tui non-tty /resume restores session without running provider turn" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("sess");
+    const file = try tmp.dir.createFile("sess/100.jsonl", .{});
+    defer file.close();
+    const events = [_]core.session.Event{
+        .{ .at_ms = 1, .data = .{ .prompt = .{ .text = "old prompt" } } },
+        .{ .at_ms = 2, .data = .{ .text = .{ .text = "old answer" } } },
+        .{ .at_ms = 3, .data = .{ .stop = .{ .reason = .done } } },
+    };
+    for (events) |ev| {
+        const raw = try core.session.encodeEventAlloc(std.testing.allocator, ev);
+        defer std.testing.allocator.free(raw);
+        try file.writeAll(raw);
+        try file.writeAll("\n");
+    }
+
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .tui,
+        .prompt = null,
+        .cfg = .{
+            .mode = .tui,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "p"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = try std.testing.allocator.dupe(u8, "cat >/dev/null; printf 'text:MODEL-RAN\\nstop:done\\n'"),
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var in_fbs = std.io.fixedBufferStream("/resume 100\n");
+    var out_buf: [65536]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    const sid = try execWithIo(
+        std.testing.allocator,
+        cfg,
+        in_fbs.reader().any(),
+        out_fbs.writer().any(),
+    );
+    defer std.testing.allocator.free(sid);
+    try std.testing.expectEqualStrings("100", sid);
+
+    const written = out_fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "resumed session 100") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "MODEL-RAN") == null);
+
+    var session_dir = try std.fs.openDirAbsolute(sess_abs, .{});
+    defer session_dir.close();
+    var rdr = try core.session.ReplayReader.init(std.testing.allocator, session_dir, "100", .{});
+    defer rdr.deinit();
+
+    var prompt_ct: usize = 0;
+    var saw_resume_prompt = false;
+    while (try rdr.next()) |ev| {
+        switch (ev.data) {
+            .prompt => |p| {
+                prompt_ct += 1;
+                if (std.mem.eql(u8, p.text, "/resume 100")) saw_resume_prompt = true;
+            },
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), prompt_ct);
+    try std.testing.expect(!saw_resume_prompt);
 }
 
 test "syncInputFooter tracks mode and clamps queue size" {
@@ -4714,24 +5613,7 @@ test "runtime executes tui mode path with provided prompt" {
     }
 }
 
-fn hasAnyAuthFileForTests() bool {
-    const home = std.posix.getenv("HOME") orelse return false;
-    const rels = [_][]const u8{
-        ".pi/agent/auth.json",
-        ".agents/auth.json",
-    };
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    for (rels) |rel| {
-        const path = std.fmt.bufPrint(&buf, "{s}/{s}", .{ home, rel }) catch continue;
-        if (std.fs.cwd().access(path, .{})) |_| return true else |_| {}
-    }
-    return false;
-}
-
 test "runtime tui reports error when no provider available" {
-    // Skip if auth file exists (native provider would attempt real HTTP)
-    if (hasAnyAuthFileForTests()) return error.SkipZigTest;
-
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4759,9 +5641,40 @@ test "runtime tui reports error when no provider available" {
     defer std.testing.allocator.free(sid);
 
     const written = out_fbs.getWritten();
-    const has_auth_hint = std.mem.indexOf(u8, written, "ANTHROPIC_API_KEY") != null;
-    const has_provider_hint = std.mem.indexOf(u8, written, "provider unavailable") != null;
-    try std.testing.expect(has_auth_hint or has_provider_hint);
+    try std.testing.expect(std.mem.indexOf(u8, written, "provider unavailable") != null);
+}
+
+test "runtime print reports unsupported native provider without provider_cmd" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("sess");
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .print,
+        .prompt = "ping",
+        .cfg = .{
+            .mode = .print,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "google"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = null,
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var out_buf: [4096]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    try std.testing.expectError(
+        error.StopErr,
+        execWithIo(std.testing.allocator, cfg, eofReader(), out_fbs.writer().any()),
+    );
+
+    const written = out_fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "native provider unavailable") != null);
 }
 
 test "runtime tui consumes multiple prompts from input stream" {
@@ -5459,6 +6372,68 @@ test "parseCmdToolMask fuzz smoke does not panic" {
         }
         _ = parseCmdToolMask(buf[0..n]) catch {};
     }
+}
+
+test "chooseLogoutProvider picks active provider when available" {
+    const logged_in = [_]core.providers.auth.Provider{ .anthropic, .openai };
+    const picked = chooseLogoutProvider("anthropic", &logged_in) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(core.providers.auth.Provider.anthropic, picked);
+}
+
+test "chooseLogoutProvider falls back to single logged-in provider" {
+    const logged_in = [_]core.providers.auth.Provider{.openai};
+    const picked = chooseLogoutProvider("anthropic", &logged_in) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(core.providers.auth.Provider.openai, picked);
+}
+
+test "chooseLogoutProvider returns null when ambiguous" {
+    const logged_in = [_]core.providers.auth.Provider{ .openai, .google };
+    try std.testing.expect(chooseLogoutProvider("anthropic", &logged_in) == null);
+}
+
+test "classifyLoginInput treats anthropic empty arg as oauth start" {
+    const got = classifyLoginInput(.anthropic, "");
+    try std.testing.expectEqual(LoginInputKind.oauth_start, got);
+}
+
+test "classifyLoginInput keeps anthropic api key flow" {
+    const got = classifyLoginInput(.anthropic, "sk-ant-api03-123");
+    try std.testing.expectEqual(LoginInputKind.api_key, got);
+}
+
+test "classifyLoginInput treats anthropic callback payload as oauth complete" {
+    const got = classifyLoginInput(.anthropic, "http://localhost:64915/callback?code=abc&state=def");
+    try std.testing.expectEqual(LoginInputKind.oauth_complete, got);
+}
+
+test "classifyLoginInput treats openai empty arg as oauth start" {
+    const got = classifyLoginInput(.openai, "");
+    try std.testing.expectEqual(LoginInputKind.oauth_start, got);
+}
+
+test "classifyLoginInput keeps openai api key flow" {
+    const got = classifyLoginInput(.openai, "sk-proj-123");
+    try std.testing.expectEqual(LoginInputKind.api_key, got);
+}
+
+test "classifyLoginInput treats openai callback payload as oauth complete" {
+    const got = classifyLoginInput(.openai, "http://localhost:1455/auth/callback?code=abc&state=def");
+    try std.testing.expectEqual(LoginInputKind.oauth_complete, got);
+}
+
+test "classifyLoginInput treats openai raw query payload as oauth complete" {
+    const got = classifyLoginInput(.openai, "code=abc&state=def");
+    try std.testing.expectEqual(LoginInputKind.oauth_complete, got);
+}
+
+test "classifyLoginInput keeps google in api key mode" {
+    const got = classifyLoginInput(.google, "");
+    try std.testing.expectEqual(LoginInputKind.api_key, got);
+}
+
+test "classifyLoginInput keeps google key input in api key mode" {
+    const got = classifyLoginInput(.google, "ya29-token");
+    try std.testing.expectEqual(LoginInputKind.api_key, got);
 }
 
 test "resolveArgSrc maps slash command names to completion sources" {

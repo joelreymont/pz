@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Native OpenAI streaming provider (`/v1/responses`) with text, reasoning, tool-call, usage, and stop/error event mapping.
+
+### Changed
+- Runtime native-provider selection is now provider-aware (`anthropic` and `openai`) instead of Anthropic-only.
+- OAuth token refresh is now provider-scoped in shared auth code (`refreshOAuthForProvider`), with Anthropic and OpenAI using the same typed flow.
+- Missing-provider diagnostics are now provider-specific for native providers and explicit for unsupported native labels.
+
+### Tests
+- Added comprehensive OpenAI provider unit tests for SSE event parsing, tool-call assembly, usage/stop mapping, and request-body conversion.
+- Added auth unit tests for provider-specific refresh request encoding and unsupported-provider rejection.
+- Added runtime regression for unsupported native provider labels when `--provider-cmd` is not set.
+
 ## [0.1.8] - 2026-02-23
 
 ### Changed
@@ -54,7 +69,6 @@ All notable changes to this project will be documented in this file.
 ### Tests
 - Added input parser regressions for SS3 Up/Down arrow decoding.
 - Added runtime regressions for lossy UTF-8 sanitization and safe transcript insertion of invalid command output.
-
 ## [0.1.4] - 2026-02-23
 
 ### Added

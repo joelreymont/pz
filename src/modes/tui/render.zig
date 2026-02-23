@@ -57,7 +57,7 @@ pub const Renderer = struct {
 
     pub fn setup(out: anytype) !void {
         try out.writeAll(decSet(.alt_screen) ++ decRst(.cursor) ++
-            "\x1b[?1000h\x1b[?1006h" ++ decSet(.bracketed_paste) ++
+            decSet(.bracketed_paste) ++
             "\x1b[>1u"); // Kitty keyboard protocol: push with disambiguate flag
     }
 
@@ -263,4 +263,31 @@ test "renderer rejects size mismatch" {
     var out = TestBuf.init(raw[0..]);
 
     try std.testing.expectError(error.SizeMismatch, rnd.render(&frm, &out));
+}
+
+test "renderer setup leaves mouse selection enabled" {
+    var raw: [128]u8 = undefined;
+    var out = TestBuf.init(raw[0..]);
+
+    try Renderer.setup(&out);
+
+    const seq = out.view();
+    try std.testing.expectEqualStrings(
+        decSet(.alt_screen) ++ decRst(.cursor) ++ decSet(.bracketed_paste) ++ "\x1b[>1u",
+        seq,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, seq, "?1000h") == null);
+    try std.testing.expect(std.mem.indexOf(u8, seq, "?1006h") == null);
+}
+
+test "renderer cleanup restores terminal and disables mouse modes" {
+    var raw: [128]u8 = undefined;
+    var out = TestBuf.init(raw[0..]);
+
+    try Renderer.cleanup(&out);
+
+    try std.testing.expectEqualStrings(
+        "\x1b[<u" ++ decRst(.bracketed_paste) ++ "\x1b[?1006l\x1b[?1000l" ++ decSet(.cursor) ++ decRst(.alt_screen),
+        out.view(),
+    );
 }

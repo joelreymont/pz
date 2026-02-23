@@ -20,7 +20,8 @@ pub const Reader = struct {
     paste_buf: [65536]u8 = undefined,
     paste_len: usize = 0,
     in_paste: bool = false,
-    notify_fd: ?std.posix.fd_t = null,
+    notify_fd_a: ?std.posix.fd_t = null,
+    notify_fd_b: ?std.posix.fd_t = null,
 
     pub fn init(fd: std.posix.fd_t) Reader {
         return .{ .fd = fd };
@@ -29,7 +30,15 @@ pub const Reader = struct {
     pub fn initWithNotify(fd: std.posix.fd_t, notify_fd: std.posix.fd_t) Reader {
         return .{
             .fd = fd,
-            .notify_fd = notify_fd,
+            .notify_fd_a = notify_fd,
+        };
+    }
+
+    pub fn initWithNotify2(fd: std.posix.fd_t, notify_fd_a: std.posix.fd_t, notify_fd_b: std.posix.fd_t) Reader {
+        return .{
+            .fd = fd,
+            .notify_fd_a = notify_fd_a,
+            .notify_fd_b = notify_fd_b,
         };
     }
 
@@ -75,34 +84,66 @@ pub const Reader = struct {
     const read_notify = std.math.maxInt(usize);
 
     fn readReady(self: *Reader) !usize {
-        if (self.notify_fd == null) {
+        if (self.notify_fd_a == null and self.notify_fd_b == null) {
             return std.posix.read(self.fd, self.buf[self.len..]);
         }
 
-        var fds = [2]std.posix.pollfd{
-            .{
-                .fd = self.fd,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            },
-            .{
-                .fd = self.notify_fd.?,
-                .events = std.posix.POLL.IN,
-                .revents = 0,
-            },
+        var fds: [3]std.posix.pollfd = undefined;
+        var n_fds: usize = 0;
+
+        const stdin_idx = n_fds;
+        fds[n_fds] = .{
+            .fd = self.fd,
+            .events = std.posix.POLL.IN,
+            .revents = 0,
         };
-        const ready = try std.posix.poll(&fds, 100);
+        n_fds += 1;
+
+        var notify_a_idx: ?usize = null;
+        if (self.notify_fd_a) |fd| {
+            notify_a_idx = n_fds;
+            fds[n_fds] = .{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+            n_fds += 1;
+        }
+
+        var notify_b_idx: ?usize = null;
+        if (self.notify_fd_b) |fd| {
+            notify_b_idx = n_fds;
+            fds[n_fds] = .{
+                .fd = fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            };
+            n_fds += 1;
+        }
+
+        const ready = try std.posix.poll(fds[0..n_fds], 100);
         if (ready == 0) return error.WouldBlock;
 
-        if ((fds[1].revents & std.posix.POLL.IN) != 0) {
-            self.drainNotify();
-            return read_notify;
+        if (notify_a_idx) |idx| {
+            if ((fds[idx].revents & std.posix.POLL.IN) != 0) {
+                self.drainNotify(self.notify_fd_a.?);
+                return read_notify;
+            }
         }
-        return std.posix.read(self.fd, self.buf[self.len..]);
+        if (notify_b_idx) |idx| {
+            if ((fds[idx].revents & std.posix.POLL.IN) != 0) {
+                self.drainNotify(self.notify_fd_b.?);
+                return read_notify;
+            }
+        }
+        if ((fds[stdin_idx].revents & std.posix.POLL.IN) != 0) {
+            return std.posix.read(self.fd, self.buf[self.len..]);
+        }
+        return error.WouldBlock;
     }
 
-    fn drainNotify(self: *Reader) void {
-        const fd = self.notify_fd orelse return;
+    fn drainNotify(self: *Reader, fd: std.posix.fd_t) void {
+        _ = self;
         var scratch: [64]u8 = undefined;
         while (true) {
             const n = std.posix.read(fd, &scratch) catch |err| switch (err) {
@@ -234,6 +275,12 @@ pub const Reader = struct {
             return .{ .key = .ctrl_g };
         }
 
+        // Ctrl-J (newline insert)
+        if (data[0] == 0x0a) {
+            self.pos += 1;
+            return .{ .key = .ctrl_j };
+        }
+
         // Ctrl-K
         if (data[0] == 0x0b) {
             self.pos += 1;
@@ -298,8 +345,8 @@ pub const Reader = struct {
             return .{ .key = .ctrl_z };
         }
 
-        // Enter (CR or LF)
-        if (data[0] == '\r' or data[0] == '\n') {
+        // Enter (CR)
+        if (data[0] == '\r') {
             self.pos += 1;
             // Skip CR+LF pair
             if (data[0] == '\r' and data.len > 1 and data[1] == '\n')
@@ -491,6 +538,7 @@ fn parseKittyKey(params: []const u8) ?editor.Key {
             'd', 'D' => .ctrl_d,
             'e', 'E' => .ctrl_e,
             'g', 'G' => .ctrl_g,
+            'j', 'J' => .ctrl_j,
             'k', 'K' => .ctrl_k,
             'l', 'L' => .ctrl_l,
             'o', 'O' => .ctrl_o,
@@ -502,6 +550,13 @@ fn parseKittyKey(params: []const u8) ?editor.Key {
             'y', 'Y' => .ctrl_y,
             'z', 'Z' => .ctrl_z,
             ']' => .ctrl_close_bracket,
+            else => null,
+        };
+    }
+
+    if (shift and !alt and !ctrl) {
+        return switch (cp) {
+            '\r', '\n' => .ctrl_j,
             else => null,
         };
     }
@@ -562,6 +617,13 @@ test "parse enter" {
     r.buf[0] = '\r';
     r.len = 1;
     try expectKey(r.parseOne().?, .enter);
+}
+
+test "parse ctrl-j from newline" {
+    var r = Reader.init(-1);
+    r.buf[0] = '\n';
+    r.len = 1;
+    try expectKey(r.parseOne().?, .ctrl_j);
 }
 
 test "parse ctrl-c" {
@@ -745,6 +807,15 @@ test "parse shift-ctrl-p kitty protocol" {
     try expectKey(r.parseOne().?, .shift_ctrl_p);
 }
 
+test "parse shift-enter kitty as multiline newline" {
+    var r = Reader.init(-1);
+    // Kitty: ESC[13;2u (enter with shift)
+    const seq = "\x1b[13;2u";
+    @memcpy(r.buf[0..seq.len], seq);
+    r.len = seq.len;
+    try expectKey(r.parseOne().?, .ctrl_j);
+}
+
 test "parse shift-ctrl-p kitty uppercase" {
     var r = Reader.init(-1);
     // Kitty: ESC[80;6u (P=80, modifier 6=shift+ctrl)
@@ -920,4 +991,42 @@ test "reader notify does not drop stdin bytes" {
         else => return error.TestUnexpectedResult,
     }
     try expectKey(r.next(), .{ .char = 'x' });
+}
+
+test "reader emits notify from either notify fd" {
+    const in_pipe = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(in_pipe[0]);
+    defer std.posix.close(in_pipe[1]);
+
+    const notify_a = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(notify_a[0]);
+    defer std.posix.close(notify_a[1]);
+
+    const notify_b = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(notify_b[0]);
+    defer std.posix.close(notify_b[1]);
+
+    var r = Reader.initWithNotify2(in_pipe[0], notify_a[0], notify_b[0]);
+    const b = [_]u8{1};
+
+    _ = try std.posix.write(notify_a[1], &b);
+    switch (r.next()) {
+        .notify => {},
+        else => return error.TestUnexpectedResult,
+    }
+
+    _ = try std.posix.write(notify_b[1], &b);
+    switch (r.next()) {
+        .notify => {},
+        else => return error.TestUnexpectedResult,
+    }
 }

@@ -15,6 +15,7 @@ Build `pz`: a Zig CLI harness with TUI. Do not optimize for compatibility with p
 ## Core Constraints
 
 - Correctness over speed.
+- Use hard cutovers only: no legacy support, compatibility shims, or fallback paths.
 - No silent fallbacks.
 - Root-cause fixes only.
 - Keep names short and clear.

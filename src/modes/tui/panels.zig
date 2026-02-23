@@ -54,7 +54,11 @@ pub const Panels = struct {
     usage: core.providers.Usage = .{},
     has_usage: bool = false,
     cost_micents: u64 = 0, // cumulative cost in 1/100000 of a dollar
-    cum_tok: u64 = 0, // cumulative tokens across session
+    cum_tok: u64 = 0, // latest turn tokens for context gauge
+    tot_in: u64 = 0,
+    tot_out: u64 = 0,
+    tot_cr: u64 = 0,
+    tot_cw: u64 = 0,
     ctx_limit: u64 = 0,
     run_state: RunState = .idle,
     turns: u32 = 0,
@@ -167,6 +171,25 @@ pub const Panels = struct {
         self.compaction_until_ms = now_ms + compaction_indicator_ms;
     }
 
+    pub fn resetSessionView(self: *Panels) void {
+        for (self.rows.items) |row| {
+            self.alloc.free(row.id);
+            self.alloc.free(row.name);
+        }
+        self.rows.items.len = 0;
+        self.last_err.items.len = 0;
+        self.usage = .{};
+        self.has_usage = false;
+        self.cost_micents = 0;
+        self.cum_tok = 0;
+        self.tot_in = 0;
+        self.tot_out = 0;
+        self.tot_cr = 0;
+        self.tot_cw = 0;
+        self.run_state = .idle;
+        self.turns = 0;
+        self.compaction_until_ms = 0;
+    }
     pub fn count(self: *const Panels) usize {
         return self.rows.items.len;
     }
@@ -202,6 +225,10 @@ pub const Panels = struct {
             .usage => |usage| {
                 self.cost_micents +|= calcCost(self.model.items, usage);
                 self.cum_tok = usage.tot_tok;
+                self.tot_in +|= usage.in_tok;
+                self.tot_out +|= usage.out_tok;
+                self.tot_cr +|= usage.cache_read;
+                self.tot_cw +|= usage.cache_write;
                 self.usage = usage;
                 self.has_usage = true;
             },
@@ -218,7 +245,7 @@ pub const Panels = struct {
 
     /// Render footer matching pi layout:
     ///   Line 1: dim(cwd (branch))
-    ///   Line 2: dim(Rin Wout CRcw CWcw $0.05 (sub) 2.9%/200k)  dim(model • thinking)
+    ///   Line 2: dim(↓in ↑out Rcache Wcache $0.05 (sub) 2.9%/200k)  dim(model • thinking)
     pub fn renderFooter(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
         if (rect.w == 0 or rect.h == 0) return;
 
@@ -272,25 +299,25 @@ pub const Panels = struct {
             if (self.has_usage) {
                 try writePart(frm, &x, x_end, y2, "\xe2\x86\x93", dim_st); // ↓
                 var ib: [16]u8 = undefined;
-                const it = fmtCompact(&ib, self.usage.in_tok) catch return error.NoSpaceLeft;
+                const it = fmtCompact(&ib, self.tot_in) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, it, dim_st);
 
                 try writePart(frm, &x, x_end, y2, " \xe2\x86\x91", dim_st); // ↑
                 var ob: [16]u8 = undefined;
-                const ot = fmtCompact(&ob, self.usage.out_tok) catch return error.NoSpaceLeft;
+                const ot = fmtCompact(&ob, self.tot_out) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, ot, dim_st);
 
-                // Cache read/write tokens
-                if (self.usage.cache_read > 0) {
-                    try writePart(frm, &x, x_end, y2, " CR", dim_st);
+                // Cache read/write tokens (pi-style: R/W)
+                if (self.tot_cr > 0) {
+                    try writePart(frm, &x, x_end, y2, " R", dim_st);
                     var rb: [16]u8 = undefined;
-                    const rt = fmtCompact(&rb, self.usage.cache_read) catch return error.NoSpaceLeft;
+                    const rt = fmtCompact(&rb, self.tot_cr) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, rt, dim_st);
                 }
-                if (self.usage.cache_write > 0) {
-                    try writePart(frm, &x, x_end, y2, " CW", dim_st);
+                if (self.tot_cw > 0) {
+                    try writePart(frm, &x, x_end, y2, " W", dim_st);
                     var wb: [16]u8 = undefined;
-                    const wt = fmtCompact(&wb, self.usage.cache_write) catch return error.NoSpaceLeft;
+                    const wt = fmtCompact(&wb, self.tot_cw) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, wt, dim_st);
                 }
 
@@ -801,6 +828,60 @@ test "panels footer shows initial 0.0%" {
     // Should have 0.0% and never show the old auto badge in footer.
     try std.testing.expect(std.mem.indexOf(u8, row, "0.0%") != null);
     try std.testing.expect(std.mem.indexOf(u8, row, "(auto)") == null);
+}
+
+test "panels footer uses pi style R/W cache labels" {
+    var ps = try Panels.initFull(std.testing.allocator, "claude-sonnet-4-6", "anthropic", "", "");
+    defer ps.deinit();
+
+    try ps.append(.{ .usage = .{
+        .in_tok = 1200,
+        .out_tok = 345,
+        .tot_tok = 1545,
+        .cache_read = 5500,
+        .cache_write = 1200,
+    } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 90, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 90, .h = 2 });
+
+    try std.testing.expect(findAsciiSeq(&frm, 1, " R5.5k"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, " W1.2k"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, " CR"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, " CW"));
+}
+
+test "panels footer accumulates token totals across usage events" {
+    var ps = try Panels.initFull(std.testing.allocator, "claude-sonnet-4-6", "anthropic", "", "");
+    defer ps.deinit();
+
+    try ps.append(.{ .usage = .{
+        .in_tok = 1500,
+        .out_tok = 800,
+        .tot_tok = 2300,
+        .cache_read = 300,
+        .cache_write = 100,
+    } });
+    try ps.append(.{ .usage = .{
+        .in_tok = 500,
+        .out_tok = 200,
+        .tot_tok = 700,
+        .cache_read = 700,
+        .cache_write = 900,
+    } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 100, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 100, .h = 2 });
+
+    // cumulative: in=2.0k out=1.0k R1.0k W1.0k
+    try std.testing.expect(hasCp(&frm, 1, 0x2193)); // ↓
+    try std.testing.expect(hasCp(&frm, 1, 0x2191)); // ↑
+    try std.testing.expect(findAsciiSeq(&frm, 1, "2.0k"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, "1.0k"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, " R1.0k"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, " W1.0k"));
 }
 
 test "panels compaction indicator expires" {

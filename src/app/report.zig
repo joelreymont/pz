@@ -50,6 +50,38 @@ const rule_map = std.StaticStringMap(Rule).initComptime(.{
         .summary = "network request timed out",
         .next = "retry after network stabilizes",
     } },
+    .{ "BrowserOpenFailed", Rule{
+        .summary = "failed to launch browser",
+        .next = "open the printed URL manually and retry",
+    } },
+    .{ "UnsupportedPlatform", Rule{
+        .summary = "automatic browser launch is unsupported on this platform",
+        .next = "open the printed URL manually and retry",
+    } },
+    .{ "InvalidOAuthInput", Rule{
+        .summary = "invalid OAuth callback payload",
+        .next = "rerun /login <provider> and paste the callback URL or code#state exactly",
+    } },
+    .{ "MissingOAuthState", Rule{
+        .summary = "OAuth state/verifier is missing",
+        .next = "rerun /login <provider> and paste full callback URL or code#state",
+    } },
+    .{ "TokenExchangeFailed", Rule{
+        .summary = "OAuth token exchange failed",
+        .next = "rerun /login <provider> and complete authorization again",
+    } },
+    .{ "OAuthCallbackTimeout", Rule{
+        .summary = "timed out waiting for OAuth callback",
+        .next = "rerun /login <provider> and complete browser authorization within the timeout",
+    } },
+    .{ "InvalidOAuthCallbackRequest", Rule{
+        .summary = "received invalid OAuth callback request",
+        .next = "rerun /login <provider> and complete authorization again",
+    } },
+    .{ "OAuthStateMismatch", Rule{
+        .summary = "OAuth callback state did not match the login request",
+        .next = "rerun /login <provider> and complete authorization in the same browser session",
+    } },
     .{ "TemporaryNameServerFailure", Rule{
         .summary = "DNS lookup failed",
         .next = "check DNS settings and retry",

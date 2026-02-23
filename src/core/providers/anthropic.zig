@@ -13,7 +13,7 @@ pub const Client = struct {
     http: std.http.Client,
 
     pub fn init(alloc: std.mem.Allocator) !Client {
-        var auth_res = try auth_mod.load(alloc);
+        var auth_res = try auth_mod.loadForProvider(alloc, .anthropic);
         errdefer auth_res.deinit();
         return .{
             .alloc = alloc,
@@ -56,7 +56,7 @@ pub const Client = struct {
         const old = self.auth.auth.oauth;
 
         // Try refresh endpoint
-        if (auth_mod.refreshOAuth(ar, old)) |new_oauth| {
+        if (auth_mod.refreshOAuthForProvider(ar, .anthropic, old)) |new_oauth| {
             const auth_ar = self.auth.arena.allocator();
             const new_access = try auth_ar.dupe(u8, new_oauth.access);
             const new_refresh = try auth_ar.dupe(u8, new_oauth.refresh);
@@ -71,7 +71,7 @@ pub const Client = struct {
         } else |_| {}
 
         // Refresh failed — reload from disk (another instance may have refreshed)
-        var reloaded = auth_mod.load(self.alloc) catch return error.RefreshFailed;
+        var reloaded = auth_mod.loadForProvider(self.alloc, .anthropic) catch return error.RefreshFailed;
         switch (reloaded.auth) {
             .oauth => |oauth| {
                 const now = std.time.milliTimestamp();

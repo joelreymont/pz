@@ -792,6 +792,8 @@ fn mapProviderEv(ev: providers.Ev, at_ms: i64) session.Event {
                 .in_tok = usage.in_tok,
                 .out_tok = usage.out_tok,
                 .tot_tok = usage.tot_tok,
+                .cache_read = usage.cache_read,
+                .cache_write = usage.cache_write,
             } },
             .stop => |stop| .{ .stop = .{
                 .reason = switch (stop.reason) {
@@ -828,6 +830,27 @@ fn hasToolResult(req: providers.Req, id: []const u8, out: []const u8) bool {
         }
     }
     return false;
+}
+
+test "mapProviderEv preserves usage cache counters" {
+    const sev = mapProviderEv(.{ .usage = .{
+        .in_tok = 10,
+        .out_tok = 20,
+        .tot_tok = 30,
+        .cache_read = 4,
+        .cache_write = 7,
+    } }, 42);
+    try std.testing.expectEqual(@as(i64, 42), sev.at_ms);
+    switch (sev.data) {
+        .usage => |u| {
+            try std.testing.expectEqual(@as(u64, 10), u.in_tok);
+            try std.testing.expectEqual(@as(u64, 20), u.out_tok);
+            try std.testing.expectEqual(@as(u64, 30), u.tot_tok);
+            try std.testing.expectEqual(@as(u64, 4), u.cache_read);
+            try std.testing.expectEqual(@as(u64, 7), u.cache_write);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "loop smoke composes replay provider tool and mode" {

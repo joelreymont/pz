@@ -16,6 +16,7 @@ pub const Key = union(enum) {
     ctrl_d: void,
     ctrl_e: void,
     ctrl_g: void,
+    ctrl_j: void,
     ctrl_k: void,
     ctrl_l: void,
     ctrl_o: void,
@@ -252,6 +253,11 @@ pub const Editor = struct {
                 break :blk .none;
             },
             .ctrl_g => .ext_editor,
+            .ctrl_j => blk: {
+                try self.snapshot(.insert);
+                try self.insertSlice("\n");
+                break :blk .none;
+            },
             .ctrl_k => blk: {
                 try self.snapshot(.kill);
                 try self.killToEol();
@@ -356,10 +362,17 @@ pub const Editor = struct {
     }
 
     fn killToEol(self: *Editor) !void {
-        if (self.cur < self.buf.items.len) {
-            try self.krPush(self.buf.items[self.cur..], false);
+        if (self.cur >= self.buf.items.len) return;
+
+        var end = std.mem.indexOfScalarPos(u8, self.buf.items, self.cur, '\n') orelse self.buf.items.len;
+        // Emacs behavior: at end-of-line, kill the newline to join lines.
+        if (end == self.cur and self.buf.items[self.cur] == '\n') {
+            end = @min(self.buf.items.len, self.cur + 1);
         }
-        self.buf.items.len = self.cur;
+        if (end <= self.cur) return;
+
+        try self.krPush(self.buf.items[self.cur..end], false);
+        deleteRange(self, self.cur, end);
     }
 
     fn killLine(self: *Editor) !void {
@@ -687,6 +700,36 @@ test "ctrl-k at end is no-op" {
     _ = try ed.apply(.{ .char = 'x' });
     try std.testing.expect((try ed.apply(.{ .ctrl_k = {} })) == .kill_to_eol);
     try std.testing.expectEqualStrings("x", ed.text());
+}
+
+test "ctrl-j inserts newline for multiline input" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    _ = try ed.apply(.{ .char = 'a' });
+    _ = try ed.apply(.{ .ctrl_j = {} });
+    _ = try ed.apply(.{ .char = 'b' });
+    try std.testing.expectEqualStrings("a\nb", ed.text());
+}
+
+test "ctrl-k kills to end of current line only" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.setText("abc\ndef");
+    ed.cur = 1; // after 'a'
+    try std.testing.expect((try ed.apply(.{ .ctrl_k = {} })) == .kill_to_eol);
+    try std.testing.expectEqualStrings("a\ndef", ed.text());
+}
+
+test "ctrl-k at line end kills newline" {
+    var ed = Editor.init(std.testing.allocator);
+    defer ed.deinit();
+
+    try ed.setText("abc\ndef");
+    ed.cur = 3; // at newline
+    try std.testing.expect((try ed.apply(.{ .ctrl_k = {} })) == .kill_to_eol);
+    try std.testing.expectEqualStrings("abcdef", ed.text());
 }
 
 test "setText replaces editor content" {
