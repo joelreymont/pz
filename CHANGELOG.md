@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.5] - 2026-02-23
+
+### Fixed
+- TUI now decodes SS3 arrow sequences (`ESC O A/B`) so Up/Down navigation works in command preview and overlays on terminals using application-cursor mode.
+- Slash-command transcript writes now sanitize invalid UTF-8 instead of crashing, preventing `/upgrade` and other command outputs from aborting the UI on non-UTF-8 bytes.
+
+### Tests
+- Added input parser regressions for SS3 Up/Down arrow decoding.
+- Added runtime regressions for lossy UTF-8 sanitization and safe transcript insertion of invalid command output.
+
 ## [0.1.4] - 2026-02-23
 
 ### Added

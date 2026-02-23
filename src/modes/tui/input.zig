@@ -415,6 +415,8 @@ pub const Reader = struct {
     fn parseSS3(self: *Reader, data: []const u8) ?Ev {
         if (data.len < 3) return null;
         const ev: Ev = switch (data[2]) {
+            'A' => .{ .key = .up },
+            'B' => .{ .key = .down },
             'C' => .{ .key = .right },
             'D' => .{ .key = .left },
             'H' => .{ .key = .home },
@@ -588,6 +590,20 @@ test "parse arrow left" {
     @memcpy(r.buf[0..3], "\x1b[D");
     r.len = 3;
     try expectKey(r.parseOne().?, .left);
+}
+
+test "parse ss3 arrow up" {
+    var r = Reader.init(-1);
+    @memcpy(r.buf[0..3], "\x1bOA");
+    r.len = 3;
+    try expectKey(r.parseOne().?, .up);
+}
+
+test "parse ss3 arrow down" {
+    var r = Reader.init(-1);
+    @memcpy(r.buf[0..3], "\x1bOB");
+    r.len = 3;
+    try expectKey(r.parseOne().?, .down);
 }
 
 test "parse delete key" {
