@@ -7,6 +7,7 @@ pub const Ev = union(enum) {
     mouse: mouse.Ev,
     paste: []const u8, // bracketed paste content
     resize: void, // SIGWINCH detected
+    notify: void, // external wake-up (background jobs, etc.)
     none: void, // timeout / no data
     err: void, // fatal read error (EBADF, etc.)
 };
@@ -19,9 +20,17 @@ pub const Reader = struct {
     paste_buf: [65536]u8 = undefined,
     paste_len: usize = 0,
     in_paste: bool = false,
+    notify_fd: ?std.posix.fd_t = null,
 
     pub fn init(fd: std.posix.fd_t) Reader {
         return .{ .fd = fd };
+    }
+
+    pub fn initWithNotify(fd: std.posix.fd_t, notify_fd: std.posix.fd_t) Reader {
+        return .{
+            .fd = fd,
+            .notify_fd = notify_fd,
+        };
     }
 
     /// Inject bytes into the read buffer (e.g. from InputWatcher stash).
@@ -45,7 +54,7 @@ pub const Reader = struct {
 
         // Read more data
         self.compact();
-        const n = std.posix.read(self.fd, self.buf[self.len..]) catch |err| switch (err) {
+        const n = self.readReady() catch |err| switch (err) {
             error.WouldBlock => return .none,
             else => return .err,
         };
@@ -57,9 +66,52 @@ pub const Reader = struct {
             }
             return .none;
         }
+        if (n == read_notify) return .notify;
         self.len += n;
 
         return self.parseOne() orelse .none;
+    }
+
+    const read_notify = std.math.maxInt(usize);
+
+    fn readReady(self: *Reader) !usize {
+        if (self.notify_fd == null) {
+            return std.posix.read(self.fd, self.buf[self.len..]);
+        }
+
+        var fds = [2]std.posix.pollfd{
+            .{
+                .fd = self.fd,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+            .{
+                .fd = self.notify_fd.?,
+                .events = std.posix.POLL.IN,
+                .revents = 0,
+            },
+        };
+        const ready = try std.posix.poll(&fds, 100);
+        if (ready == 0) return error.WouldBlock;
+
+        if ((fds[1].revents & std.posix.POLL.IN) != 0) {
+            self.drainNotify();
+            return read_notify;
+        }
+        return std.posix.read(self.fd, self.buf[self.len..]);
+    }
+
+    fn drainNotify(self: *Reader) void {
+        const fd = self.notify_fd orelse return;
+        var scratch: [64]u8 = undefined;
+        while (true) {
+            const n = std.posix.read(fd, &scratch) catch |err| switch (err) {
+                error.WouldBlock => return,
+                else => return,
+            };
+            if (n == 0) return;
+            if (n < scratch.len) return;
+        }
     }
 
     fn accumulatePaste(self: *Reader) Ev {
@@ -785,4 +837,59 @@ test "parse ctrl-close-bracket" {
     r.buf[0] = 0x1d;
     r.len = 1;
     try expectKey(r.parseOne().?, .ctrl_close_bracket);
+}
+
+test "reader emits notify event from notify fd" {
+    const in_pipe = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(in_pipe[0]);
+    defer std.posix.close(in_pipe[1]);
+
+    const notify_pipe = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(notify_pipe[0]);
+    defer std.posix.close(notify_pipe[1]);
+
+    var r = Reader.initWithNotify(in_pipe[0], notify_pipe[0]);
+    const b = [_]u8{1};
+    _ = try std.posix.write(notify_pipe[1], &b);
+
+    const ev = r.next();
+    switch (ev) {
+        .notify => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "reader notify does not drop stdin bytes" {
+    const in_pipe = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(in_pipe[0]);
+    defer std.posix.close(in_pipe[1]);
+
+    const notify_pipe = try std.posix.pipe2(.{
+        .NONBLOCK = true,
+        .CLOEXEC = true,
+    });
+    defer std.posix.close(notify_pipe[0]);
+    defer std.posix.close(notify_pipe[1]);
+
+    var r = Reader.initWithNotify(in_pipe[0], notify_pipe[0]);
+
+    const n = [_]u8{1};
+    _ = try std.posix.write(notify_pipe[1], &n);
+    _ = try std.posix.write(in_pipe[1], "x");
+
+    const ev1 = r.next();
+    switch (ev1) {
+        .notify => {},
+        else => return error.TestUnexpectedResult,
+    }
+    try expectKey(r.next(), .{ .char = 'x' });
 }

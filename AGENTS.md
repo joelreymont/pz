@@ -53,6 +53,8 @@ Only include files changed by the current agent/task. No broad staging.
 
 Run relevant tests before and after each fix or feature.
 Every bug fix must add or strengthen a test.
+Use `ohsnap` snapshots for struct/multi-field outputs and serialized payload checks.
+Use `std.testing.expectEqual` only for scalar primitives.
 
 ## Zig Rules
 

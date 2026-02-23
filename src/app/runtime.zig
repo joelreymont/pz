@@ -1,5 +1,9 @@
 const std = @import("std");
 const cli = @import("cli.zig");
+const bg = @import("bg.zig");
+const changelog = @import("changelog.zig");
+const version_check = @import("version.zig");
+const config = @import("config.zig");
 const core = @import("../core/mod.zig");
 const print_fmt = @import("../modes/print/format.zig");
 const print_err = @import("../modes/print/errors.zig");
@@ -597,14 +601,28 @@ fn runTui(
         .max_turns = run_cmd.max_turns,
         .cancel = cancel,
     };
+    var bg_mgr = try bg.Mgr.init(alloc);
+    defer bg_mgr.deinit();
+    try syncBgFooter(alloc, &ui, &bg_mgr);
     var thinking = run_cmd.thinking;
     var popts = thinking.toProviderOpts();
     var auto_compact_on: bool = true;
     ui.pn.thinking_label = thinkingLabel(thinking);
     ui.border_fg = thinkingBorderFg(thinking);
 
+    // Background version check (TUI only, skip for dev builds)
+    const skip_ver = std.posix.getenv("PZ_SKIP_VERSION_CHECK") != null or
+        std.mem.indexOf(u8, cli.version, "-dev") != null;
+    var ver_check = version_check.Check.init(alloc);
+    if (!skip_ver) ver_check.spawn();
+    defer ver_check.deinit();
+
     // Startup info matching pi's display
-    try showStartup(alloc, &ui);
+    const is_resumed = switch (run_cmd.session) {
+        .cont, .resm, .explicit => true,
+        .auto => false,
+    };
+    try showStartup(alloc, &ui, is_resumed);
 
     // Set terminal title (OSC 0)
     try out.writeAll("\x1b]0;pz\x07");
@@ -613,6 +631,16 @@ fn runTui(
     };
 
     try ui.draw(out);
+
+    // Check for new version after initial draw
+    if (ver_check.poll()) |new_ver| {
+        const t = tui_theme.get();
+        const ver_msg = try std.fmt.allocPrint(alloc, "Update available: {s}", .{new_ver});
+        defer alloc.free(ver_msg);
+        try ui.tr.styledText(ver_msg, .{ .fg = t.accent });
+        try ui.tr.infoText("  https://github.com/joelreymont/pz/releases");
+        try ui.draw(out);
+    }
     if (run_cmd.prompt) |prompt| {
         var init_cmd_buf: [4096]u8 = undefined;
         var init_cmd_fbs = std.io.fixedBufferStream(&init_cmd_buf);
@@ -625,6 +653,7 @@ fn runTui(
             &provider_label,
             &provider_owned,
             tools_rt,
+            &bg_mgr,
             session_dir_path,
             no_session,
             sys_prompt,
@@ -684,6 +713,7 @@ fn runTui(
                 try ui.tr.infoText(cmd_text);
                 ui.tr.scrollToBottom();
             }
+            try syncBgFooter(alloc, &ui, &bg_mgr);
             try ui.setModel(model);
             try ui.setProvider(provider_label);
         }
@@ -713,7 +743,7 @@ fn runTui(
 
     if (is_tty) {
         // Raw mode already enabled above (before -p prompt path)
-        var reader = tui_input.Reader.init(stdin_fd);
+        var reader = tui_input.Reader.initWithNotify(stdin_fd, bg_mgr.wakeFd());
         var followup_queue: std.ArrayListUnmanaged([]u8) = .empty;
         defer {
             for (followup_queue.items) |q| alloc.free(q);
@@ -844,8 +874,7 @@ fn runTui(
                                     if (cp.selectedArg()) |path| {
                                         const text = ui.ed.text();
                                         const cur = ui.ed.cursor();
-                                        var ws: usize = cur;
-                                        while (ws > 0 and text[ws - 1] != ' ' and text[ws - 1] != '\n' and text[ws - 1] != '\t') ws -= 1;
+                                        const ws = ui.ed.wordStart(cur);
                                         const has_at = ws < cur and text[ws] == '@';
                                         const at_s: []const u8 = if (has_at) "@" else "";
                                         const new_text = std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
@@ -917,6 +946,7 @@ fn runTui(
                                 &provider_label,
                                 &provider_owned,
                                 tools_rt,
+                                &bg_mgr,
                                 session_dir_path,
                                 no_session,
                                 sys_prompt,
@@ -1030,6 +1060,7 @@ fn runTui(
                                     try ui.tr.infoText(cmd_text);
                                     ui.tr.scrollToBottom();
                                 }
+                                try syncBgFooter(alloc, &ui, &bg_mgr);
                                 try ui.setModel(model);
                                 try ui.setProvider(provider_label);
                                 try ui.draw(out);
@@ -1141,12 +1172,17 @@ fn runTui(
                         .ext_editor => {
                             if (pre) |p| alloc.free(p);
                             tui_term.restore(stdin_fd);
-                            if (openExtEditor(alloc, ui.editorText())) |txt| {
-                                defer alloc.free(txt);
-                                _ = tui_term.enableRaw(stdin_fd);
-                                try ui.ed.setText(txt);
-                            } else {
-                                _ = tui_term.enableRaw(stdin_fd);
+                            const ed_result = openExtEditor(alloc, ui.editorText());
+                            _ = tui_term.enableRaw(stdin_fd);
+                            if (ed_result) |maybe_txt| {
+                                if (maybe_txt) |txt| {
+                                    defer alloc.free(txt);
+                                    try ui.ed.setText(txt);
+                                }
+                            } else |err| {
+                                const msg = try std.fmt.allocPrint(alloc, "[editor failed: {s}]", .{@errorName(err)});
+                                defer alloc.free(msg);
+                                try ui.tr.infoText(msg);
                             }
                             try ui.draw(out);
                         },
@@ -1232,6 +1268,11 @@ fn runTui(
                     ui.onMouse(mev);
                     try ui.draw(out);
                 },
+                .notify => {
+                    try flushBgDone(alloc, &ui, &bg_mgr);
+                    try syncBgFooter(alloc, &ui, &bg_mgr);
+                    try ui.draw(out);
+                },
                 .paste => |text| {
                     if (text.len > 0) {
                         ui.ed.insertSlice(text) catch {
@@ -1284,6 +1325,7 @@ fn runTui(
                 &provider_label,
                 &provider_owned,
                 tools_rt,
+                &bg_mgr,
                 session_dir_path,
                 no_session,
                 sys_prompt,
@@ -1323,6 +1365,7 @@ fn runTui(
                 continue;
             }
             if (cmd == .handled) {
+                try syncBgFooter(alloc, &ui, &bg_mgr);
                 try ui.setModel(model);
                 try ui.setProvider(provider_label);
                 try ui.draw(out);
@@ -1387,9 +1430,24 @@ fn runRpc(
         .mode = mode,
         .max_turns = run_cmd.max_turns,
     };
+    var bg_mgr = try bg.Mgr.init(alloc);
+    defer bg_mgr.deinit();
 
     while (try in.readUntilDelimiterOrEofAlloc(alloc, '\n', 128 * 1024)) |raw_line| {
         defer alloc.free(raw_line);
+
+        const bg_done = try bg_mgr.drainDone(alloc);
+        defer bg.deinitViews(alloc, bg_done);
+        for (bg_done) |job| {
+            try writeJsonLine(alloc, out, .{
+                .type = "rpc_bg_done",
+                .bg_id = job.id,
+                .state = bg.stateName(job.state),
+                .code = job.code,
+                .log = job.log_path,
+                .cmdline = job.cmd,
+            });
+        }
 
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0) continue;
@@ -1417,12 +1475,13 @@ fn runRpc(
         }
         const cmd = normalizeRpcCmd(raw_cmd);
 
-        const RpcCmd = enum { prompt, model, provider, tools, new, @"resume", session, tree, fork, compact, help, commands, quit, exit };
+        const RpcCmd = enum { prompt, model, provider, tools, bg, new, @"resume", session, tree, fork, compact, help, commands, quit, exit };
         const rpc_map = std.StaticStringMap(RpcCmd).initComptime(.{
             .{ "prompt", .prompt },
             .{ "model", .model },
             .{ "provider", .provider },
             .{ "tools", .tools },
+            .{ "bg", .bg },
             .{ "new", .new },
             .{ "resume", .@"resume" },
             .{ "session", .session },
@@ -1550,6 +1609,17 @@ fn runRpc(
                     .tools = tool_csv,
                 });
             },
+            .bg => {
+                const bg_arg = req.arg orelse req.text orelse "list";
+                const msg = try runBgCommand(alloc, &bg_mgr, bg_arg);
+                defer alloc.free(msg);
+                try writeJsonLine(alloc, out, .{
+                    .type = "rpc_bg",
+                    .id = req.id,
+                    .cmd = raw_cmd,
+                    .msg = msg,
+                });
+            },
             .new => {
                 const next_sid = try newSid(alloc);
                 alloc.free(sid.*);
@@ -1562,27 +1632,16 @@ fn runRpc(
                 });
             },
             .@"resume" => {
-                if (no_session or session_dir_path == null) {
-                    try writeJsonLine(alloc, out, .{
-                        .type = "rpc_error",
-                        .id = req.id,
-                        .cmd = raw_cmd,
-                        .msg = "session_disabled",
-                    });
-                    continue;
-                }
                 const token = req.session_path orelse req.session orelse req.sid orelse req.arg;
-                const next_sid = resolveResumeSid(alloc, session_dir_path.?, token) catch |err| {
+                applyResumeSid(alloc, sid, session_dir_path, no_session, token) catch |err| {
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = @errorName(err),
+                        .msg = if (err == error.SessionDisabled) "session_disabled" else @errorName(err),
                     });
                     continue;
                 };
-                alloc.free(sid.*);
-                sid.* = next_sid;
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_ack",
                     .id = req.id,
@@ -1610,7 +1669,7 @@ fn runRpc(
                 });
             },
             .tree => {
-                if (no_session or session_dir_path == null) {
+                const session_dir = requireSessionDir(session_dir_path, no_session) catch {
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
@@ -1618,8 +1677,8 @@ fn runRpc(
                         .msg = "session_disabled",
                     });
                     continue;
-                }
-                const tree = try listSessionsAlloc(alloc, session_dir_path.?);
+                };
+                const tree = try listSessionsAlloc(alloc, session_dir);
                 defer alloc.free(tree);
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_tree",
@@ -1628,23 +1687,15 @@ fn runRpc(
                 });
             },
             .fork => {
-                if (no_session or session_dir_path == null) {
+                applyForkSid(alloc, sid, session_dir_path, no_session, req.sid orelse req.arg) catch |err| {
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = "session_disabled",
+                        .msg = if (err == error.SessionDisabled) "session_disabled" else @errorName(err),
                     });
                     continue;
-                }
-                const next_sid = if (req.sid orelse req.arg) |raw| blk: {
-                    try core.session.path.validateSid(raw);
-                    break :blk try alloc.dupe(u8, raw);
-                } else try newSid(alloc);
-                errdefer alloc.free(next_sid);
-                try forkSessionFile(session_dir_path.?, sid.*, next_sid);
-                alloc.free(sid.*);
-                sid.* = next_sid;
+                };
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_ack",
                     .id = req.id,
@@ -1653,7 +1704,7 @@ fn runRpc(
                 });
             },
             .compact => {
-                if (no_session or session_dir_path == null) {
+                const session_dir = requireSessionDir(session_dir_path, no_session) catch {
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
@@ -1661,8 +1712,8 @@ fn runRpc(
                         .msg = "session_disabled",
                     });
                     continue;
-                }
-                var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
+                };
+                var dir = try std.fs.cwd().openDir(session_dir, .{});
                 defer dir.close();
                 const ck = try core.session.compactSession(alloc, dir, sid.*, std.time.milliTimestamp());
                 try writeJsonLine(alloc, out, .{
@@ -1679,12 +1730,12 @@ fn runRpc(
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_help",
                     .id = req.id,
-                    .commands = "prompt,model,provider,tools,new,resume,session,tree,fork,compact,quit",
+                    .commands = "prompt,model,provider,tools,bg,new,resume,session,tree,fork,compact,quit",
                 });
             },
             .commands => {
                 const commands = [_][]const u8{
-                    "prompt", "model", "provider", "tools", "new", "resume", "session", "tree", "fork", "compact", "help", "quit",
+                    "prompt", "model", "provider", "tools", "bg", "new", "resume", "session", "tree", "fork", "compact", "help", "quit",
                 };
                 try writeJsonLine(alloc, out, .{
                     .type = "rpc_commands",
@@ -1729,6 +1780,7 @@ fn handleSlashCommand(
     provider: *([]const u8),
     provider_owned: *?[]u8,
     tools_rt: *core.tools.builtin.Runtime,
+    bg_mgr: *bg.Mgr,
     session_dir_path: ?[]const u8,
     no_session: bool,
     _: ?[]const u8, // sys_prompt (unused after settings became interactive)
@@ -1743,7 +1795,7 @@ fn handleSlashCommand(
     const cmd = if (sp) |i| body[0..i] else body;
     const arg = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
 
-    const Cmd = enum { help, quit, exit, session, model, provider, tools, new, @"resume", tree, fork, compact, @"export", settings, hotkeys, login, logout, clear, cost, copy, name, reload, share, changelog };
+    const Cmd = enum { help, quit, exit, session, model, provider, tools, bg, new, @"resume", tree, fork, compact, @"export", settings, hotkeys, login, logout, clear, cost, copy, name, reload, share, changelog };
     const cmd_map = std.StaticStringMap(Cmd).initComptime(.{
         .{ "help", .help },
         .{ "quit", .quit },
@@ -1752,6 +1804,7 @@ fn handleSlashCommand(
         .{ "model", .model },
         .{ "provider", .provider },
         .{ "tools", .tools },
+        .{ "bg", .bg },
         .{ "new", .new },
         .{ "resume", .@"resume" },
         .{ "tree", .tree },
@@ -1786,6 +1839,7 @@ fn handleSlashCommand(
                 \\  /model [id]        Set/select model
                 \\  /provider <id>     Set/show provider
                 \\  /tools [list|all]  Set/show tools
+                \\  /bg <subcommand>   Background jobs
                 \\  /clear             Clear transcript
                 \\  /copy              Copy last response
                 \\  /export [path]     Export to markdown
@@ -1810,10 +1864,11 @@ fn handleSlashCommand(
             const stats = try sessionStats(alloc, session_dir_path, sid.*, no_session);
             defer if (stats.path_owned) |path| alloc.free(path);
             const total = stats.user_msgs + stats.asst_msgs + stats.tool_calls + stats.tool_results;
-            const info = try std.fmt.allocPrint(alloc,
+            const info = try std.fmt.allocPrint(
+                alloc,
                 "Session Info\n\nFile: {s}\nID:   {s}\n\nMessages\n" ++
-                "  User:         {d}\n  Assistant:    {d}\n  Tool Calls:   {d}\n" ++
-                "  Tool Results: {d}\n  Total:        {d}\n",
+                    "  User:         {d}\n  Assistant:    {d}\n  Tool Calls:   {d}\n" ++
+                    "  Tool Results: {d}\n  Total:        {d}\n",
                 .{ stats.path, sid.*, stats.user_msgs, stats.asst_msgs, stats.tool_calls, stats.tool_results, total },
             );
             defer alloc.free(info);
@@ -1854,6 +1909,23 @@ fn handleSlashCommand(
             defer alloc.free(tool_csv);
             try writeTextLine(alloc, out, "tools {s}\n", .{tool_csv});
         },
+        .bg => {
+            if (arg.len == 0) {
+                const usage =
+                    \\usage:
+                    \\  /bg run <cmd>
+                    \\  /bg list
+                    \\  /bg show <id>
+                    \\  /bg stop <id>
+                    \\
+                ;
+                try out.writeAll(usage);
+                return .handled;
+            }
+            const bg_out = try runBgCommand(alloc, bg_mgr, arg);
+            defer alloc.free(bg_out);
+            try out.writeAll(bg_out);
+        },
         .new => {
             const next_sid = try newSid(alloc);
             alloc.free(sid.*);
@@ -1861,61 +1933,55 @@ fn handleSlashCommand(
             try writeTextLine(alloc, out, "new session {s}\n", .{sid.*});
         },
         .@"resume" => {
-            if (no_session or session_dir_path == null) {
-                try out.writeAll("error: session disabled\n");
-                return .handled;
-            }
             if (arg.len == 0) return .select_session;
-            const next_sid = resolveResumeSid(alloc, session_dir_path.?, arg) catch |err| {
+            applyResumeSid(alloc, sid, session_dir_path, no_session, arg) catch |err| {
+                if (err == error.SessionDisabled) {
+                    try out.writeAll("error: session disabled\n");
+                    return .handled;
+                }
                 try writeTextLine(alloc, out, "error: resume failed ({s})\n", .{@errorName(err)});
                 return .handled;
             };
-            alloc.free(sid.*);
-            sid.* = next_sid;
             try writeTextLine(alloc, out, "resumed session {s}\n", .{sid.*});
         },
         .tree => {
-            if (no_session or session_dir_path == null) {
+            const session_dir = requireSessionDir(session_dir_path, no_session) catch {
                 try out.writeAll("error: session disabled\n");
                 return .handled;
-            }
-            const tree = try listSessionsAlloc(alloc, session_dir_path.?);
+            };
+            const tree = try listSessionsAlloc(alloc, session_dir);
             defer alloc.free(tree);
             try out.writeAll(tree);
             if (tree.len == 0 or tree[tree.len - 1] != '\n') try out.writeAll("\n");
         },
         .fork => {
-            if (no_session or session_dir_path == null) {
-                try out.writeAll("error: session disabled\n");
-                return .handled;
-            }
             if (arg.len == 0) return .select_fork;
-            const next_sid = blk: {
-                try core.session.path.validateSid(arg);
-                break :blk try alloc.dupe(u8, arg);
+            applyForkSid(alloc, sid, session_dir_path, no_session, arg) catch |err| {
+                if (err == error.SessionDisabled) {
+                    try out.writeAll("error: session disabled\n");
+                    return .handled;
+                }
+                try writeTextLine(alloc, out, "error: fork failed ({s})\n", .{@errorName(err)});
+                return .handled;
             };
-            errdefer alloc.free(next_sid);
-            try forkSessionFile(session_dir_path.?, sid.*, next_sid);
-            alloc.free(sid.*);
-            sid.* = next_sid;
             try writeTextLine(alloc, out, "forked session {s}\n", .{sid.*});
         },
         .compact => {
-            if (no_session or session_dir_path == null) {
+            const session_dir = requireSessionDir(session_dir_path, no_session) catch {
                 try out.writeAll("error: session disabled\n");
                 return .handled;
-            }
-            var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
+            };
+            var dir = try std.fs.cwd().openDir(session_dir, .{});
             defer dir.close();
             const ck = try core.session.compactSession(alloc, dir, sid.*, std.time.milliTimestamp());
             try writeTextLine(alloc, out, "compacted in={d} out={d}\n", .{ ck.in_lines, ck.out_lines });
         },
         .@"export" => {
-            if (no_session or session_dir_path == null) {
+            const session_dir = requireSessionDir(session_dir_path, no_session) catch {
                 try out.writeAll("error: session disabled\n");
                 return .handled;
-            }
-            var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
+            };
+            var dir = try std.fs.cwd().openDir(session_dir, .{});
             defer dir.close();
             const out_path = if (arg.len > 0) arg else null;
             const path = core.session.exportMarkdown(alloc, dir, sid.*, out_path) catch |err| {
@@ -2009,11 +2075,11 @@ fn handleSlashCommand(
         .logout => return .select_logout,
         .reload => return .reload,
         .share => {
-            if (no_session or session_dir_path == null) {
+            const session_dir = requireSessionDir(session_dir_path, no_session) catch {
                 try out.writeAll("error: session disabled\n");
                 return .handled;
-            }
-            var dir = try std.fs.cwd().openDir(session_dir_path.?, .{});
+            };
+            var dir = try std.fs.cwd().openDir(session_dir, .{});
             defer dir.close();
             const md_path = core.session.exportMarkdown(alloc, dir, sid.*, null) catch |err| {
                 try writeTextLine(alloc, out, "export failed: {s}\n", .{@errorName(err)});
@@ -2028,10 +2094,136 @@ fn handleSlashCommand(
             try writeTextLine(alloc, out, "shared: {s}\n", .{gist_url});
         },
         .changelog => {
-            try out.writeAll("pz — no changelog yet\n");
+            const cl = try changelog.formatForDisplay(alloc, 50);
+            defer alloc.free(cl);
+            try out.writeAll("[What's New]\n");
+            try out.writeAll(cl);
+            try out.writeAll("\n");
         },
     }
     return .handled;
+}
+
+fn runBgCommand(alloc: std.mem.Allocator, bg_mgr: *bg.Mgr, arg: []const u8) ![]u8 {
+    const body = std.mem.trim(u8, arg, " \t");
+    if (body.len == 0) {
+        return alloc.dupe(u8, "usage: /bg run <cmd>|list|show <id>|stop <id>\n");
+    }
+
+    const sp = std.mem.indexOfAny(u8, body, " \t");
+    const sub = if (sp) |i| body[0..i] else body;
+    const rest = if (sp) |i| std.mem.trim(u8, body[i + 1 ..], " \t") else "";
+
+    if (std.mem.eql(u8, sub, "run")) {
+        if (rest.len == 0) {
+            return alloc.dupe(u8, "usage: /bg run <cmd>\n");
+        }
+        const id = try bg_mgr.start(rest, null);
+        const v = (try bg_mgr.view(alloc, id)) orelse return error.InternalError;
+        defer bg.deinitView(alloc, v);
+        return std.fmt.allocPrint(alloc, "bg started id={d} pid={d} log={s}\n", .{
+            v.id,
+            v.pid,
+            v.log_path,
+        });
+    }
+
+    if (std.mem.eql(u8, sub, "list")) {
+        const jobs = try bg_mgr.list(alloc);
+        defer bg.deinitViews(alloc, jobs);
+        if (jobs.len == 0) return alloc.dupe(u8, "no background jobs\n");
+
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "id pid state code log cmd\n");
+        for (jobs) |j| {
+            const code = j.code orelse -1;
+            const line = try std.fmt.allocPrint(alloc, "{d} {d} {s} {d} {s} {s}\n", .{
+                j.id,
+                j.pid,
+                bg.stateName(j.state),
+                code,
+                j.log_path,
+                j.cmd,
+            });
+            defer alloc.free(line);
+            try out.appendSlice(alloc, line);
+        }
+        return out.toOwnedSlice(alloc);
+    }
+
+    if (std.mem.eql(u8, sub, "show")) {
+        const id = parseBgId(rest) catch return alloc.dupe(u8, "usage: /bg show <id>\n");
+        const v = (try bg_mgr.view(alloc, id)) orelse return alloc.dupe(u8, "bg: not found\n");
+        defer bg.deinitView(alloc, v);
+
+        return std.fmt.allocPrint(alloc, "id={d}\npid={d}\nstate={s}\ncode={?d}\nstarted_ms={d}\nended_ms={?d}\nlog={s}\ncmd={s}\n", .{
+            v.id,
+            v.pid,
+            bg.stateName(v.state),
+            v.code,
+            v.started_at_ms,
+            v.ended_at_ms,
+            v.log_path,
+            v.cmd,
+        });
+    }
+
+    if (std.mem.eql(u8, sub, "stop")) {
+        const id = parseBgId(rest) catch return alloc.dupe(u8, "usage: /bg stop <id>\n");
+        const stop = try bg_mgr.stop(id);
+        return switch (stop) {
+            .sent => std.fmt.allocPrint(alloc, "bg stop sent id={d}\n", .{id}),
+            .already_done => std.fmt.allocPrint(alloc, "bg already done id={d}\n", .{id}),
+            .not_found => std.fmt.allocPrint(alloc, "bg not found id={d}\n", .{id}),
+        };
+    }
+
+    return alloc.dupe(u8, "usage: /bg run <cmd>|list|show <id>|stop <id>\n");
+}
+
+fn parseBgId(text: []const u8) !u64 {
+    const tok = std.mem.trim(u8, text, " \t");
+    if (tok.len == 0) return error.InvalidId;
+    return std.fmt.parseInt(u64, tok, 10);
+}
+
+fn flushBgDone(alloc: std.mem.Allocator, ui: *tui_harness.Ui, bg_mgr: *bg.Mgr) !void {
+    const done = try bg_mgr.drainDone(alloc);
+    defer bg.deinitViews(alloc, done);
+
+    for (done) |job| {
+        const msg = if (job.state == .wait_err)
+            try std.fmt.allocPrint(alloc, "[bg {d} {s} err={s} log={s}]", .{
+                job.id,
+                bg.stateName(job.state),
+                job.err_name orelse "",
+                job.log_path,
+            })
+        else
+            try std.fmt.allocPrint(alloc, "[bg {d} {s} code={?d} log={s}]", .{
+                job.id,
+                bg.stateName(job.state),
+                job.code,
+                job.log_path,
+            });
+        defer alloc.free(msg);
+        try ui.tr.infoText(msg);
+    }
+    if (done.len > 0) ui.tr.scrollToBottom();
+}
+
+fn syncBgFooter(alloc: std.mem.Allocator, ui: *tui_harness.Ui, bg_mgr: *bg.Mgr) !void {
+    const jobs = try bg_mgr.list(alloc);
+    defer bg.deinitViews(alloc, jobs);
+
+    const launched: u32 = @intCast(jobs.len);
+    var running: u32 = 0;
+    for (jobs) |job| {
+        if (job.state == .running) running +%= 1;
+    }
+    const done: u32 = launched -| running;
+    ui.pn.setBgStatus(launched, running, done);
 }
 
 fn shareGist(alloc: std.mem.Allocator, md_path: []const u8) ![]u8 {
@@ -2194,16 +2386,7 @@ fn sessionStats(
     var asst_msgs: u32 = 0;
     var tool_calls: u32 = 0;
     var tool_results: u32 = 0;
-    var buf: [8192]u8 = undefined;
-
-    // Count lines and try to count message types from the replay reader
-    while (true) {
-        const n = try f.read(&buf);
-        if (n == 0) break;
-        lines += std.mem.count(u8, buf[0..n], "\n");
-    }
-
-    // Replay to count message types
+    // Replay once to count lines and message types.
     if (session_dir_path) |sdp| {
         var dir = std.fs.cwd().openDir(sdp, .{}) catch return .{
             .path = abs,
@@ -2221,6 +2404,7 @@ fn sessionStats(
         defer rdr.deinit();
         while (true) {
             const ev = rdr.next() catch break;
+            lines = rdr.line();
             const item = ev orelse break;
             switch (item.data) {
                 .prompt => user_msgs += 1,
@@ -2230,6 +2414,7 @@ fn sessionStats(
                 else => {},
             }
         }
+        lines = rdr.line();
     }
 
     return .{
@@ -2309,9 +2494,7 @@ fn completeFilePath(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const cur = ui.ed.cursor();
     if (cur == 0) return;
 
-    // Find last word
-    var ws: usize = cur;
-    while (ws > 0 and text[ws - 1] != ' ' and text[ws - 1] != '\n' and text[ws - 1] != '\t') ws -= 1;
+    const ws = ui.ed.wordStart(cur);
     const word = text[ws..cur];
     if (word.len == 0) return;
 
@@ -2390,6 +2573,44 @@ fn resolveResumeSid(
         try core.session.selector.latestInDir(alloc, session_dir);
     defer alloc.free(plan.dir_path);
     return plan.sid;
+}
+
+const SessionOpErr = error{SessionDisabled};
+
+fn requireSessionDir(session_dir_path: ?[]const u8, no_session: bool) SessionOpErr![]const u8 {
+    if (no_session or session_dir_path == null) return error.SessionDisabled;
+    return session_dir_path.?;
+}
+
+fn applyResumeSid(
+    alloc: std.mem.Allocator,
+    sid: *([]u8),
+    session_dir_path: ?[]const u8,
+    no_session: bool,
+    token: ?[]const u8,
+) (SessionOpErr || anyerror)!void {
+    const dir = try requireSessionDir(session_dir_path, no_session);
+    const next_sid = try resolveResumeSid(alloc, dir, token);
+    alloc.free(sid.*);
+    sid.* = next_sid;
+}
+
+fn applyForkSid(
+    alloc: std.mem.Allocator,
+    sid: *([]u8),
+    session_dir_path: ?[]const u8,
+    no_session: bool,
+    token: ?[]const u8,
+) (SessionOpErr || anyerror)!void {
+    const dir = try requireSessionDir(session_dir_path, no_session);
+    const next_sid = if (token) |raw| blk: {
+        try core.session.path.validateSid(raw);
+        break :blk try alloc.dupe(u8, raw);
+    } else try newSid(alloc);
+    errdefer alloc.free(next_sid);
+    try forkSessionFile(dir, sid.*, next_sid);
+    alloc.free(sid.*);
+    sid.* = next_sid;
 }
 
 fn listSessionsAlloc(alloc: std.mem.Allocator, session_dir: []const u8) ![]u8 {
@@ -2636,6 +2857,7 @@ const model_cycle = [_][]const u8{
 
 const provider_args = [_][]const u8{ "anthropic", "openai", "google" };
 const tool_args = [_][]const u8{ "all", "none", "read", "write", "bash", "edit", "grep", "find", "ls" };
+const bg_args = [_][]const u8{ "run", "list", "show", "stop" };
 
 /// Resolve arg completion source based on current editor text.
 fn resolveArgSrc(text: []const u8, models: []const []const u8) ?[]const []const u8 {
@@ -2646,6 +2868,7 @@ fn resolveArgSrc(text: []const u8, models: []const []const u8) ?[]const []const 
     if (std.mem.eql(u8, cmd, "model")) return models;
     if (std.mem.eql(u8, cmd, "provider")) return &provider_args;
     if (std.mem.eql(u8, cmd, "tools")) return &tool_args;
+    if (std.mem.eql(u8, cmd, "bg")) return &bg_args;
     if (std.mem.eql(u8, cmd, "login") or std.mem.eql(u8, cmd, "logout")) return &provider_args;
     return null;
 }
@@ -2711,11 +2934,12 @@ fn thinkingBorderFg(level: args_mod.ThinkingLevel) @import("../modes/tui/frame.z
     };
 }
 
-fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
+fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool) !void {
     const t = tui_theme.get();
 
     // Version banner (matching pi's "pi v0.52.12")
-    try ui.tr.styledText(" pz v0.0.0", .{ .fg = t.dim });
+    const ver_line = " pz v" ++ cli.version ++ " (" ++ cli.git_hash ++ ")";
+    try ui.tr.styledText(ver_line, .{ .fg = t.dim });
 
     // Hotkeys — key in dim, description in muted
     const keys = [_][2][]const u8{
@@ -2791,6 +3015,31 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
             defer alloc.free(display2);
             try ui.tr.infoText(display2);
         }
+    }
+
+    // What's New section (only on fresh sessions)
+    if (!is_resumed) {
+        var state = config.PzState.load(alloc) orelse config.PzState{};
+        defer state.deinit(alloc);
+
+        const new_entries = changelog.entriesSince(state.last_hash);
+        if (new_entries.len > 0) {
+            const formatted = try changelog.formatRaw(alloc, new_entries, 10);
+            defer alloc.free(formatted);
+            try ui.tr.styledText("", .{}); // blank line
+            try ui.tr.styledText("[What's New]", .{ .fg = t.md_heading });
+            // Split and display each line
+            var off: usize = 0;
+            while (off < formatted.len) {
+                const eol = std.mem.indexOfScalarPos(u8, formatted, off, '\n') orelse formatted.len;
+                try ui.tr.infoText(formatted[off..eol]);
+                off = eol + 1;
+            }
+        }
+
+        // Update state with current git hash
+        const new_state = config.PzState{ .last_hash = cli.git_hash };
+        new_state.save(alloc);
     }
 
     // Trailing blank lines before prompt (matching pi's spacing)
@@ -2985,20 +3234,20 @@ fn runBashMode(
     }
 }
 
-fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
+fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) !?[]u8 {
     const ed = std.posix.getenv("EDITOR") orelse std.posix.getenv("VISUAL") orelse "vi";
 
     // Write current text to unique temp file
     var tmp_buf: [64]u8 = undefined;
     const ts: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts}) catch return null;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts});
     defer std.fs.deleteFileAbsolute(tmp) catch |err| {
         std.debug.print("warning: temp file cleanup failed: {s}\n", .{@errorName(err)});
     };
     {
-        const f = std.fs.createFileAbsolute(tmp, .{}) catch return null;
+        const f = try std.fs.createFileAbsolute(tmp, .{});
         defer f.close();
-        f.writeAll(current) catch return null;
+        try f.writeAll(current);
     }
 
     const argv = [_][]const u8{ ed, tmp };
@@ -3006,13 +3255,13 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-    child.spawn() catch return null;
-    _ = child.wait() catch return null;
+    try child.spawn();
+    _ = try child.wait();
 
     // Read back
-    const f = std.fs.openFileAbsolute(tmp, .{}) catch return null;
+    const f = try std.fs.openFileAbsolute(tmp, .{});
     defer f.close();
-    const content = f.readToEndAlloc(alloc, 1024 * 1024) catch return null;
+    const content = try f.readToEndAlloc(alloc, 1024 * 1024);
     // Trim trailing newline
     var len = content.len;
     while (len > 0 and (content[len - 1] == '\n' or content[len - 1] == '\r')) len -= 1;
@@ -3021,10 +3270,7 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
         return null;
     }
     if (len < content.len) {
-        const trimmed = alloc.dupe(u8, content[0..len]) catch {
-            alloc.free(content);
-            return null;
-        };
+        const trimmed = try alloc.dupe(u8, content[0..len]);
         alloc.free(content);
         return trimmed;
     }
@@ -3814,6 +4060,45 @@ test "runtime tui slash commands execute without prompt turns" {
     try std.testing.expect(std.mem.indexOf(u8, written, "new session") != null);
 }
 
+test "runtime tui bg command starts and lists background jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("sess");
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .tui,
+        .prompt = null,
+        .cfg = .{
+            .mode = .tui,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "p"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = try std.testing.allocator.dupe(u8, "cat >/dev/null; printf 'text:noop\\nstop:done\\n'"),
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var in_fbs = std.io.fixedBufferStream("/bg run sleep 1\n/bg list\n/quit\n");
+    var out_buf: [32768]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    const sid = try execWithIo(
+        std.testing.allocator,
+        cfg,
+        in_fbs.reader().any(),
+        out_fbs.writer().any(),
+    );
+    defer std.testing.allocator.free(sid);
+
+    const written = out_fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "bg started id=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "id pid state code log cmd") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "bg L1 R1 D0") != null);
+}
+
 test "runtime rpc accepts type envelope aliases and echoes ids" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3863,6 +4148,117 @@ test "runtime rpc accepts type envelope aliases and echoes ids" {
     try std.testing.expect(std.mem.indexOf(u8, written, "\"provider\":\"p2\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_commands\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"cmd\":\"new_session\"") != null);
+}
+
+test "runtime rpc bg command starts lists and stops jobs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("sess");
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .rpc,
+        .prompt = null,
+        .cfg = .{
+            .mode = .rpc,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "p"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = try std.testing.allocator.dupe(u8, "cat >/dev/null; printf 'text:noop\\nstop:done\\n'"),
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var in_fbs = std.io.fixedBufferStream(
+        "{\"id\":\"1\",\"cmd\":\"bg\",\"arg\":\"run sleep 1\"}\n" ++
+            "{\"id\":\"2\",\"cmd\":\"bg\",\"arg\":\"list\"}\n" ++
+            "{\"id\":\"3\",\"cmd\":\"bg\",\"arg\":\"stop 1\"}\n" ++
+            "{\"id\":\"4\",\"cmd\":\"quit\"}\n",
+    );
+    var out_buf: [32768]u8 = undefined;
+    var out_fbs = std.io.fixedBufferStream(&out_buf);
+
+    const sid = try execWithIo(
+        std.testing.allocator,
+        cfg,
+        in_fbs.reader().any(),
+        out_fbs.writer().any(),
+    );
+    defer std.testing.allocator.free(sid);
+
+    const written = out_fbs.getWritten();
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"type\":\"rpc_bg\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "bg started id=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "id pid state code log cmd") != null);
+    try std.testing.expect(
+        std.mem.indexOf(u8, written, "bg stop sent id=1") != null or
+            std.mem.indexOf(u8, written, "bg already done id=1") != null,
+    );
+}
+
+test "runtime bg command validates usage and missing ids" {
+    var mgr = try bg.Mgr.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const usage = try runBgCommand(std.testing.allocator, &mgr, "");
+    defer std.testing.allocator.free(usage);
+    try std.testing.expectEqualStrings("usage: /bg run <cmd>|list|show <id>|stop <id>\n", usage);
+
+    const run_usage = try runBgCommand(std.testing.allocator, &mgr, "run");
+    defer std.testing.allocator.free(run_usage);
+    try std.testing.expectEqualStrings("usage: /bg run <cmd>\n", run_usage);
+
+    const show_usage = try runBgCommand(std.testing.allocator, &mgr, "show nope");
+    defer std.testing.allocator.free(show_usage);
+    try std.testing.expectEqualStrings("usage: /bg show <id>\n", show_usage);
+
+    const stop_usage = try runBgCommand(std.testing.allocator, &mgr, "stop nope");
+    defer std.testing.allocator.free(stop_usage);
+    try std.testing.expectEqualStrings("usage: /bg stop <id>\n", stop_usage);
+
+    const not_found = try runBgCommand(std.testing.allocator, &mgr, "show 42");
+    defer std.testing.allocator.free(not_found);
+    try std.testing.expectEqualStrings("bg: not found\n", not_found);
+
+    const stop_not_found = try runBgCommand(std.testing.allocator, &mgr, "stop 42");
+    defer std.testing.allocator.free(stop_not_found);
+    try std.testing.expectEqualStrings("bg not found id=42\n", stop_not_found);
+
+    const bad_sub = try runBgCommand(std.testing.allocator, &mgr, "wat");
+    defer std.testing.allocator.free(bad_sub);
+    try std.testing.expectEqualStrings("usage: /bg run <cmd>|list|show <id>|stop <id>\n", bad_sub);
+}
+
+test "runtime bg command run show list workflow" {
+    var mgr = try bg.Mgr.init(std.testing.allocator);
+    defer mgr.deinit();
+
+    const started = try runBgCommand(std.testing.allocator, &mgr, "run sleep 1");
+    defer std.testing.allocator.free(started);
+    try std.testing.expect(std.mem.indexOf(u8, started, "bg started id=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, started, "pid=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, started, "log=/tmp/pz-bg-") != null);
+
+    const shown = try runBgCommand(std.testing.allocator, &mgr, "show 1");
+    defer std.testing.allocator.free(shown);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "id=1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "pid=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "state=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "cmd=sleep 1\n") != null);
+
+    const listed = try runBgCommand(std.testing.allocator, &mgr, "list");
+    defer std.testing.allocator.free(listed);
+    try std.testing.expect(std.mem.indexOf(u8, listed, "id pid state code log cmd\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, listed, " sleep 1\n") != null);
+
+    const stopped = try runBgCommand(std.testing.allocator, &mgr, "stop 1");
+    defer std.testing.allocator.free(stopped);
+    try std.testing.expect(
+        std.mem.indexOf(u8, stopped, "bg stop sent id=1\n") != null or
+            std.mem.indexOf(u8, stopped, "bg already done id=1\n") != null,
+    );
 }
 
 test "runtime tui tools command updates tool availability per turn" {

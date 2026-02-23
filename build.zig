@@ -1,8 +1,30 @@
 const std = @import("std");
+const pkg = @import("build.zig.zon");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+
+    // Build options: version, git hash, changelog
+    const options = b.addOptions();
+    options.addOption([]const u8, "version", pkg.version);
+
+    var code: u8 = 0;
+    const git_hash_raw = b.runAllowFail(
+        &.{ "git", "rev-parse", "--short", "HEAD" },
+        &code,
+        .Ignore,
+    ) catch "unknown";
+    const git_hash = std.mem.trimRight(u8, git_hash_raw, "\n\r ");
+    options.addOption([]const u8, "git_hash", git_hash);
+
+    const git_log_raw = b.runAllowFail(
+        &.{ "git", "log", "--oneline", "--no-decorate", "-n", "50" },
+        &code,
+        .Ignore,
+    ) catch "No commit history available";
+    const git_log = std.mem.trimRight(u8, git_log_raw, "\n\r ");
+    options.addOption([]const u8, "changelog", git_log);
 
     const exe = b.addExecutable(.{
         .name = "pz",
@@ -12,6 +34,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    exe.root_module.addOptions("build_options", options);
     b.installArtifact(exe);
 
     const build_step = b.step("build", "Build the executable");
@@ -29,6 +52,12 @@ pub fn build(b: *std.Build) void {
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
     });
+    if (b.lazyDependency("ohsnap", .{
+        .target = target,
+        .optimize = optimize,
+    })) |ohsnap_dep| {
+        exe_tests.root_module.addImport("ohsnap", ohsnap_dep.module("ohsnap"));
+    }
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
     const suite_tests = b.addTest(.{
@@ -38,6 +67,13 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    suite_tests.root_module.addOptions("build_options", options);
+    if (b.lazyDependency("ohsnap", .{
+        .target = target,
+        .optimize = optimize,
+    })) |ohsnap_dep| {
+        suite_tests.root_module.addImport("ohsnap", ohsnap_dep.module("ohsnap"));
+    }
     const run_suite_tests = b.addRunArtifact(suite_tests);
 
     const test_step = b.step("test", "Run unit tests");

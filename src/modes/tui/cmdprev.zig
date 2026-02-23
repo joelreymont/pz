@@ -36,6 +36,7 @@ pub const cmds = [_]Cmd{
     .{ .name = "share", .desc = "Share as gist" },
     .{ .name = "tools", .desc = "Set/show tools" },
     .{ .name = "tree", .desc = "List sessions" },
+    .{ .name = "bg", .desc = "Background jobs" },
 };
 
 /// Max visible rows in the dropdown (pi uses 5).

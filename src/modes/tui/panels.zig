@@ -52,6 +52,9 @@ pub const Panels = struct {
     ctx_limit: u64 = 0,
     run_state: RunState = .idle,
     turns: u32 = 0,
+    bg_launched: u32 = 0,
+    bg_running: u32 = 0,
+    bg_done: u32 = 0,
     thinking_label: []const u8 = "",
     is_sub: bool = false, // subscription (vs pay-per-token)
 
@@ -118,6 +121,12 @@ pub const Panels = struct {
 
     pub fn providerName(self: *const Panels) []const u8 {
         return self.provider.items;
+    }
+
+    pub fn setBgStatus(self: *Panels, launched: u32, running: u32, done: u32) void {
+        self.bg_launched = launched;
+        self.bg_running = running;
+        self.bg_done = done;
     }
 
     pub fn count(self: *const Panels) usize {
@@ -203,6 +212,21 @@ pub const Panels = struct {
             var x = rect.x;
 
             // Left: turn count + usage stats
+            if (self.bg_launched > 0) {
+                try writePart(frm, &x, x_end, y2, "bg L", dim_st);
+                var lbuf: [16]u8 = undefined;
+                const ltxt = fmtBuf(&lbuf, "{d}", .{self.bg_launched}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, ltxt, dim_st);
+                try writePart(frm, &x, x_end, y2, " R", dim_st);
+                var rbuf: [16]u8 = undefined;
+                const rtxt = fmtBuf(&rbuf, "{d}", .{self.bg_running}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, rtxt, dim_st);
+                try writePart(frm, &x, x_end, y2, " D", dim_st);
+                var dbuf: [16]u8 = undefined;
+                const dtxt = fmtBuf(&dbuf, "{d}", .{self.bg_done}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, dtxt, dim_st);
+                try writePart(frm, &x, x_end, y2, " ", dim_st);
+            }
             if (self.turns > 0) {
                 var tb: [16]u8 = undefined;
                 const tt = fmtBuf(&tb, "{d}", .{self.turns}) catch return error.NoSpaceLeft;
@@ -819,4 +843,16 @@ test "panels footer shows turn count" {
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 40, .h = 2 });
 
     try std.testing.expect(findAsciiSeq(&frm, 1, "5 turns"));
+}
+
+test "panels footer shows background job counts" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
+    defer ps.deinit();
+    ps.setBgStatus(3, 1, 2);
+
+    var frm = try frame.Frame.init(std.testing.allocator, 50, 2);
+    defer frm.deinit(std.testing.allocator);
+    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 50, .h = 2 });
+
+    try std.testing.expect(findAsciiSeq(&frm, 1, "bg L3 R1 D2"));
 }
