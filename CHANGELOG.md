@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.6] - 2026-02-23
+
+### Changed
+- Updater/version HTTP client now initializes proxy settings from standard env vars (`http_proxy`, `https_proxy`, `all_proxy` and uppercase variants).
+
+### Fixed
+- Upgrade HTTP errors now extract meaningful HTML message text (`title`/`h1`/`h2`/`p`) instead of printing truncated markup.
+- HTTP 400 upgrade failures now report a targeted hint for proxy/header rewriting scenarios.
+
+### Tests
+- Added updater regression covering HTML error-message extraction for 400 responses.
+
+## [0.1.5] - 2026-02-23
+
+### Fixed
+- TUI now decodes SS3 arrow sequences (`ESC O A/B`) so Up/Down navigation works in command preview and overlays on terminals using application-cursor mode.
+- Slash-command transcript writes now sanitize invalid UTF-8 instead of crashing, preventing `/upgrade` and other command outputs from aborting the UI on non-UTF-8 bytes.
+
+### Tests
+- Added input parser regressions for SS3 Up/Down arrow decoding.
+- Added runtime regressions for lossy UTF-8 sanitization and safe transcript insertion of invalid command output.
+
 ## [0.1.4] - 2026-02-23
 
 ### Added
