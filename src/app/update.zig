@@ -13,6 +13,22 @@ const ReleasePayload = struct {
     assets: []ReleaseAsset = &.{},
 };
 
+const release_latest_url = "https://api.github.com/repos/joelreymont/pz/releases/latest";
+const release_accept = "application/vnd.github+json";
+const asset_accept = "application/octet-stream";
+const release_limit = 256 * 1024;
+const asset_limit = 256 * 1024 * 1024;
+const body_snip_limit = 220;
+
+pub const Outcome = struct {
+    ok: bool,
+    msg: []u8,
+
+    pub fn deinit(self: Outcome, alloc: std.mem.Allocator) void {
+        alloc.free(self.msg);
+    }
+};
+
 pub const UpdateError = error{
     InvalidCurrentVersion,
     InvalidLatestVersion,
@@ -23,56 +39,166 @@ pub const UpdateError = error{
     InvalidExecutablePath,
 };
 
+const HttpResult = union(enum) {
+    ok: []u8,
+    status: struct {
+        code: u16,
+        body: []u8,
+    },
+
+    fn deinit(self: HttpResult, alloc: std.mem.Allocator) void {
+        switch (self) {
+            .ok => |body| alloc.free(body),
+            .status => |resp| alloc.free(resp.body),
+        }
+    }
+};
+
 pub fn run(alloc: std.mem.Allocator) ![]u8 {
+    const out = try runOutcome(alloc);
+    return out.msg;
+}
+
+pub fn runOutcome(alloc: std.mem.Allocator) !Outcome {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const ar = arena.allocator();
 
-    const release = try fetchLatestRelease(ar);
+    const release_http = httpGetResult(alloc, release_latest_url, release_accept, release_limit) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .ok = false,
+            .msg = try formatTransportFailure(
+                alloc,
+                "fetch latest release metadata",
+                release_latest_url,
+                err,
+            ),
+        };
+    };
+    defer release_http.deinit(alloc);
+
+    const release_body = switch (release_http) {
+        .ok => |body| body,
+        .status => |resp| {
+            return .{
+                .ok = false,
+                .msg = try formatHttpFailure(
+                    alloc,
+                    "fetch latest release metadata",
+                    release_latest_url,
+                    resp.code,
+                    resp.body,
+                ),
+            };
+        },
+    };
+
+    const release_parsed = std.json.parseFromSlice(ReleasePayload, ar, release_body, .{
+        .ignore_unknown_fields = true,
+    }) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .ok = false,
+            .msg = try formatParseFailure(alloc, release_body),
+        };
+    };
+    const release = release_parsed.value;
+
     const current = version.parseVersion(cli.version) orelse return error.InvalidCurrentVersion;
     const latest = version.parseVersion(release.tag_name) orelse return error.InvalidLatestVersion;
     if (!latest.isNewer(current)) {
-        return std.fmt.allocPrint(alloc, "already up to date ({s})\n", .{cli.version});
+        return .{
+            .ok = true,
+            .msg = try std.fmt.allocPrint(alloc, "already up to date ({s})\n", .{cli.version}),
+        };
     }
 
-    const asset_name = targetAssetName() orelse return error.UnsupportedTarget;
-    const asset_url = findAssetUrl(release.assets, asset_name) orelse return error.MissingAsset;
+    const asset_name = targetAssetName() orelse {
+        const target = try targetLabelAlloc(alloc);
+        defer alloc.free(target);
+        return .{
+            .ok = false,
+            .msg = try std.fmt.allocPrint(
+                alloc,
+                "upgrade failed: no prebuilt binary for target {s}\nsupported targets: x86_64-linux, aarch64-linux, aarch64-macos\nmanual install: https://github.com/joelreymont/pz/releases/latest\n",
+                .{target},
+            ),
+        };
+    };
+    const asset_url = findAssetUrl(release.assets, asset_name) orelse {
+        const list = try assetListAlloc(alloc, release.assets);
+        defer alloc.free(list);
+        return .{
+            .ok = false,
+            .msg = try std.fmt.allocPrint(
+                alloc,
+                "upgrade failed: release {s} does not contain asset {s}\navailable assets: {s}\nmanual install: https://github.com/joelreymont/pz/releases/latest\n",
+                .{ release.tag_name, asset_name, list },
+            ),
+        };
+    };
 
-    const archive = try httpGetAlloc(alloc, asset_url, "application/octet-stream", 256 * 1024 * 1024);
-    defer alloc.free(archive);
+    const archive_http = httpGetResult(alloc, asset_url, asset_accept, asset_limit) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .ok = false,
+            .msg = try formatTransportFailure(alloc, "download release archive", asset_url, err),
+        };
+    };
+    defer archive_http.deinit(alloc);
 
-    const next_bin = try extractPzBinary(alloc, archive);
+    const archive = switch (archive_http) {
+        .ok => |body| body,
+        .status => |resp| {
+            return .{
+                .ok = false,
+                .msg = try formatHttpFailure(
+                    alloc,
+                    "download release archive",
+                    asset_url,
+                    resp.code,
+                    resp.body,
+                ),
+            };
+        },
+    };
+
+    const next_bin = extractPzBinary(alloc, archive) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .ok = false,
+            .msg = try formatExtractFailure(alloc, err, asset_name),
+        };
+    };
     defer alloc.free(next_bin);
 
     const exe_path = try std.fs.selfExePathAlloc(alloc);
     defer alloc.free(exe_path);
-    try installBinary(alloc, exe_path, next_bin);
+    installBinary(alloc, exe_path, next_bin) catch |err| {
+        if (err == error.OutOfMemory) return err;
+        return .{
+            .ok = false,
+            .msg = try formatInstallFailure(alloc, err, exe_path),
+        };
+    };
 
-    return std.fmt.allocPrint(
-        alloc,
-        "updated {s} -> {s}; restart pz to use the new binary\n",
-        .{ cli.version, release.tag_name },
-    );
+    return .{
+        .ok = true,
+        .msg = try std.fmt.allocPrint(
+            alloc,
+            "updated {s} -> {s}; restart pz to use the new binary\n",
+            .{ cli.version, release.tag_name },
+        ),
+    };
 }
 
-fn fetchLatestRelease(alloc: std.mem.Allocator) !ReleasePayload {
-    const body = try httpGetAlloc(
-        alloc,
-        "https://api.github.com/repos/joelreymont/pz/releases/latest",
-        "application/vnd.github+json",
-        256 * 1024,
-    );
-    return std.json.parseFromSliceLeaky(ReleasePayload, alloc, body, .{
-        .ignore_unknown_fields = true,
-    });
-}
-
-fn httpGetAlloc(
+fn httpGetResult(
     alloc: std.mem.Allocator,
     url: []const u8,
     accept: []const u8,
     limit: usize,
-) ![]u8 {
+) !HttpResult {
     var http = std.http.Client{ .allocator = alloc };
     defer http.deinit();
 
@@ -91,13 +217,143 @@ fn httpGetAlloc(
 
     var redir_buf: [4096]u8 = undefined;
     var resp = try req.receiveHead(&redir_buf);
-    if (resp.head.status != .ok) return error.ReleaseApiFailed;
 
     var transfer_buf: [16384]u8 = undefined;
     var decomp: std.http.Decompress = undefined;
     var decomp_buf: [std.compress.flate.max_window_len]u8 = undefined;
     const reader = resp.readerDecompressing(&transfer_buf, &decomp, &decomp_buf);
-    return reader.allocRemaining(alloc, .limited(limit));
+    const body = try reader.allocRemaining(alloc, .limited(limit));
+
+    if (resp.head.status != .ok) {
+        return .{
+            .status = .{
+                .code = @intFromEnum(resp.head.status),
+                .body = body,
+            },
+        };
+    }
+
+    return .{ .ok = body };
+}
+
+fn targetLabelAlloc(alloc: std.mem.Allocator) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "{s}-{s}",
+        .{ @tagName(builtin.target.cpu.arch), @tagName(builtin.target.os.tag) },
+    );
+}
+
+fn assetListAlloc(alloc: std.mem.Allocator, assets: []const ReleaseAsset) ![]u8 {
+    if (assets.len == 0) return alloc.dupe(u8, "<none>");
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    const max_items: usize = 6;
+    const lim = @min(assets.len, max_items);
+    for (assets[0..lim], 0..) |asset, i| {
+        if (i != 0) try out.appendSlice(alloc, ", ");
+        try out.appendSlice(alloc, asset.name);
+    }
+    if (assets.len > lim) try out.appendSlice(alloc, ", ...");
+    return out.toOwnedSlice(alloc);
+}
+
+fn sanitizeSnippetAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const lim = @min(raw.len, body_snip_limit);
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    for (raw[0..lim]) |b| {
+        if (b >= 0x20 and b <= 0x7e) {
+            try out.append(alloc, b);
+        } else if (b == '\n' or b == '\r' or b == '\t') {
+            try out.append(alloc, ' ');
+        } else {
+            try out.append(alloc, '.');
+        }
+    }
+    if (out.items.len == 0) try out.appendSlice(alloc, "<empty>");
+    if (raw.len > lim) try out.appendSlice(alloc, "...");
+    return out.toOwnedSlice(alloc);
+}
+
+fn statusHint(status: u16) []const u8 {
+    return switch (status) {
+        401 => "GitHub rejected the request as unauthorized.",
+        403 => "GitHub denied the request (possibly rate-limited or blocked).",
+        404 => "Release endpoint not found.",
+        429 => "GitHub rate limit exceeded. Retry later.",
+        500...599 => "GitHub returned a server error. Retry shortly.",
+        else => "GitHub returned an unexpected response.",
+    };
+}
+
+fn formatTransportFailure(
+    alloc: std.mem.Allocator,
+    step: []const u8,
+    url: []const u8,
+    err: anyerror,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        alloc,
+        "upgrade failed: could not {s}\nreason: {s}\nurl: {s}\nnext: check network/DNS/firewall/proxy settings and retry\n",
+        .{ step, @errorName(err), url },
+    );
+}
+
+fn formatHttpFailure(
+    alloc: std.mem.Allocator,
+    step: []const u8,
+    url: []const u8,
+    status: u16,
+    body: []const u8,
+) ![]u8 {
+    const snip = try sanitizeSnippetAlloc(alloc, body);
+    defer alloc.free(snip);
+    return std.fmt.allocPrint(
+        alloc,
+        "upgrade failed: could not {s}\nhttp status: {d}\nreason: {s}\nurl: {s}\nresponse: {s}\nnext: retry later or install manually from https://github.com/joelreymont/pz/releases/latest\n",
+        .{ step, status, statusHint(status), url, snip },
+    );
+}
+
+fn formatParseFailure(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    const snip = try sanitizeSnippetAlloc(alloc, body);
+    defer alloc.free(snip);
+    return std.fmt.allocPrint(
+        alloc,
+        "upgrade failed: release metadata could not be parsed\nresponse: {s}\nnext: retry later or install manually from https://github.com/joelreymont/pz/releases/latest\n",
+        .{snip},
+    );
+}
+
+fn formatExtractFailure(alloc: std.mem.Allocator, err: anyerror, asset_name: []const u8) ![]u8 {
+    if (err == error.ArchiveMissingBinary) {
+        return std.fmt.allocPrint(
+            alloc,
+            "upgrade failed: downloaded archive {s} did not contain a pz binary\nnext: retry later or install manually from https://github.com/joelreymont/pz/releases/latest\n",
+            .{asset_name},
+        );
+    }
+    return std.fmt.allocPrint(
+        alloc,
+        "upgrade failed: could not unpack archive {s}\nreason: {s}\nnext: retry later or install manually from https://github.com/joelreymont/pz/releases/latest\n",
+        .{ asset_name, @errorName(err) },
+    );
+}
+
+fn formatInstallFailure(alloc: std.mem.Allocator, err: anyerror, exe_path: []const u8) ![]u8 {
+    return switch (err) {
+        error.AccessDenied => std.fmt.allocPrint(
+            alloc,
+            "upgrade failed: permission denied while replacing {s}\nnext: run with permissions that can write this path or reinstall manually\n",
+            .{exe_path},
+        ),
+        else => std.fmt.allocPrint(
+            alloc,
+            "upgrade failed: could not replace {s}\nreason: {s}\nnext: retry or reinstall manually\n",
+            .{ exe_path, @errorName(err) },
+        ),
+    };
 }
 
 fn targetAssetName() ?[]const u8 {
@@ -351,4 +607,26 @@ test "installBinary atomically replaces executable bytes" {
 
 test "installBinary rejects non-path executable" {
     try std.testing.expectError(error.InvalidExecutablePath, installBinary(std.testing.allocator, "pz", "x"));
+}
+
+test "sanitizeSnippetAlloc normalizes binary text and truncates" {
+    const raw = "ok\x00\x01\nline";
+    const snip = try sanitizeSnippetAlloc(std.testing.allocator, raw);
+    defer std.testing.allocator.free(snip);
+    try std.testing.expect(std.mem.indexOf(u8, snip, "ok") != null);
+    try std.testing.expect(std.mem.indexOf(u8, snip, "..") != null);
+}
+
+test "formatHttpFailure includes actionable fields" {
+    const msg = try formatHttpFailure(
+        std.testing.allocator,
+        "fetch latest release metadata",
+        release_latest_url,
+        403,
+        "{\"message\":\"API rate limit exceeded\"}",
+    );
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "http status: 403") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "rate-limited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "response: ") != null);
 }

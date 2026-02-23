@@ -2,6 +2,24 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.4] - 2026-02-23
+
+### Added
+- Shared user-facing error reporter for CLI, TUI, and RPC command paths with actionable `reason` and `next` guidance.
+
+### Changed
+- `--upgrade`/`/upgrade` now return structured outcomes and detailed diagnostics (operation, transport/http cause, response snippet, and recovery guidance) instead of opaque error codes.
+- Resume-session overlay flow is now centralized so both startup and interactive `/resume` paths use the same picker behavior.
+
+### Fixed
+- Command and RPC failures no longer surface raw internal error names by default in user-facing output.
+- Improved tool-value validation hint to show accepted tool names directly in the message.
+
+### Tests
+- Added update diagnostics tests for HTTP-failure message formatting and response-sanitization behavior.
+- Added session-restore UX tests covering resume overlay listing, ordering, and up/down arrow wrap navigation.
+- Added explicit runtime parity test for `-r` (resume latest session) behavior.
+
 ## [0.1.3] - 2026-02-23
 
 ### Changed

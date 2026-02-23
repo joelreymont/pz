@@ -3,6 +3,7 @@ const std = @import("std");
 const cli = @import("cli.zig");
 const bg = @import("bg.zig");
 const changelog = @import("changelog.zig");
+const report = @import("report.zig");
 const update_mod = @import("update.zig");
 const version_check = @import("version.zig");
 const config = @import("config.zig");
@@ -1123,13 +1124,7 @@ fn runTui(
             ui.ov = tui_overlay.Overlay.init(models_list, cur_idx);
         }
         if (cmd == .select_session) {
-            if (session_dir_path) |sdp| {
-                if (listSessionSids(alloc, sdp)) |sids| {
-                    if (sids.len > 0) {
-                        ui.ov = tui_overlay.Overlay.initDyn(alloc, sids, "Resume Session", .session);
-                    }
-                } else |_| {}
-            }
+            _ = try showResumeOverlay(alloc, &ui, session_dir_path);
         }
         if (cmd == .select_settings) {
             ui.ov = try buildSettingsOverlay(alloc, &ui, auto_compact_on);
@@ -1456,13 +1451,7 @@ fn runTui(
                                 continue;
                             }
                             if (cmd == .select_session) {
-                                if (session_dir_path) |sdp| {
-                                    if (listSessionSids(alloc, sdp)) |sids| {
-                                        if (sids.len > 0) {
-                                            ui.ov = tui_overlay.Overlay.initDyn(alloc, sids, "Resume Session", .session);
-                                        }
-                                    } else |_| {}
-                                }
+                                _ = try showResumeOverlay(alloc, &ui, session_dir_path);
                                 try ui.draw(out);
                                 continue;
                             }
@@ -1640,7 +1629,9 @@ fn runTui(
                                     try ui.ed.setText(txt);
                                 }
                             } else |err| {
-                                const msg = try std.fmt.allocPrint(alloc, "[editor failed: {s}]", .{@errorName(err)});
+                                const detail = try report.inlineMsg(alloc, err);
+                                defer alloc.free(detail);
+                                const msg = try std.fmt.allocPrint(alloc, "[editor failed: {s}]", .{detail});
                                 defer alloc.free(msg);
                                 try ui.tr.infoText(msg);
                             }
@@ -1916,7 +1907,7 @@ fn runRpc(
         }) catch {
             try writeJsonLine(alloc, out, .{
                 .type = "rpc_error",
-                .msg = "invalid_json",
+                .msg = "invalid JSON request payload",
             });
             continue;
         };
@@ -1927,7 +1918,7 @@ fn runRpc(
             try writeJsonLine(alloc, out, .{
                 .type = "rpc_error",
                 .id = req.id,
-                .msg = "missing_cmd",
+                .msg = "missing command field (cmd or type)",
             });
             continue;
         }
@@ -1958,7 +1949,7 @@ fn runRpc(
                 .type = "rpc_error",
                 .id = req.id,
                 .cmd = raw_cmd,
-                .msg = "unknown_cmd",
+                .msg = "unknown command; run rpc help or rpc commands",
             });
             continue;
         };
@@ -1971,7 +1962,7 @@ fn runRpc(
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = "missing_text",
+                        .msg = "missing prompt text",
                     });
                     continue;
                 }
@@ -2007,7 +1998,7 @@ fn runRpc(
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = "missing_model",
+                        .msg = "missing model value",
                     });
                     continue;
                 }
@@ -2030,7 +2021,7 @@ fn runRpc(
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = "missing_provider",
+                        .msg = "missing provider value",
                     });
                     continue;
                 }
@@ -2053,7 +2044,7 @@ fn runRpc(
                             .type = "rpc_error",
                             .id = req.id,
                             .cmd = raw_cmd,
-                            .msg = "invalid_tools",
+                            .msg = "invalid tools value",
                         });
                         continue;
                     };
@@ -2080,22 +2071,33 @@ fn runRpc(
                 });
             },
             .upgrade => {
-                const msg = update_mod.run(alloc) catch |err| {
+                const outcome = update_mod.runOutcome(alloc) catch |err| {
+                    const err_msg = try report.rpc(alloc, "upgrade", err);
+                    defer alloc.free(err_msg);
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = @errorName(err),
+                        .msg = err_msg,
                     });
                     continue;
                 };
-                defer alloc.free(msg);
-                try writeJsonLine(alloc, out, .{
-                    .type = "rpc_upgrade",
-                    .id = req.id,
-                    .cmd = raw_cmd,
-                    .msg = msg,
-                });
+                defer outcome.deinit(alloc);
+                if (outcome.ok) {
+                    try writeJsonLine(alloc, out, .{
+                        .type = "rpc_upgrade",
+                        .id = req.id,
+                        .cmd = raw_cmd,
+                        .msg = outcome.msg,
+                    });
+                } else {
+                    try writeJsonLine(alloc, out, .{
+                        .type = "rpc_error",
+                        .id = req.id,
+                        .cmd = raw_cmd,
+                        .msg = outcome.msg,
+                    });
+                }
             },
             .new => {
                 const next_sid = try newSid(alloc);
@@ -2111,11 +2113,13 @@ fn runRpc(
             .@"resume" => {
                 const token = req.session_path orelse req.session orelse req.sid orelse req.arg;
                 applyResumeSid(alloc, sid, session_dir_path, no_session, token) catch |err| {
+                    const err_msg = try report.rpc(alloc, "resume session", err);
+                    defer alloc.free(err_msg);
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = if (err == error.SessionDisabled) "session_disabled" else @errorName(err),
+                        .msg = err_msg,
                     });
                     continue;
                 };
@@ -2147,11 +2151,13 @@ fn runRpc(
             },
             .tree => {
                 const session_dir = requireSessionDir(session_dir_path, no_session) catch {
+                    const err_msg = try report.rpc(alloc, "list sessions", error.SessionDisabled);
+                    defer alloc.free(err_msg);
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = "session_disabled",
+                        .msg = err_msg,
                     });
                     continue;
                 };
@@ -2165,11 +2171,13 @@ fn runRpc(
             },
             .fork => {
                 applyForkSid(alloc, sid, session_dir_path, no_session, req.sid orelse req.arg) catch |err| {
+                    const err_msg = try report.rpc(alloc, "fork session", err);
+                    defer alloc.free(err_msg);
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = if (err == error.SessionDisabled) "session_disabled" else @errorName(err),
+                        .msg = err_msg,
                     });
                     continue;
                 };
@@ -2182,11 +2190,13 @@ fn runRpc(
             },
             .compact => {
                 const session_dir = requireSessionDir(session_dir_path, no_session) catch {
+                    const err_msg = try report.rpc(alloc, "compact session", error.SessionDisabled);
+                    defer alloc.free(err_msg);
                     try writeJsonLine(alloc, out, .{
                         .type = "rpc_error",
                         .id = req.id,
                         .cmd = raw_cmd,
-                        .msg = "session_disabled",
+                        .msg = err_msg,
                     });
                     continue;
                 };
@@ -2375,7 +2385,7 @@ fn handleSlashCommand(
         .tools => {
             if (arg.len != 0) {
                 const mask = parseCmdToolMask(arg) catch {
-                    try out.writeAll("error: invalid tools value\n");
+                    try out.writeAll("error: invalid tools value; use all, none, or comma list of read,write,bash,edit,grep,find,ls,ask\n");
                     return .handled;
                 };
                 tools_rt.tool_mask = mask;
@@ -2406,12 +2416,9 @@ fn handleSlashCommand(
             try out.writeAll(bg_out);
         },
         .upgrade => {
-            const msg = update_mod.run(alloc) catch |err| {
-                try writeTextLine(alloc, out, "upgrade failed: {s}\n", .{@errorName(err)});
-                return .handled;
-            };
-            defer alloc.free(msg);
-            try out.writeAll(msg);
+            const outcome = try update_mod.runOutcome(alloc);
+            defer outcome.deinit(alloc);
+            try out.writeAll(outcome.msg);
         },
         .new => {
             const next_sid = try newSid(alloc);
@@ -2422,18 +2429,18 @@ fn handleSlashCommand(
         .@"resume" => {
             if (arg.len == 0) return .select_session;
             applyResumeSid(alloc, sid, session_dir_path, no_session, arg) catch |err| {
-                if (err == error.SessionDisabled) {
-                    try out.writeAll("error: session disabled\n");
-                    return .handled;
-                }
-                try writeTextLine(alloc, out, "error: resume failed ({s})\n", .{@errorName(err)});
+                const em = try report.cli(alloc, "resume session", err);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             try writeTextLine(alloc, out, "resumed session {s}\n", .{sid.*});
         },
         .tree => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
-                try out.writeAll("error: session disabled\n");
+                const em = try report.cli(alloc, "list sessions", error.SessionDisabled);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             const tree = try listSessionsAlloc(alloc, session_dir);
@@ -2444,18 +2451,18 @@ fn handleSlashCommand(
         .fork => {
             if (arg.len == 0) return .select_fork;
             applyForkSid(alloc, sid, session_dir_path, no_session, arg) catch |err| {
-                if (err == error.SessionDisabled) {
-                    try out.writeAll("error: session disabled\n");
-                    return .handled;
-                }
-                try writeTextLine(alloc, out, "error: fork failed ({s})\n", .{@errorName(err)});
+                const em = try report.cli(alloc, "fork session", err);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             try writeTextLine(alloc, out, "forked session {s}\n", .{sid.*});
         },
         .compact => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
-                try out.writeAll("error: session disabled\n");
+                const em = try report.cli(alloc, "compact session", error.SessionDisabled);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             var dir = try std.fs.cwd().openDir(session_dir, .{});
@@ -2465,14 +2472,18 @@ fn handleSlashCommand(
         },
         .@"export" => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
-                try out.writeAll("error: session disabled\n");
+                const em = try report.cli(alloc, "export session", error.SessionDisabled);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             var dir = try std.fs.cwd().openDir(session_dir, .{});
             defer dir.close();
             const out_path = if (arg.len > 0) arg else null;
             const path = core.session.exportMarkdown(alloc, dir, sid.*, out_path) catch |err| {
-                try writeTextLine(alloc, out, "export failed: {s}\n", .{@errorName(err)});
+                const em = try report.cli(alloc, "export session", err);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             defer alloc.free(path);
@@ -2531,7 +2542,9 @@ fn handleSlashCommand(
             if (!no_session and session_dir_path != null) {
                 try writeTextLine(alloc, out, "session named: {s}\n", .{arg});
             } else {
-                try out.writeAll("error: session disabled\n");
+                const em = try report.cli(alloc, "name session", error.SessionDisabled);
+                defer alloc.free(em);
+                try out.writeAll(em);
             }
         },
         .login => {
@@ -2564,18 +2577,24 @@ fn handleSlashCommand(
         .reload => return .reload,
         .share => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
-                try out.writeAll("error: session disabled\n");
+                const em = try report.cli(alloc, "share session", error.SessionDisabled);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             var dir = try std.fs.cwd().openDir(session_dir, .{});
             defer dir.close();
             const md_path = core.session.exportMarkdown(alloc, dir, sid.*, null) catch |err| {
-                try writeTextLine(alloc, out, "export failed: {s}\n", .{@errorName(err)});
+                const em = try report.cli(alloc, "share session", err);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             defer alloc.free(md_path);
             const gist_url = shareGist(alloc, md_path) catch |err| {
-                try writeTextLine(alloc, out, "gist failed: {s}\n", .{@errorName(err)});
+                const em = try report.cli(alloc, "publish gist", err);
+                defer alloc.free(em);
+                try out.writeAll(em);
                 return .handled;
             };
             defer alloc.free(gist_url);
@@ -3752,7 +3771,9 @@ fn autoCompact(
     defer dir.close();
     const now = std.time.milliTimestamp();
     _ = core.session.compactSession(alloc, dir, sid, now) catch |err| {
-        const msg = try std.fmt.allocPrint(alloc, "[auto-compact failed: {s}]", .{@errorName(err)});
+        const detail = try report.inlineMsg(alloc, err);
+        defer alloc.free(detail);
+        const msg = try std.fmt.allocPrint(alloc, "[auto-compact failed: {s}]", .{detail});
         defer alloc.free(msg);
         try ui.tr.infoText(msg);
         return;
@@ -3775,6 +3796,17 @@ fn queueFollowup(
     const queued = try alloc.dupe(u8, text);
     errdefer alloc.free(queued);
     try queue.append(alloc, queued);
+}
+
+fn showResumeOverlay(alloc: std.mem.Allocator, ui: *tui_harness.Ui, session_dir_path: ?[]const u8) !bool {
+    const sdp = session_dir_path orelse return false;
+    const sids = listSessionSids(alloc, sdp) catch return false;
+    if (sids.len == 0) {
+        alloc.free(sids);
+        return false;
+    }
+    ui.ov = tui_overlay.Overlay.initDyn(alloc, sids, "Resume Session", .session);
+    return true;
 }
 
 fn shouldQueueSubmit(text: []const u8) bool {
@@ -3892,7 +3924,9 @@ fn runBashMode(
         .argv = &.{ "/bin/bash", "-lc", bcmd.cmd },
         .max_output_bytes = 256 * 1024,
     }) catch |err| {
-        const msg = try std.fmt.allocPrint(alloc, "bash error: {s}", .{@errorName(err)});
+        const detail = try report.inlineMsg(alloc, err);
+        defer alloc.free(detail);
+        const msg = try std.fmt.allocPrint(alloc, "bash error: {s}", .{detail});
         defer alloc.free(msg);
         try ui.tr.append(.{ .err = msg });
         return;
@@ -4342,6 +4376,61 @@ test "showQueueOverlay and dequeueQueuedIntoEditor edit selected message" {
     ui.ov = null;
 }
 
+test "showResumeOverlay lists sessions and supports arrow navigation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("sess");
+    try tmp.dir.writeFile(.{
+        .sub_path = "sess/200.jsonl",
+        .data = "",
+    });
+    try tmp.dir.writeFile(.{
+        .sub_path = "sess/100.jsonl",
+        .data = "",
+    });
+
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
+    defer ui.deinit();
+
+    try std.testing.expect(try showResumeOverlay(std.testing.allocator, &ui, sess_abs));
+    try std.testing.expect(ui.ov != null);
+    try std.testing.expect(ui.ov.?.kind == .session);
+    try std.testing.expectEqualStrings("Resume Session", ui.ov.?.title);
+    try std.testing.expect(ui.ov.?.dyn_items != null);
+    const items = ui.ov.?.dyn_items.?;
+    try std.testing.expectEqual(@as(usize, 2), items.len);
+    try std.testing.expectEqualStrings("100", items[0]);
+    try std.testing.expectEqualStrings("200", items[1]);
+
+    try std.testing.expectEqualStrings("100", ui.ov.?.selected().?);
+    ui.ov.?.down();
+    try std.testing.expectEqualStrings("200", ui.ov.?.selected().?);
+    ui.ov.?.down();
+    try std.testing.expectEqualStrings("100", ui.ov.?.selected().?);
+    ui.ov.?.up();
+    try std.testing.expectEqualStrings("200", ui.ov.?.selected().?);
+
+    ui.ov.?.deinit(std.testing.allocator);
+    ui.ov = null;
+}
+
+test "showResumeOverlay returns false when no sessions exist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.makePath("sess");
+    const sess_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
+    defer ui.deinit();
+
+    try std.testing.expect(!(try showResumeOverlay(std.testing.allocator, &ui, sess_abs)));
+    try std.testing.expect(ui.ov == null);
+}
+
 test "syncInputFooter tracks mode and clamps queue size" {
     var ui = try tui_harness.Ui.init(std.testing.allocator, 60, 10, "m", "p");
     defer ui.deinit();
@@ -4700,7 +4789,7 @@ test "runtime tui rejects blank-only stdin input" {
     );
 }
 
-test "runtime continue reuses latest session id and appends new turn" {
+fn expectLatestSessionReused(session_sel: anytype) !void {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -4734,7 +4823,7 @@ test "runtime continue reuses latest session id and appends new turn" {
     var cfg = cli.Run{
         .mode = .print,
         .prompt = "new-turn",
-        .session = .cont,
+        .session = session_sel,
         .cfg = .{
             .mode = .print,
             .model = try std.testing.allocator.dupe(u8, "m"),
@@ -4772,6 +4861,14 @@ test "runtime continue reuses latest session id and appends new turn" {
         }
     }
     try std.testing.expect(saw_new);
+}
+
+test "runtime continue reuses latest session id and appends new turn" {
+    try expectLatestSessionReused(.cont);
+}
+
+test "runtime resume (-r) reuses latest session id and appends new turn" {
+    try expectLatestSessionReused(.resm);
 }
 
 test "runtime explicit session path resumes that session id" {
