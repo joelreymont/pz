@@ -12,6 +12,7 @@ pub const Env = struct {
     provider: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     mode: ?[]const u8 = null,
+    theme: ?[]const u8 = null,
     provider_cmd: ?[]const u8 = null,
     home: ?[]const u8 = null,
 
@@ -21,6 +22,7 @@ pub const Env = struct {
             .provider = dupEnvAlias(alloc, "PZ_PROVIDER", "PI_PROVIDER"),
             .session_dir = dupEnvAlias(alloc, "PZ_SESSION_DIR", "PI_SESSION_DIR"),
             .mode = dupEnvAlias(alloc, "PZ_MODE", "PI_MODE"),
+            .theme = dupEnvAlias(alloc, "PZ_THEME", "PI_THEME"),
             .provider_cmd = dupEnvAlias(alloc, "PZ_PROVIDER_CMD", "PI_PROVIDER_CMD"),
             .home = dupEnv(alloc, "HOME"),
         };
@@ -31,6 +33,7 @@ pub const Env = struct {
         if (self.provider) |v| alloc.free(v);
         if (self.session_dir) |v| alloc.free(v);
         if (self.mode) |v| alloc.free(v);
+        if (self.theme) |v| alloc.free(v);
         if (self.provider_cmd) |v| alloc.free(v);
         if (self.home) |v| alloc.free(v);
         self.* = undefined;
@@ -42,6 +45,7 @@ pub const Config = struct {
     model: []u8,
     provider: []u8,
     session_dir: []u8,
+    theme: ?[]u8 = null,
     provider_cmd: ?[]u8 = null,
     enabled_models: ?[][]u8 = null, // model cycle list
 
@@ -49,6 +53,7 @@ pub const Config = struct {
         alloc.free(self.model);
         alloc.free(self.provider);
         alloc.free(self.session_dir);
+        if (self.theme) |v| alloc.free(v);
         if (self.provider_cmd) |v| alloc.free(v);
         if (self.enabled_models) |models| {
             for (models) |m| alloc.free(m);
@@ -133,6 +138,7 @@ pub fn discover(
             file_cfg.value.provider,
             file_cfg.value.session_dir,
             file_cfg.value.mode,
+            file_cfg.value.theme,
             file_cfg.value.provider_cmd,
             error.InvalidFileMode,
         );
@@ -149,6 +155,7 @@ pub fn discover(
         env.provider,
         env.session_dir,
         env.mode,
+        env.theme,
         env.provider_cmd,
         error.InvalidEnvMode,
     );
@@ -166,6 +173,7 @@ pub fn discover(
         parsed.model,
         parsed.provider,
         parsed.session_dir,
+        null,
         null,
         parsed.provider_cmd,
         error.InvalidMode,
@@ -185,6 +193,7 @@ const FileCfg = struct {
     provider: ?[]const u8 = null,
     session_dir: ?[]const u8 = null,
     mode: ?[]const u8 = null,
+    theme: ?[]const u8 = null,
     provider_cmd: ?[]const u8 = null,
 };
 
@@ -199,6 +208,7 @@ const PiFileCfg = struct {
     session_dir: ?[]const u8 = null,
     defaultMode: ?[]const u8 = null,
     mode: ?[]const u8 = null,
+    theme: ?[]const u8 = null,
     providerCommand: ?[]const u8 = null,
     provider_cmd: ?[]const u8 = null,
 };
@@ -253,6 +263,7 @@ fn applyPiCfg(alloc: std.mem.Allocator, cfg: *Config, pi: PiFileCfg) Err!void {
         pick(pi.provider, pi.defaultProvider),
         pick(pi.session_dir, pi.sessionDir),
         pick(pi.mode, pi.defaultMode),
+        pi.theme,
         pick(pi.provider_cmd, pi.providerCommand),
         error.InvalidPiMode,
     );
@@ -271,6 +282,7 @@ fn applyRawCfg(
     provider: ?[]const u8,
     session_dir: ?[]const u8,
     mode: ?[]const u8,
+    theme: ?[]const u8,
     provider_cmd: ?[]const u8,
     comptime invalid_mode: anytype,
 ) Err!void {
@@ -278,6 +290,7 @@ fn applyRawCfg(
     if (provider) |v| try replaceStr(alloc, &out.provider, v);
     if (session_dir) |v| try replaceStr(alloc, &out.session_dir, v);
     if (mode) |v| out.mode = try parseMode(v, invalid_mode);
+    if (theme) |v| try replaceOptStr(alloc, &out.theme, v);
     if (provider_cmd) |v| try replaceOptStr(alloc, &out.provider_cmd, v);
 }
 
@@ -392,6 +405,7 @@ test "config uses defaults when no sources are present" {
     try std.testing.expectEqualStrings(model_default, cfg.model);
     try std.testing.expectEqualStrings(provider_default, cfg.provider);
     try std.testing.expectEqualStrings(session_dir_default, cfg.session_dir);
+    try std.testing.expect(cfg.theme == null);
     try std.testing.expect(cfg.provider_cmd == null);
 }
 
@@ -401,7 +415,7 @@ test "config precedence is file then env then flags" {
 
     try tmp.dir.writeFile(.{
         .sub_path = auto_cfg_path,
-        .data = "{\"mode\":\"print\",\"model\":\"file-model\",\"session_dir\":\"file-sessions\",\"provider_cmd\":\"file-cmd\"}",
+        .data = "{\"mode\":\"print\",\"model\":\"file-model\",\"session_dir\":\"file-sessions\",\"theme\":\"light\",\"provider_cmd\":\"file-cmd\"}",
     });
 
     const parsed = try args.parse(&.{ "--tui", "--model", "flag-model", "--provider-cmd", "flag-cmd" });
@@ -410,6 +424,7 @@ test "config precedence is file then env then flags" {
         .provider = "env-provider",
         .session_dir = "env-sessions",
         .mode = "print",
+        .theme = "dark",
         .provider_cmd = "env-cmd",
     });
     defer cfg.deinit(std.testing.allocator);
@@ -418,6 +433,8 @@ test "config precedence is file then env then flags" {
     try std.testing.expectEqualStrings("flag-model", cfg.model);
     try std.testing.expectEqualStrings("env-provider", cfg.provider);
     try std.testing.expectEqualStrings("env-sessions", cfg.session_dir);
+    try std.testing.expect(cfg.theme != null);
+    try std.testing.expectEqualStrings("dark", cfg.theme.?);
     try std.testing.expect(cfg.provider_cmd != null);
     try std.testing.expectEqualStrings("flag-cmd", cfg.provider_cmd.?);
 }
@@ -438,6 +455,7 @@ test "config no-config bypasses file source" {
     try std.testing.expect(cfg.mode == .tui);
     try std.testing.expectEqualStrings(model_default, cfg.model);
     try std.testing.expectEqualStrings(provider_default, cfg.provider);
+    try std.testing.expect(cfg.theme == null);
     try std.testing.expect(cfg.provider_cmd == null);
 }
 
@@ -447,7 +465,7 @@ test "config explicit path loads file" {
 
     try tmp.dir.writeFile(.{
         .sub_path = "custom.json",
-        .data = "{\"mode\":\"print\",\"model\":\"m\",\"session_dir\":\"s\",\"provider_cmd\":\"cmd\"}",
+        .data = "{\"mode\":\"print\",\"model\":\"m\",\"session_dir\":\"s\",\"theme\":\"light\",\"provider_cmd\":\"cmd\"}",
     });
 
     const parsed = try args.parse(&.{ "--config", "custom.json" });
@@ -458,6 +476,8 @@ test "config explicit path loads file" {
     try std.testing.expectEqualStrings("m", cfg.model);
     try std.testing.expectEqualStrings(provider_default, cfg.provider);
     try std.testing.expectEqualStrings("s", cfg.session_dir);
+    try std.testing.expect(cfg.theme != null);
+    try std.testing.expectEqualStrings("light", cfg.theme.?);
     try std.testing.expect(cfg.provider_cmd != null);
     try std.testing.expectEqualStrings("cmd", cfg.provider_cmd.?);
 }
@@ -513,6 +533,7 @@ test "config auto imports pi settings from home" {
         \\  "defaultProvider":"anthropic",
         \\  "sessionDir":"/tmp/pi-sessions",
         \\  "defaultMode":"interactive",
+        \\  "theme":"light",
         \\  "providerCommand":"pi-provider-cmd"
         \\}
         ,
@@ -531,6 +552,8 @@ test "config auto imports pi settings from home" {
     try std.testing.expectEqualStrings("pi-model", cfg.model);
     try std.testing.expectEqualStrings("anthropic", cfg.provider);
     try std.testing.expectEqualStrings("/tmp/pi-sessions", cfg.session_dir);
+    try std.testing.expect(cfg.theme != null);
+    try std.testing.expectEqualStrings("light", cfg.theme.?);
     try std.testing.expect(cfg.provider_cmd != null);
     try std.testing.expectEqualStrings("pi-provider-cmd", cfg.provider_cmd.?);
 }
@@ -548,13 +571,14 @@ test "config local auto file overrides pi settings" {
         \\  "defaultProvider":"pi-provider",
         \\  "sessionDir":"pi-sessions",
         \\  "defaultMode":"json",
+        \\  "theme":"dark",
         \\  "providerCommand":"pi-cmd"
         \\}
         ,
     });
     try tmp.dir.writeFile(.{
         .sub_path = auto_cfg_path,
-        .data = "{\"mode\":\"print\",\"model\":\"local-model\",\"provider\":\"local-provider\",\"session_dir\":\"local-sessions\",\"provider_cmd\":\"local-cmd\"}",
+        .data = "{\"mode\":\"print\",\"model\":\"local-model\",\"provider\":\"local-provider\",\"session_dir\":\"local-sessions\",\"theme\":\"light\",\"provider_cmd\":\"local-cmd\"}",
     });
 
     const home_abs = try tmp.dir.realpathAlloc(std.testing.allocator, "home");
@@ -570,6 +594,8 @@ test "config local auto file overrides pi settings" {
     try std.testing.expectEqualStrings("local-model", cfg.model);
     try std.testing.expectEqualStrings("local-provider", cfg.provider);
     try std.testing.expectEqualStrings("local-sessions", cfg.session_dir);
+    try std.testing.expect(cfg.theme != null);
+    try std.testing.expectEqualStrings("light", cfg.theme.?);
     try std.testing.expect(cfg.provider_cmd != null);
     try std.testing.expectEqualStrings("local-cmd", cfg.provider_cmd.?);
 }

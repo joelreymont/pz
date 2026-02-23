@@ -58,6 +58,7 @@ pub const Panels = struct {
     ctx_limit: u64 = 0,
     run_state: RunState = .idle,
     turns: u32 = 0,
+    compaction_until_ms: i64 = 0,
     bg_launched: u32 = 0,
     bg_running: u32 = 0,
     bg_done: u32 = 0,
@@ -73,6 +74,7 @@ pub const Panels = struct {
         InvalidUtf8,
         NoSpaceLeft,
     };
+    pub const compaction_indicator_ms: i64 = 2500;
 
     pub fn init(alloc: std.mem.Allocator, model: []const u8, provider: []const u8) InitError!Panels {
         return initFull(alloc, model, provider, "", "");
@@ -148,6 +150,23 @@ pub const Panels = struct {
         self.bg_spin +%= 1;
     }
 
+    pub fn noteCompaction(self: *Panels) void {
+        self.noteCompactionAt(std.time.milliTimestamp());
+    }
+
+    pub fn compactionActive(self: *Panels, now_ms: i64) bool {
+        if (self.compaction_until_ms == 0) return false;
+        if (now_ms >= self.compaction_until_ms) {
+            self.compaction_until_ms = 0;
+            return false;
+        }
+        return true;
+    }
+
+    fn noteCompactionAt(self: *Panels, now_ms: i64) void {
+        self.compaction_until_ms = now_ms + compaction_indicator_ms;
+    }
+
     pub fn count(self: *const Panels) usize {
         return self.rows.items.len;
     }
@@ -199,7 +218,7 @@ pub const Panels = struct {
 
     /// Render footer matching pi layout:
     ///   Line 1: dim(cwd (branch))
-    ///   Line 2: dim(↑turns ↓tok R1.2k W3.4k $0.05 (sub) 2.9%/200k (auto))  dim((prov) model • thinking)
+    ///   Line 2: dim(Rin Wout CRcw CWcw $0.05 (sub) 2.9%/200k)  dim(model • thinking)
     pub fn renderFooter(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
         if (rect.w == 0 or rect.h == 0) return;
 
@@ -249,60 +268,27 @@ pub const Panels = struct {
             var x = rect.x;
 
             // Left: turn count + usage stats
-            try writePart(frm, &x, x_end, y2, "mode ", dim_st);
-            try writePart(frm, &x, x_end, y2, inputModeText(self.input_mode), dim_st);
-            try writePart(frm, &x, x_end, y2, " q", dim_st);
-            var qbuf: [16]u8 = undefined;
-            const qtxt = fmtBuf(&qbuf, "{d}", .{self.queued_msgs}) catch return error.NoSpaceLeft;
-            try writePart(frm, &x, x_end, y2, qtxt, dim_st);
-            try writePart(frm, &x, x_end, y2, " ", dim_st);
 
-            if (self.bg_launched > 0) {
-                try writePart(frm, &x, x_end, y2, "bg L", dim_st);
-                var lbuf: [16]u8 = undefined;
-                const ltxt = fmtBuf(&lbuf, "{d}", .{self.bg_launched}) catch return error.NoSpaceLeft;
-                try writePart(frm, &x, x_end, y2, ltxt, dim_st);
-                try writePart(frm, &x, x_end, y2, " R", dim_st);
-                var rbuf: [16]u8 = undefined;
-                const rtxt = fmtBuf(&rbuf, "{d}", .{self.bg_running}) catch return error.NoSpaceLeft;
-                try writePart(frm, &x, x_end, y2, rtxt, dim_st);
-                try writePart(frm, &x, x_end, y2, " D", dim_st);
-                var dbuf: [16]u8 = undefined;
-                const dtxt = fmtBuf(&dbuf, "{d}", .{self.bg_done}) catch return error.NoSpaceLeft;
-                try writePart(frm, &x, x_end, y2, dtxt, dim_st);
-                if (self.bg_running > 0) {
-                    var sbuf: [4]u8 = undefined;
-                    try writePart(frm, &x, x_end, y2, " ", dim_st);
-                    try writePart(frm, &x, x_end, y2, spinner.utf8(self.bg_spin, &sbuf), dim_st);
-                }
-                try writePart(frm, &x, x_end, y2, " ", dim_st);
-            }
-            if (self.turns > 0) {
-                var tb: [16]u8 = undefined;
-                const tt = fmtBuf(&tb, "{d}", .{self.turns}) catch return error.NoSpaceLeft;
-                try writePart(frm, &x, x_end, y2, tt, dim_st);
-                try writePart(frm, &x, x_end, y2, if (self.turns == 1) " turn " else " turns ", dim_st);
-            }
             if (self.has_usage) {
-                try writePart(frm, &x, x_end, y2, "\xe2\x86\x91", dim_st); // ↑
+                try writePart(frm, &x, x_end, y2, "\xe2\x86\x93", dim_st); // ↓
                 var ib: [16]u8 = undefined;
                 const it = fmtCompact(&ib, self.usage.in_tok) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, it, dim_st);
 
-                try writePart(frm, &x, x_end, y2, " \xe2\x86\x93", dim_st); // ↓
+                try writePart(frm, &x, x_end, y2, " \xe2\x86\x91", dim_st); // ↑
                 var ob: [16]u8 = undefined;
                 const ot = fmtCompact(&ob, self.usage.out_tok) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, ot, dim_st);
 
-                // R/W cache tokens
+                // Cache read/write tokens
                 if (self.usage.cache_read > 0) {
-                    try writePart(frm, &x, x_end, y2, " R", dim_st);
+                    try writePart(frm, &x, x_end, y2, " CR", dim_st);
                     var rb: [16]u8 = undefined;
                     const rt = fmtCompact(&rb, self.usage.cache_read) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, rt, dim_st);
                 }
                 if (self.usage.cache_write > 0) {
-                    try writePart(frm, &x, x_end, y2, " W", dim_st);
+                    try writePart(frm, &x, x_end, y2, " CW", dim_st);
                     var wb: [16]u8 = undefined;
                     const wt = fmtCompact(&wb, self.usage.cache_write) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, wt, dim_st);
@@ -333,37 +319,56 @@ pub const Panels = struct {
                     var lb: [16]u8 = undefined;
                     const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, lt, dim_st);
-                    try writePart(frm, &x, x_end, y2, " (auto)", dim_st);
                 }
             } else if (self.ctx_limit > 0) {
-                // No usage yet — show 0.0%/Nk (auto) like pi
+                // No usage yet — show 0.0%/Nk
                 try writePart(frm, &x, x_end, y2, "0.0%", dim_st);
                 var lb: [16]u8 = undefined;
                 const lt = fmtBuf(&lb, "/{d}k", .{self.ctx_limit / 1000}) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, lt, dim_st);
-                try writePart(frm, &x, x_end, y2, " (auto)", dim_st);
             }
 
-            // Right: (prov) model • thinking-level
+            if (self.bg_launched > 0) {
+                try writePart(frm, &x, x_end, y2, " bg L", dim_st);
+                var lbuf: [16]u8 = undefined;
+                const ltxt = fmtBuf(&lbuf, "{d}", .{self.bg_launched}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, ltxt, dim_st);
+                try writePart(frm, &x, x_end, y2, " R", dim_st);
+                var rbuf: [16]u8 = undefined;
+                const rtxt = fmtBuf(&rbuf, "{d}", .{self.bg_running}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, rtxt, dim_st);
+                try writePart(frm, &x, x_end, y2, " D", dim_st);
+                var dbuf: [16]u8 = undefined;
+                const dtxt = fmtBuf(&dbuf, "{d}", .{self.bg_done}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, dtxt, dim_st);
+                if (self.bg_running > 0) {
+                    var sbuf: [4]u8 = undefined;
+                    try writePart(frm, &x, x_end, y2, " ", dim_st);
+                    try writePart(frm, &x, x_end, y2, spinner.utf8(self.bg_spin, &sbuf), dim_st);
+                }
+            }
+            if (self.turns > 0) {
+                var tb: [16]u8 = undefined;
+                const tt = fmtBuf(&tb, "{d}", .{self.turns}) catch return error.NoSpaceLeft;
+                try writePart(frm, &x, x_end, y2, " ", dim_st);
+                try writePart(frm, &x, x_end, y2, tt, dim_st);
+                try writePart(frm, &x, x_end, y2, if (self.turns == 1) " turn" else " turns", dim_st);
+            }
+
+            // Right: model • thinking-level
             const model_text = self.model.items;
-            const prov_text = self.provider.items;
             if (model_text.len > 0) {
                 var right_cols = cpCountSlice(model_text);
-                if (prov_text.len > 0)
-                    right_cols += cpCountSlice(prov_text) + 3; // "(" + prov + ") "
                 if (self.thinking_label.len > 0)
                     right_cols += 3 + self.thinking_label.len; // " • " + label
                 if (right_cols < rect.w) {
                     var rx = x_end - right_cols;
-                    if (prov_text.len > 0) {
-                        try writePart(frm, &rx, x_end, y2, "(", dim_st);
-                        try writePart(frm, &rx, x_end, y2, prov_text, dim_st);
-                        try writePart(frm, &rx, x_end, y2, ") ", dim_st);
-                    }
-                    try writePart(frm, &rx, x_end, y2, model_text, dim_st);
-                    if (self.thinking_label.len > 0) {
-                        try writePart(frm, &rx, x_end, y2, " \xe2\x80\xa2 ", dim_st); // " • "
-                        try writePart(frm, &rx, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
+                    if (rx > x) {
+                        try writePart(frm, &rx, x_end, y2, model_text, dim_st);
+                        if (self.thinking_label.len > 0) {
+                            try writePart(frm, &rx, x_end, y2, " \xe2\x80\xa2 ", dim_st); // " • "
+                            try writePart(frm, &rx, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
+                        }
                     }
                 }
             }
@@ -498,19 +503,11 @@ fn digitCols(n: u64) usize {
     return c;
 }
 
-fn inputModeText(mode: InputMode) []const u8 {
-    return switch (mode) {
-        .steering => "steering",
-        .queue => "queue",
-    };
-}
-
 fn usageCols(self: *const Panels) usize {
-    // ↑N ↓N = 1+digits + 1 + 1+digits
+    // RN WN = 1+digits + 2 + digits
     var c: usize = 0;
-    c += 1 + digitCols(self.usage.in_tok); // ↑N (↑ is 1 col)
-    c += 1; // space
-    c += 1 + digitCols(self.usage.out_tok); // ↓N
+    c += 1 + digitCols(self.usage.in_tok); // RN
+    c += 2 + digitCols(self.usage.out_tok); // WN (with leading " W")
     if (self.ctx_limit > 0) {
         const pct = self.cum_tok *| 100 / self.ctx_limit;
         c += 1; // space
@@ -789,7 +786,7 @@ test "panels footer keeps branch visible with long path" {
     try std.testing.expect(findAsciiSeq(&frm, 0, "(main)"));
 }
 
-test "panels footer shows initial 0.0% and (auto) with ctx_limit" {
+test "panels footer shows initial 0.0%" {
     var ps = try Panels.initFull(std.testing.allocator, "claude", "anthropic", "~/proj", "");
     defer ps.deinit();
     ps.ctx_limit = 200000;
@@ -799,31 +796,25 @@ test "panels footer shows initial 0.0% and (auto) with ctx_limit" {
 
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    // Line 2 should have "0.0%/200k (auto)" before usage arrives
-    var found_auto = false;
     var buf: [60]u8 = undefined;
     const row = try rowAscii(&frm, 1, buf[0..]);
-    if (std.mem.indexOf(u8, row, "(auto)") != null) found_auto = true;
-    try std.testing.expect(found_auto);
-
-    // Should also have 0.0%
+    // Should have 0.0% and never show the old auto badge in footer.
     try std.testing.expect(std.mem.indexOf(u8, row, "0.0%") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "(auto)") == null);
 }
 
-test "panels footer shows (auto) after usage" {
-    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "~/proj", "");
+test "panels compaction indicator expires" {
+    var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
     defer ps.deinit();
-    ps.ctx_limit = 200000;
 
-    try ps.append(.{ .usage = .{ .in_tok = 100, .out_tok = 50, .tot_tok = 1000 } });
+    const t0 = std.time.milliTimestamp();
+    try std.testing.expect(!ps.compactionActive(t0));
 
-    var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
-    defer frm.deinit(std.testing.allocator);
-
-    try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
-
-    // Search for "(auto)" in frame row 1 (contains non-ASCII ↑↓)
-    try std.testing.expect(findAsciiSeq(&frm, 1, "(auto)"));
+    ps.noteCompactionAt(t0);
+    try std.testing.expect(ps.compactionActive(t0));
+    try std.testing.expect(ps.compactionActive(t0 + Panels.compaction_indicator_ms - 1));
+    try std.testing.expect(!ps.compactionActive(t0 + Panels.compaction_indicator_ms));
+    try std.testing.expect(!ps.compactionActive(t0 + Panels.compaction_indicator_ms + 1));
 }
 
 fn findAsciiSeq(frm: *const frame.Frame, y: usize, needle: []const u8) bool {
@@ -852,6 +843,15 @@ fn firstSpinnerCp(frm: *const frame.Frame, y: usize) ?u21 {
         }
     }
     return null;
+}
+
+fn hasCp(frm: *const frame.Frame, y: usize, needle: u21) bool {
+    var x: usize = 0;
+    while (x < frm.w) : (x += 1) {
+        const c = frm.cell(x, y) catch return false;
+        if (c.cp == needle) return true;
+    }
+    return false;
 }
 
 test "panels validate utf8 model and event fields" {
@@ -945,20 +945,28 @@ test "panels footer shows turn count" {
     try std.testing.expect(findAsciiSeq(&frm, 1, "5 turns"));
 }
 
-test "panels footer shows input mode and queue count" {
+test "panels footer hides input mode and queue count and starts with arrows+counts" {
     var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
     defer ps.deinit();
     ps.setInputStatus(.queue, 3);
+    try ps.append(.{ .usage = .{ .in_tok = 12, .out_tok = 3, .tot_tok = 15 } });
 
     var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
     defer frm.deinit(std.testing.allocator);
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    try std.testing.expect(findAsciiSeq(&frm, 1, "mode queue q3"));
+    const first = try frm.cell(0, 1);
+    try std.testing.expectEqual(@as(u21, 0x2193), first.cp); // ↓ at beginning
+    try std.testing.expect(hasCp(&frm, 1, 0x2191)); // ↑ present
+    try std.testing.expect(findAsciiSeq(&frm, 1, "12"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, "3"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "queue"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "q3"));
 
     ps.setInputStatus(.steering, 0);
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
-    try std.testing.expect(findAsciiSeq(&frm, 1, "mode steering q0"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "steering"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "q0"));
 }
 
 test "panels footer shows background job counts" {

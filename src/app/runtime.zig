@@ -993,7 +993,7 @@ fn runTui(
     defer if (branch.len > 0) alloc.free(branch);
 
     const tsz = tui_term.size(std.posix.STDOUT_FILENO) orelse tui_term.Size{ .w = 80, .h = 24 };
-    var ui = try tui_harness.Ui.initFull(alloc, tsz.w, tsz.h, model, provider_label, cwd_path, branch);
+    var ui = try tui_harness.Ui.initFull(alloc, tsz.w, tsz.h, model, provider_label, cwd_path, branch, run_cmd.cfg.theme);
     defer ui.deinit();
     ui.img_cap = @import("../modes/tui/imgproto.zig").detect();
     ui.pn.ctx_limit = modelCtxWindow(model);
@@ -1142,10 +1142,13 @@ fn runTui(
                 } else |_| {}
             }
         }
-        if (cmd == .handled or cmd == .clear or cmd == .copy or cmd == .cost or cmd == .reload or cmd == .select_model or cmd == .select_session or cmd == .select_settings or cmd == .select_fork) {
+        if (cmd == .compacted) {
+            ui.pn.noteCompaction();
+        }
+        if (cmd == .handled or cmd == .compacted or cmd == .clear or cmd == .copy or cmd == .cost or cmd == .reload or cmd == .select_model or cmd == .select_session or cmd == .select_settings or cmd == .select_fork) {
             const cmd_text = init_cmd_fbs.getWritten();
             if (cmd_text.len > 0) {
-                try ui.tr.infoText(cmd_text);
+                try infoTextSafe(alloc, &ui, cmd_text);
                 ui.tr.scrollToBottom();
             }
             try syncBgFooter(alloc, &ui, &bg_mgr);
@@ -1502,10 +1505,11 @@ fn runTui(
                                 try ui.draw(out);
                                 continue;
                             }
-                            if (cmd == .handled) {
+                            if (cmd == .handled or cmd == .compacted) {
+                                if (cmd == .compacted) ui.pn.noteCompaction();
                                 const cmd_text = cmd_fbs.getWritten();
                                 if (cmd_text.len > 0) {
-                                    try ui.tr.infoText(cmd_text);
+                                    try infoTextSafe(alloc, &ui, cmd_text);
                                     ui.tr.scrollToBottom();
                                 }
                                 try syncBgFooter(alloc, &ui, &bg_mgr);
@@ -1813,7 +1817,8 @@ fn runTui(
                 cmd_ct += 1;
                 continue;
             }
-            if (cmd == .handled) {
+            if (cmd == .handled or cmd == .compacted) {
+                if (cmd == .compacted) ui.pn.noteCompaction();
                 try syncBgFooter(alloc, &ui, &bg_mgr);
                 try ui.setModel(model);
                 try ui.setProvider(provider_label);
@@ -2245,6 +2250,7 @@ fn runRpc(
 const CmdRes = enum {
     unhandled,
     handled,
+    compacted,
     quit,
     clear,
     copy,
@@ -2469,6 +2475,7 @@ fn handleSlashCommand(
             defer dir.close();
             const ck = try core.session.compactSession(alloc, dir, sid.*, std.time.milliTimestamp());
             try writeTextLine(alloc, out, "compacted in={d} out={d}\n", .{ ck.in_lines, ck.out_lines });
+            return .compacted;
         },
         .@"export" => {
             const session_dir = requireSessionDir(session_dir_path, no_session) catch {
@@ -3699,6 +3706,47 @@ fn discoverSkills(alloc: std.mem.Allocator) ![][]u8 {
     return try paths.toOwnedSlice(alloc);
 }
 
+fn infoTextSafe(alloc: std.mem.Allocator, ui: *tui_harness.Ui, text: []const u8) !void {
+    ui.tr.infoText(text) catch |err| switch (err) {
+        error.InvalidUtf8 => {
+            const safe = try sanitizeUtf8LossyAlloc(alloc, text);
+            defer alloc.free(safe);
+            try ui.tr.infoText(safe);
+        },
+        else => return err,
+    };
+}
+
+fn sanitizeUtf8LossyAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    if (std.unicode.Utf8View.init(raw)) |_| {
+        return alloc.dupe(u8, raw);
+    } else |_| {}
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+
+    var i: usize = 0;
+    while (i < raw.len) {
+        const n = std.unicode.utf8ByteSequenceLength(raw[i]) catch {
+            try out.append(alloc, '?');
+            i += 1;
+            continue;
+        };
+        if (i + n > raw.len) {
+            try out.append(alloc, '?');
+            break;
+        }
+        _ = std.unicode.utf8Decode(raw[i .. i + n]) catch {
+            try out.append(alloc, '?');
+            i += 1;
+            continue;
+        };
+        try out.appendSlice(alloc, raw[i .. i + n]);
+        i += n;
+    }
+    return out.toOwnedSlice(alloc);
+}
+
 fn showCost(_: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const u = ui.pn.usage;
     const mc = ui.pn.cost_micents;
@@ -3778,6 +3826,7 @@ fn autoCompact(
         try ui.tr.infoText(msg);
         return;
     };
+    ui.pn.noteCompaction();
     try ui.tr.infoText("[session compacted]");
 }
 
@@ -4452,6 +4501,29 @@ test "needsAskHint detects ask-question prompts" {
 test "needsAskHint ignores regular prompts" {
     try std.testing.expect(!needsAskHint("build a parser for this input"));
     try std.testing.expect(!needsAskHint("summarize the codebase"));
+}
+
+test "sanitizeUtf8LossyAlloc preserves valid utf8" {
+    const in = "upgrade ok ✓";
+    const out = try sanitizeUtf8LossyAlloc(std.testing.allocator, in);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings(in, out);
+}
+
+test "sanitizeUtf8LossyAlloc replaces invalid bytes" {
+    const bad = [_]u8{ 'o', 0xff, 'k', 0xc3 };
+    const out = try sanitizeUtf8LossyAlloc(std.testing.allocator, bad[0..]);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("o?k?", out);
+}
+
+test "infoTextSafe accepts invalid utf8 command output" {
+    var ui = try tui_harness.Ui.init(std.testing.allocator, 80, 12, "m", "p");
+    defer ui.deinit();
+
+    const bad = [_]u8{ 'u', 0xff, 'p' };
+    try infoTextSafe(std.testing.allocator, &ui, bad[0..]);
+    try std.testing.expectEqual(@as(usize, 1), ui.tr.count());
 }
 
 fn eofReader() std.Io.AnyReader {

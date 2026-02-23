@@ -45,16 +45,18 @@ pub const Handler = struct {
             if (to_line < from_line) return error.InvalidArgs;
         }
 
-        const full = std.fs.cwd().readFileAlloc(self.alloc, args.path, self.max_bytes) catch |read_err| {
-            return mapReadErr(read_err);
-        };
-        defer self.alloc.free(full);
+        const selected = try readSelected(self, args.path, from_line, args.to_line);
+        errdefer self.alloc.free(selected.chunk);
 
-        const selected = sliceLines(full, from_line, args.to_line);
-        const chunk = self.alloc.dupe(u8, selected) catch return error.OutOfMemory;
-        errdefer self.alloc.free(chunk);
+        const meta = tools.output.metaFor(self.max_bytes, selected.full_bytes);
+        var meta_chunk: ?[]u8 = null;
+        if (meta) |m| {
+            meta_chunk = tools.output.metaJsonAlloc(self.alloc, .stdout, m) catch return error.OutOfMemory;
+        }
+        errdefer if (meta_chunk) |chunk| self.alloc.free(chunk);
 
-        const out = self.alloc.alloc(tools.Output, 1) catch return error.OutOfMemory;
+        const out_len: usize = 1 + @as(usize, @intFromBool(meta_chunk != null));
+        const out = self.alloc.alloc(tools.Output, out_len) catch return error.OutOfMemory;
         errdefer self.alloc.free(out);
 
         out[0] = .{
@@ -62,10 +64,23 @@ pub const Handler = struct {
             .seq = 0,
             .at_ms = self.now_ms,
             .stream = .stdout,
-            .chunk = chunk,
+            .chunk = selected.chunk,
             .owned = true,
-            .truncated = false,
+            .truncated = meta != null,
         };
+
+        if (meta_chunk) |chunk| {
+            out[1] = .{
+                .call_id = call.id,
+                .seq = 1,
+                .at_ms = self.now_ms,
+                .stream = .meta,
+                .chunk = chunk,
+                .owned = true,
+                .truncated = false,
+            };
+            meta_chunk = null;
+        }
 
         return .{
             .call_id = call.id,
@@ -86,54 +101,105 @@ pub const Handler = struct {
     }
 };
 
+const Selected = struct {
+    chunk: []u8,
+    full_bytes: usize,
+};
+
+const Acc = struct {
+    alloc: std.mem.Allocator,
+    limit: usize,
+    buf: std.ArrayList(u8) = .empty,
+    full_bytes: usize = 0,
+
+    fn init(alloc: std.mem.Allocator, limit: usize) Acc {
+        return .{
+            .alloc = alloc,
+            .limit = limit,
+        };
+    }
+
+    fn deinit(self: *Acc) void {
+        self.buf.deinit(self.alloc);
+        self.* = undefined;
+    }
+
+    fn appendByte(self: *Acc, b: u8) std.mem.Allocator.Error!void {
+        self.full_bytes = satAdd(self.full_bytes, 1);
+        if (self.buf.items.len >= self.limit) return;
+        try self.buf.append(self.alloc, b);
+    }
+
+    fn takeOwned(self: *Acc) std.mem.Allocator.Error![]u8 {
+        const out = try self.buf.toOwnedSlice(self.alloc);
+        self.buf = .empty;
+        return out;
+    }
+};
+
+fn readSelected(self: Handler, path: []const u8, from_line: u32, to_line: ?u32) Err!Selected {
+    var file = std.fs.cwd().openFile(path, .{ .mode = .read_only }) catch |open_err| {
+        return mapReadErr(open_err);
+    };
+    defer file.close();
+
+    const last_line = to_line orelse std.math.maxInt(u32);
+    var line_no: u32 = 1;
+    var in_range = line_no >= from_line and line_no <= last_line;
+
+    var acc = Acc.init(self.alloc, self.max_bytes);
+    defer acc.deinit();
+
+    var scratch: [4096]u8 = undefined;
+    while (true) {
+        const n = file.read(&scratch) catch |read_err| {
+            return mapReadErr(read_err);
+        };
+        if (n == 0) break;
+
+        var i: usize = 0;
+        while (i < n) : (i += 1) {
+            const b = scratch[i];
+            if (in_range) try acc.appendByte(b);
+
+            if (b == '\n') {
+                if (line_no == last_line) {
+                    return .{
+                        .chunk = acc.takeOwned() catch return error.OutOfMemory,
+                        .full_bytes = acc.full_bytes,
+                    };
+                }
+                line_no = satAddU32(line_no, 1);
+                in_range = line_no >= from_line and line_no <= last_line;
+            }
+        }
+    }
+
+    return .{
+        .chunk = acc.takeOwned() catch return error.OutOfMemory,
+        .full_bytes = acc.full_bytes,
+    };
+}
+
 fn mapReadErr(err: anyerror) Err {
     return switch (err) {
         error.FileNotFound => error.NotFound,
         error.AccessDenied, error.PermissionDenied => error.Denied,
-        error.FileTooBig => error.TooLarge,
         error.OutOfMemory => error.OutOfMemory,
         else => error.Io,
     };
 }
 
-fn sliceLines(full: []const u8, from_line: u32, to_line: ?u32) []const u8 {
-    if (full.len == 0) return "";
+fn satAdd(a: usize, b: usize) usize {
+    const out, const ov = @addWithOverflow(a, b);
+    if (ov == 0) return out;
+    return std.math.maxInt(usize);
+}
 
-    const last_line = to_line orelse std.math.maxInt(u32);
-    if (from_line > last_line) return "";
-
-    var line_num: u32 = 1;
-    var line_start: usize = 0;
-    var sel_start: ?usize = null;
-    var sel_end: usize = 0;
-
-    var idx: usize = 0;
-    while (idx < full.len) : (idx += 1) {
-        if (full[idx] != '\n') continue;
-
-        const line_end = idx + 1;
-        if (line_num >= from_line and line_num <= last_line) {
-            if (sel_start == null) sel_start = line_start;
-            sel_end = line_end;
-        }
-
-        if (line_num == last_line) {
-            break;
-        }
-
-        line_num += 1;
-        line_start = line_end;
-    }
-
-    if (line_start < full.len and line_num >= from_line and line_num <= last_line) {
-        if (sel_start == null) sel_start = line_start;
-        sel_end = full.len;
-    }
-
-    if (sel_start) |start| {
-        return full[start..sel_end];
-    }
-    return "";
+fn satAddU32(a: u32, b: u32) u32 {
+    const out, const ov = @addWithOverflow(a, b);
+    if (ov == 0) return out;
+    return std.math.maxInt(u32);
 }
 
 test "read handler returns selected lines with deterministic timestamps" {
@@ -261,4 +327,95 @@ test "read handler returns kind mismatch for wrong call kind" {
     };
 
     try std.testing.expectError(error.KindMismatch, handler.run(call, sink));
+}
+
+test "read handler truncates oversized output instead of failing TooLarge" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(std.testing.allocator);
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        try text.appendSlice(std.testing.allocator, "line-data-1234567890\n");
+    }
+
+    try tmp.dir.writeFile(.{ .sub_path = "big.txt", .data = text.items });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "big.txt");
+    defer std.testing.allocator.free(path);
+
+    const SinkImpl = struct {
+        fn push(_: *@This(), _: tools.Event) !void {}
+    };
+    var sink_impl = SinkImpl{};
+    const sink = tools.Sink.from(SinkImpl, &sink_impl, SinkImpl.push);
+
+    const handler = Handler.init(.{
+        .alloc = std.testing.allocator,
+        .max_bytes = 128,
+        .now_ms = 99,
+    });
+    const call: tools.Call = .{
+        .id = "c-big",
+        .kind = .read,
+        .args = .{ .read = .{ .path = path } },
+        .src = .model,
+        .at_ms = 0,
+    };
+
+    const res = try handler.run(call, sink);
+    defer handler.deinitResult(res);
+
+    try std.testing.expectEqual(@as(usize, 2), res.out.len);
+    try std.testing.expectEqual(@as(usize, 128), res.out[0].chunk.len);
+    try std.testing.expect(res.out[0].truncated);
+    try std.testing.expect(res.out[1].stream == .meta);
+    try std.testing.expect(std.mem.indexOf(u8, res.out[1].chunk, "\"type\":\"trunc\"") != null);
+}
+
+test "read handler can target a line in very large file without TooLarge" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var txt = std.ArrayList(u8).empty;
+    defer txt.deinit(std.testing.allocator);
+    var w = txt.writer(std.testing.allocator);
+    var i: usize = 0;
+    while (i < 10_000) : (i += 1) {
+        try w.print("line-{d}\n", .{i + 1});
+    }
+    try tmp.dir.writeFile(.{ .sub_path = "huge.txt", .data = txt.items });
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "huge.txt");
+    defer std.testing.allocator.free(path);
+
+    const SinkImpl = struct {
+        fn push(_: *@This(), _: tools.Event) !void {}
+    };
+    var sink_impl = SinkImpl{};
+    const sink = tools.Sink.from(SinkImpl, &sink_impl, SinkImpl.push);
+
+    const handler = Handler.init(.{
+        .alloc = std.testing.allocator,
+        .max_bytes = 64,
+    });
+
+    const call: tools.Call = .{
+        .id = "c-huge",
+        .kind = .read,
+        .args = .{ .read = .{
+            .path = path,
+            .from_line = 9999,
+            .to_line = 9999,
+        } },
+        .src = .model,
+        .at_ms = 0,
+    };
+
+    const res = try handler.run(call, sink);
+    defer handler.deinitResult(res);
+
+    try std.testing.expectEqual(@as(usize, 1), res.out.len);
+    try std.testing.expectEqualStrings("line-9999\n", res.out[0].chunk);
+    try std.testing.expect(!res.out[0].truncated);
 }

@@ -82,7 +82,7 @@ pub const dark = Theme{
     .tool_error_bg = .{ .rgb = 0x3c2828 },
     // Tools
     .tool_title = .{ .default = {} },
-    .tool_output = .{ .rgb = 0x808080 },
+    .tool_output = .{ .default = {} },
     .tool_diff_add = .{ .rgb = 0xb5bd68 },
     .tool_diff_rm = .{ .rgb = 0xcc6666 },
     .tool_diff_ctx = .{ .rgb = 0x808080 },
@@ -141,7 +141,7 @@ pub const light = Theme{
     .tool_error_bg = .{ .rgb = 0xf0e8e8 },
     // Tools
     .tool_title = .{ .default = {} },
-    .tool_output = .{ .rgb = 0x586e75 },
+    .tool_output = .{ .default = {} },
     .tool_diff_add = .{ .rgb = 0x859900 },
     .tool_diff_rm = .{ .rgb = 0xdc322f },
     .tool_diff_ctx = .{ .rgb = 0x93a1a1 },
@@ -180,17 +180,22 @@ pub const light = Theme{
 
 var active: *const Theme = &dark;
 
-pub fn init() void {
-    if (std.posix.getenv("PZ_THEME")) |val| {
-        const map = std.StaticStringMap(*const Theme).initComptime(.{
-            .{ "light", &light },
-            .{ "dark", &dark },
-        });
-        if (map.get(val)) |t| {
-            active = t;
-            return;
-        }
+pub fn init(name: ?[]const u8) void {
+    if (name) |raw| {
+        active = themeByName(raw) orelse &dark;
+        return;
     }
+
+    if (std.posix.getenv("PZ_THEME")) |val| {
+        active = themeByName(val) orelse &dark;
+        return;
+    }
+    if (std.posix.getenv("PI_THEME")) |val| {
+        active = themeByName(val) orelse &dark;
+        return;
+    }
+
+    active = &dark;
     // Auto-detect from COLORFGBG: "fg;bg" — high bg number means light bg
     if (std.posix.getenv("COLORFGBG")) |val| {
         if (std.mem.lastIndexOfScalar(u8, val, ';')) |sep| {
@@ -214,6 +219,12 @@ pub fn setActive(t: *const Theme) void {
     active = t;
 }
 
+fn themeByName(name: []const u8) ?*const Theme {
+    if (std.ascii.eqlIgnoreCase(name, "dark")) return &dark;
+    if (std.ascii.eqlIgnoreCase(name, "light")) return &light;
+    return null;
+}
+
 test "dark and light differ" {
     const d = &dark;
     const l = &light;
@@ -230,6 +241,25 @@ test "init selects dark by default" {
     active = &light;
     // With no env vars set in test, init should leave dark or detect
     // Just verify get() returns a valid pointer
+    init(null);
     const t = get();
     try std.testing.expect(t == &dark or t == &light);
+}
+
+test "init honors explicit theme name" {
+    const prev = active;
+    defer active = prev;
+
+    init("light");
+    try std.testing.expect(get() == &light);
+    init("dark");
+    try std.testing.expect(get() == &dark);
+}
+
+test "init falls back to dark on unknown explicit theme" {
+    const prev = active;
+    defer active = prev;
+
+    init("custom-unknown");
+    try std.testing.expect(get() == &dark);
 }

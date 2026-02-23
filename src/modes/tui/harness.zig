@@ -29,6 +29,11 @@ pub const Ui = struct {
     img_cap: imgproto_mod.ImageCap = .none,
     spin: u8 = 0,
 
+    const BorderStatus = struct {
+        label: []const u8,
+        fg: frame.Color,
+    };
+
     pub fn init(
         alloc: std.mem.Allocator,
         w: usize,
@@ -36,7 +41,7 @@ pub const Ui = struct {
         model: []const u8,
         provider: []const u8,
     ) !Ui {
-        return initFull(alloc, w, h, model, provider, "", "");
+        return initFull(alloc, w, h, model, provider, "", "", null);
     }
 
     pub fn initFull(
@@ -47,8 +52,9 @@ pub const Ui = struct {
         provider: []const u8,
         cwd: []const u8,
         branch: []const u8,
+        theme_name: ?[]const u8,
     ) !Ui {
-        theme.init();
+        theme.init(theme_name);
         return .{
             .alloc = alloc,
             .ed = editor.Editor.init(alloc),
@@ -414,38 +420,45 @@ pub const Ui = struct {
     }
 
     fn drawBorderWithStatus(self: *Ui, y: usize) !void {
-        const active = self.pn.run_state == .streaming or self.pn.run_state == .tool;
+        const t = theme.get();
+        const now_ms = std.time.milliTimestamp();
+        const compact_on = self.pn.compactionActive(now_ms);
+        const active = self.pn.run_state == .streaming or self.pn.run_state == .tool or compact_on;
         if (active) self.spin +%= 1;
-        var lbl_buf: [48]u8 = undefined;
-        const label: ?[]const u8 = switch (self.pn.run_state) {
+
+        var lbl_buf: [64]u8 = undefined;
+        const status: ?BorderStatus = switch (self.pn.run_state) {
             .streaming, .tool => blk: {
                 const prefix: []const u8 = if (self.pn.run_state == .tool) " running tool " else " streaming ";
                 const sc = spinner.cp(self.spin);
-                break :blk std.fmt.bufPrint(&lbl_buf, "{s}{u} ", .{ prefix, sc }) catch prefix;
+                const label = std.fmt.bufPrint(&lbl_buf, "{s}{u} ", .{ prefix, sc }) catch prefix;
+                break :blk .{ .label = label, .fg = t.accent };
             },
-            .canceled => " canceled ",
-            .failed => " error ",
-            else => null,
+            .canceled => .{ .label = " canceled ", .fg = t.warn },
+            .failed => .{ .label = " error ", .fg = t.err },
+            else => blk: {
+                if (!compact_on) break :blk null;
+                const sc = spinner.cp(self.spin);
+                const show_spin = (self.spin & 1) == 0;
+                const label = if (show_spin)
+                    std.fmt.bufPrint(&lbl_buf, " compaction {u} ", .{sc}) catch " compaction "
+                else
+                    " compaction ";
+                break :blk .{ .label = label, .fg = t.accent };
+            },
         };
-        try self.drawBorderPlain(y, label);
+        try self.drawBorderPlain(y, status);
     }
 
-    fn drawBorderPlain(self: *Ui, y: usize, label: ?[]const u8) !void {
+    fn drawBorderPlain(self: *Ui, y: usize, status: ?BorderStatus) !void {
         const bst = frame.Style{ .fg = self.border_fg };
         var x: usize = 0;
         while (x < self.frm.w) : (x += 1) {
             try self.frm.set(x, y, 0x2500, bst); // ─
         }
-        if (label) |lbl| {
-            const t = theme.get();
-            const fg = switch (self.pn.run_state) {
-                .streaming, .tool => t.accent,
-                .canceled => t.warn,
-                .failed => t.err,
-                else => t.dim,
-            };
-            const lst = frame.Style{ .fg = fg };
-            _ = try self.frm.write(1, y, lbl, lst);
+        if (status) |st| {
+            const lst = frame.Style{ .fg = st.fg };
+            _ = try self.frm.write(1, y, st.label, lst);
         }
     }
 
@@ -661,6 +674,31 @@ const TestBuf = struct {
     }
 };
 
+fn findAsciiSeqX(frm: *const frame.Frame, y: usize, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    var x: usize = 0;
+    while (x + needle.len <= frm.w) : (x += 1) {
+        var ok = true;
+        for (needle, 0..) |ch, j| {
+            const c = frm.cell(x + j, y) catch return null;
+            if (c.cp != @as(u21, ch)) {
+                ok = false;
+                break;
+            }
+        }
+        if (ok) return x;
+    }
+    return null;
+}
+
+fn findAsciiSeqInFrame(frm: *const frame.Frame, needle: []const u8) ?struct { x: usize, y: usize } {
+    var y: usize = 0;
+    while (y < frm.h) : (y += 1) {
+        if (findAsciiSeqX(frm, y, needle)) |x| return .{ .x = x, .y = y };
+    }
+    return null;
+}
+
 test "harness renders full-width transcript with footer" {
     var ui = try Ui.init(std.testing.allocator, 40, 8, "gpt-x", "prov-a");
     defer ui.deinit();
@@ -731,6 +769,21 @@ test "harness resize reallocates frame and renderer" {
     out.clear();
     try ui.draw(&out);
     try std.testing.expect(out.view().len != 0);
+}
+
+test "harness border shows compaction indicator" {
+    var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
+    defer ui.deinit();
+    ui.pn.noteCompaction();
+
+    var raw: [4096]u8 = undefined;
+    var out = TestBuf.init(raw[0..]);
+    try ui.draw(&out);
+
+    const pos = findAsciiSeqInFrame(&ui.frm, "compaction");
+    try std.testing.expect(pos != null);
+    const cc = try ui.frm.cell(pos.?.x, pos.?.y);
+    try std.testing.expect(frame.Color.eql(cc.style.fg, theme.get().accent));
 }
 
 test "harness onMouse scrolls transcript" {

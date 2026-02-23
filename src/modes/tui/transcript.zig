@@ -15,6 +15,7 @@ pub const Rect = struct {
 const imgproto = @import("imgproto.zig");
 
 const Kind = enum { text, user, thinking, tool, err, meta, image };
+const ToolPhase = enum { none, call, result };
 
 const Span = struct {
     start: usize, // byte offset in buf
@@ -27,6 +28,8 @@ const Block = struct {
     buf: std.ArrayListUnmanaged(u8),
     st: frame.Style,
     spans: std.ArrayListUnmanaged(Span) = .empty,
+    tool_gid: u64 = 0,
+    tool_phase: ToolPhase = .none,
 
     pub fn deinit(self: *Block, alloc: std.mem.Allocator) void {
         self.spans.deinit(alloc);
@@ -136,17 +139,23 @@ pub const Transcript = struct {
                 defer self.alloc.free(display);
                 try self.pushBlock(.tool, display, .{
                     .fg = theme.get().dim,
+                    .bg = theme.get().tool_pending_bg,
                 });
+                self.tagLastTool(toolGroup(tc.id), .call);
             },
             .tool_result => |tr| {
+                const gid = toolGroup(tr.id);
+                self.setToolCallStatus(gid, tr.is_err);
                 if (tr.is_err) {
                     try self.pushAnsi(.err, "", .{}, tr.out, .{
                         .fg = theme.get().err,
                         .bg = theme.get().tool_error_bg,
                     });
+                    self.tagLastTool(gid, .result);
                 } else {
                     // Show result with collapsing like pi
                     try self.pushToolResult(tr.out);
+                    self.tagLastTool(gid, .result);
                 }
             },
             .err => |t| try self.pushFmt(.err, "[err] {s}", .{t}, .{
@@ -200,13 +209,15 @@ pub const Transcript = struct {
         const bar_w: usize = if (avail_w >= 2) 1 else 0;
         const count_w = avail_w - bar_w;
         var total: usize = 0;
-        var vis_ct: usize = 0;
+        var prev_vis: ?*Block = null;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
+            if (prev_vis) |prev| {
+                if (needsGap(prev, b)) total += 1;
+            }
             total += blockLineCount(b, count_w);
-            vis_ct += 1;
+            prev_vis = b;
         }
-        if (vis_ct > 1) total += vis_ct - 1; // gaps
         if (total == 0) return;
 
         const has_bar = total > rect.h and bar_w > 0;
@@ -226,11 +237,12 @@ pub const Transcript = struct {
 
         var md = markdown.MdRenderer{};
         var first_vis = true;
+        var prev_rendered: ?*Block = null;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
 
             // 1-line gap between blocks
-            if (!first_vis) {
+            if (!first_vis and (prev_rendered == null or needsGap(prev_rendered.?, b))) {
                 if (skipped < skip) {
                     skipped += 1;
                 } else if (row < rect.h) {
@@ -238,6 +250,7 @@ pub const Transcript = struct {
                 }
             }
             first_vis = false;
+            prev_rendered = b;
 
             // Image blocks: header line + reserved rows
             if (b.kind == .image) {
@@ -272,40 +285,191 @@ pub const Transcript = struct {
 
             const txt = self.blockDisplayText(b);
             const use_md = b.kind == .text or b.kind == .user;
-            if (use_md) md = .{};
-            var wit = wrapIter(txt, text_w);
-            while (wit.next()) |line| {
-                if (skipped < skip) {
-                    skipped += 1;
-                    if (use_md) {
-                        // Advance md state for skipped lines
-                        if (md.in_code_block or markdown.isFence(line))
-                            md.advanceSkipped(line);
+            if (use_md) {
+                md = .{};
+                var md_wit = mdWrapIter(txt, text_w);
+                var pending_md: ?[]const u8 = null;
+                while (true) {
+                    const line = if (pending_md) |p| blk: {
+                        pending_md = null;
+                        break :blk p;
+                    } else md_wit.next() orelse break;
+
+                    // Detect a markdown table block (header + separator + rows)
+                    if (isMdTableLine(line)) {
+                        if (md_wit.next()) |sep_line| {
+                            if (isMdTableSepLine(sep_line)) {
+                                var table_lines_buf: [64][]const u8 = undefined;
+                                var table_n: usize = 0;
+                                table_lines_buf[table_n] = line;
+                                table_n += 1;
+                                table_lines_buf[table_n] = sep_line;
+                                table_n += 1;
+
+                                while (md_wit.next()) |tbl_line| {
+                                    if (!isMdTableLine(tbl_line)) {
+                                        pending_md = tbl_line;
+                                        break;
+                                    }
+                                    if (table_n < table_lines_buf.len) {
+                                        table_lines_buf[table_n] = tbl_line;
+                                        table_n += 1;
+                                    }
+                                }
+
+                                const table_lines = table_lines_buf[0..table_n];
+                                const layout = computeMdTableLayout(table_lines, text_w);
+                                const data_n: usize = if (table_lines.len > 2) table_lines.len - 2 else 0;
+
+                                // top border
+                                if (skipped < skip) {
+                                    skipped += 1;
+                                } else if (row < rect.h) {
+                                    const y = rect.y + row;
+                                    if (!b.st.bg.isDefault()) {
+                                        var x: usize = rect.x;
+                                        while (x < rect.x + rect.w) : (x += 1) {
+                                            try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                                        }
+                                    }
+                                    try renderMdTableRule(frm, content_x, y, text_w, layout, b.st, .top);
+                                    row += 1;
+                                }
+
+                                // header row
+                                const header_line = table_lines[0];
+                                if (skipped < skip) {
+                                    skipped += 1;
+                                    md.advanceSkipped(header_line);
+                                } else if (row < rect.h) {
+                                    const y = rect.y + row;
+                                    if (!b.st.bg.isDefault()) {
+                                        var x: usize = rect.x;
+                                        while (x < rect.x + rect.w) : (x += 1) {
+                                            try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                                        }
+                                    }
+                                    try renderMdTableRowAligned(frm, content_x, y, text_w, header_line, layout, b.st, true);
+                                    row += 1;
+                                }
+
+                                // header/data separator
+                                if (skipped < skip) {
+                                    skipped += 1;
+                                } else if (row < rect.h) {
+                                    const y = rect.y + row;
+                                    if (!b.st.bg.isDefault()) {
+                                        var x: usize = rect.x;
+                                        while (x < rect.x + rect.w) : (x += 1) {
+                                            try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                                        }
+                                    }
+                                    try renderMdTableRule(frm, content_x, y, text_w, layout, b.st, .mid);
+                                    row += 1;
+                                }
+
+                                var di: usize = 0;
+                                while (di < data_n) : (di += 1) {
+                                    const data_line = table_lines[2 + di];
+                                    if (skipped < skip) {
+                                        skipped += 1;
+                                        md.advanceSkipped(data_line);
+                                    } else if (row < rect.h) {
+                                        const y = rect.y + row;
+                                        if (!b.st.bg.isDefault()) {
+                                            var x: usize = rect.x;
+                                            while (x < rect.x + rect.w) : (x += 1) {
+                                                try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                                            }
+                                        }
+                                        try renderMdTableRowAligned(frm, content_x, y, text_w, data_line, layout, b.st, false);
+                                        row += 1;
+                                    }
+
+                                    if (di + 1 < data_n) {
+                                        if (skipped < skip) {
+                                            skipped += 1;
+                                        } else if (row < rect.h) {
+                                            const y = rect.y + row;
+                                            if (!b.st.bg.isDefault()) {
+                                                var x: usize = rect.x;
+                                                while (x < rect.x + rect.w) : (x += 1) {
+                                                    try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                                                }
+                                            }
+                                            try renderMdTableRule(frm, content_x, y, text_w, layout, b.st, .mid);
+                                            row += 1;
+                                        }
+                                    }
+                                }
+
+                                // bottom border
+                                if (skipped < skip) {
+                                    skipped += 1;
+                                } else if (row < rect.h) {
+                                    const y = rect.y + row;
+                                    if (!b.st.bg.isDefault()) {
+                                        var x: usize = rect.x;
+                                        while (x < rect.x + rect.w) : (x += 1) {
+                                            try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                                        }
+                                    }
+                                    try renderMdTableRule(frm, content_x, y, text_w, layout, b.st, .bottom);
+                                    row += 1;
+                                }
+                                continue;
+                            }
+                            pending_md = sep_line;
+                        }
                     }
-                    continue;
-                }
-                if (row >= rect.h) break;
 
-                const y = rect.y + row;
-
-                // Fill bg across full width (including padding) if non-default
-                if (!b.st.bg.isDefault()) {
-                    var x = rect.x;
-                    while (x < rect.x + rect.w) : (x += 1) {
-                        try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                    if (skipped < skip) {
+                        skipped += 1;
+                        md.advanceSkipped(line);
+                        continue;
                     }
-                }
+                    if (row >= rect.h) break;
 
-                if (use_md) {
+                    const y = rect.y + row;
+
+                    if (!b.st.bg.isDefault()) {
+                        var x: usize = rect.x;
+                        while (x < rect.x + rect.w) : (x += 1) {
+                            try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                        }
+                    }
+
                     _ = try md.renderLine(frm, content_x, y, line, text_w, b.st);
-                } else if (b.hasSpans()) {
-                    const base_off = @intFromPtr(line.ptr) - @intFromPtr(txt.ptr);
-                    _ = try writeStyled(frm, content_x, y, line, base_off, b);
-                } else {
-                    _ = try frm.write(content_x, y, line, b.st);
+                    row += 1;
                 }
+            } else {
+                var wit = wrapIter(txt, text_w);
+                while (wit.next()) |line| {
+                    if (skipped < skip) {
+                        skipped += 1;
+                        continue;
+                    }
+                    if (row >= rect.h) break;
 
-                row += 1;
+                    const y = rect.y + row;
+
+                    // Fill bg across full width (including padding) if non-default
+                    if (!b.st.bg.isDefault()) {
+                        var x = rect.x;
+                        while (x < rect.x + rect.w) : (x += 1) {
+                            try frm.set(x, y, ' ', .{ .bg = b.st.bg });
+                        }
+                    }
+
+                    if (b.hasSpans()) {
+                        const base_off = @intFromPtr(line.ptr) - @intFromPtr(txt.ptr);
+                        _ = try writeStyled(frm, content_x, y, line, base_off, b);
+                    } else {
+                        _ = try frm.write(content_x, y, line, b.st);
+                    }
+
+                    row += 1;
+                }
             }
         }
 
@@ -342,6 +506,7 @@ pub const Transcript = struct {
 
     fn blockLineCount(b: *const Block, w: usize) usize {
         if (b.kind == .image) return imgproto.img_rows;
+        if (b.kind == .text or b.kind == .user) return countMdLines(b.text(), w);
         return countLines(b.text(), w);
     }
 
@@ -427,17 +592,27 @@ pub const Transcript = struct {
     /// Show tool result, collapsing long output like pi does:
     /// "... (N earlier lines, ctrl+o to expand)"
     fn pushToolResult(self: *Transcript, out: []const u8) AppendError!void {
+        var shown = out;
+        var shown_owned: ?[]u8 = null;
+        defer if (shown_owned) |buf| self.alloc.free(buf);
+
+        if (try formatAskResultAlloc(self.alloc, out)) |pretty| {
+            shown_owned = pretty;
+            shown = pretty;
+        }
+
         const max_tail = 6; // show last N lines
         var lines: usize = 0;
-        for (out) |c| {
+        for (shown) |c| {
             if (c == '\n') lines += 1;
         }
-        if (out.len > 0 and out[out.len - 1] != '\n') lines += 1;
+        if (shown.len > 0 and shown[shown.len - 1] != '\n') lines += 1;
 
         if (lines <= max_tail + 1) {
             // Short enough: show all
-            try self.pushAnsi(.tool, "", .{}, out, .{
-                .fg = theme.get().dim,
+            try self.pushAnsi(.tool, "", .{}, shown, .{
+                .fg = theme.get().tool_output,
+                .bg = theme.get().tool_success_bg,
             });
             return;
         }
@@ -446,7 +621,7 @@ pub const Transcript = struct {
         const hidden = lines - max_tail;
         var skip: usize = 0;
         var nl_count: usize = 0;
-        for (out, 0..) |c, idx| {
+        for (shown, 0..) |c, idx| {
             if (c == '\n') {
                 nl_count += 1;
                 if (nl_count == hidden) {
@@ -456,11 +631,41 @@ pub const Transcript = struct {
             }
         }
 
-        try self.pushAnsi(.tool, " ... ({d} earlier lines, ctrl+o to expand)\n", .{hidden}, out[skip..], .{
-            .fg = theme.get().dim,
+        try self.pushAnsi(.tool, " ... ({d} earlier lines, ctrl+o to expand)\n", .{hidden}, shown[skip..], .{
+            .fg = theme.get().tool_output,
+            .bg = theme.get().tool_success_bg,
         });
     }
+
+    fn setToolCallStatus(self: *Transcript, gid: u64, is_err: bool) void {
+        if (gid == 0) return;
+        var i = self.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            var b = &self.blocks.items[i];
+            if (b.tool_gid != gid or b.tool_phase != .call) continue;
+            b.st.bg = if (is_err) theme.get().tool_error_bg else theme.get().tool_success_bg;
+            return;
+        }
+    }
+
+    fn tagLastTool(self: *Transcript, gid: u64, phase: ToolPhase) void {
+        if (self.blocks.items.len == 0) return;
+        var b = &self.blocks.items[self.blocks.items.len - 1];
+        b.tool_gid = gid;
+        b.tool_phase = phase;
+    }
 };
+
+fn toolGroup(id: []const u8) u64 {
+    if (id.len == 0) return 0;
+    return std.hash.Wyhash.hash(0, id);
+}
+
+fn needsGap(prev: *const Block, cur: *const Block) bool {
+    if (prev.tool_gid != 0 and prev.tool_gid == cur.tool_gid) return false;
+    return true;
+}
 
 // -- Tool call formatting --
 
@@ -507,6 +712,52 @@ fn fmtToolCall(alloc: std.mem.Allocator, name: []const u8, args: []const u8) ![]
     }
 
     return std.fmt.allocPrint(alloc, " $ {s}", .{name});
+}
+
+const AskResult = struct {
+    cancelled: bool,
+    answers: []const AskAnswer,
+};
+
+const AskAnswer = struct {
+    id: []const u8,
+    answer: []const u8,
+    index: usize,
+};
+
+fn formatAskResultAlloc(alloc: std.mem.Allocator, out: []const u8) std.mem.Allocator.Error!?[]u8 {
+    const trimmed = std.mem.trim(u8, out, " \t\r\n");
+    if (trimmed.len < 2 or trimmed[0] != '{') return null;
+
+    const parsed = std.json.parseFromSlice(AskResult, alloc, trimmed, .{
+        .allocate = .alloc_always,
+        .ignore_unknown_fields = true,
+    }) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => return null,
+    };
+    defer parsed.deinit();
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(alloc);
+
+    if (parsed.value.cancelled) {
+        try buf.appendSlice(alloc, "ask: cancelled");
+        return try buf.toOwnedSlice(alloc);
+    }
+    if (parsed.value.answers.len == 0) {
+        try buf.appendSlice(alloc, "ask: no answers");
+        return try buf.toOwnedSlice(alloc);
+    }
+
+    const noun = if (parsed.value.answers.len == 1) "answer" else "answers";
+    try std.fmt.format(buf.writer(alloc), "ask: {d} {s}\n", .{ parsed.value.answers.len, noun });
+    for (parsed.value.answers, 0..) |ans, i| {
+        _ = ans.index;
+        try std.fmt.format(buf.writer(alloc), "  - {s}: {s}", .{ ans.id, ans.answer });
+        if (i + 1 < parsed.value.answers.len) try buf.append(alloc, '\n');
+    }
+    return try buf.toOwnedSlice(alloc);
 }
 
 // -- Word wrap --
@@ -585,6 +836,292 @@ pub fn wrapIter(text: []const u8, w: usize) WrapIter {
     return .{ .text = text, .pos = 0, .w = w };
 }
 
+pub const MdWrapIter = struct {
+    text: []const u8,
+    pos: usize,
+    w: usize,
+    line_wit: ?WrapIter = null,
+
+    pub fn next(self: *MdWrapIter) ?[]const u8 {
+        if (self.w == 0) return null;
+        while (true) {
+            if (self.line_wit) |*wit| {
+                if (wit.next()) |seg| return seg;
+                self.line_wit = null;
+            }
+            if (self.pos >= self.text.len) return null;
+
+            const start = self.pos;
+            var i = start;
+            while (i < self.text.len and self.text[i] != '\n') : (i += 1) {}
+            const line = self.text[start..i];
+            self.pos = if (i < self.text.len) i + 1 else i;
+
+            if (line.len == 0) return line;
+            if (isMdTableLine(line)) return line;
+
+            self.line_wit = wrapIter(line, self.w);
+        }
+    }
+};
+
+pub fn mdWrapIter(text: []const u8, w: usize) MdWrapIter {
+    return .{ .text = text, .pos = 0, .w = w };
+}
+
+fn isMdTableLine(line: []const u8) bool {
+    const t = std.mem.trimLeft(u8, line, " \t");
+    return t.len > 0 and t[0] == '|';
+}
+
+fn isMdTableSepLine(line: []const u8) bool {
+    const t = std.mem.trimLeft(u8, line, " \t");
+    if (t.len < 3 or t[0] != '|') return false;
+    for (t) |c| {
+        switch (c) {
+            '|', '-', ':', ' ', '\t' => {},
+            else => return false,
+        }
+    }
+    return std.mem.indexOfScalar(u8, t, '-') != null;
+}
+
+const table_max_cols: usize = 32;
+const MdTableLayout = struct {
+    ncols: usize,
+    widths: [table_max_cols]usize,
+};
+
+fn splitMdTableCells(line: []const u8, buf: *[table_max_cols][]const u8) usize {
+    const t = std.mem.trimLeft(u8, line, " \t");
+    var rest = t;
+    if (rest.len > 0 and rest[0] == '|') rest = rest[1..];
+    if (rest.len > 0 and rest[rest.len - 1] == '|') rest = rest[0 .. rest.len - 1];
+
+    var n: usize = 0;
+    while (rest.len > 0 and n < buf.len) {
+        if (std.mem.indexOfScalar(u8, rest, '|')) |pipe| {
+            buf[n] = std.mem.trim(u8, rest[0..pipe], " \t");
+            n += 1;
+            rest = rest[pipe + 1 ..];
+        } else {
+            buf[n] = std.mem.trim(u8, rest, " \t");
+            n += 1;
+            break;
+        }
+    }
+    return n;
+}
+
+fn computeMdTableLayout(lines: []const []const u8, max_w: usize) MdTableLayout {
+    var layout = MdTableLayout{
+        .ncols = 0,
+        .widths = std.mem.zeroes([table_max_cols]usize),
+    };
+    var cells_buf: [table_max_cols][]const u8 = undefined;
+
+    for (lines) |line| {
+        const ncells = splitMdTableCells(line, &cells_buf);
+        if (ncells > layout.ncols) layout.ncols = ncells;
+        if (isMdTableSepLine(line)) continue;
+
+        var i: usize = 0;
+        while (i < ncells and i < layout.widths.len) : (i += 1) {
+            const w = @max(@as(usize, 1), wc.strwidth(cells_buf[i]));
+            if (w > layout.widths[i]) layout.widths[i] = w;
+        }
+    }
+
+    if (layout.ncols == 0) return layout;
+
+    var i: usize = 0;
+    while (i < layout.ncols) : (i += 1) {
+        if (layout.widths[i] == 0) layout.widths[i] = 1;
+    }
+
+    const overhead = 1 + 3 * layout.ncols; // "│" + per-cell " " + content + " " + "│"
+    if (max_w <= overhead) {
+        i = 0;
+        while (i < layout.ncols) : (i += 1) layout.widths[i] = 1;
+        return layout;
+    }
+
+    const avail_content = max_w - overhead;
+    var total_content: usize = 0;
+    i = 0;
+    while (i < layout.ncols) : (i += 1) total_content += layout.widths[i];
+
+    while (total_content > avail_content) {
+        var widest_idx: ?usize = null;
+        var widest: usize = 0;
+        i = 0;
+        while (i < layout.ncols) : (i += 1) {
+            const w = layout.widths[i];
+            if (w > widest and w > 1) {
+                widest = w;
+                widest_idx = i;
+            }
+        }
+        if (widest_idx == null) break;
+        layout.widths[widest_idx.?] -= 1;
+        total_content -= 1;
+    }
+
+    return layout;
+}
+
+const MdTableRule = enum {
+    top,
+    mid,
+    bottom,
+};
+
+fn renderMdTableRule(
+    frm: *frame.Frame,
+    x: usize,
+    y: usize,
+    max_w: usize,
+    layout: MdTableLayout,
+    base_st: frame.Style,
+    rule: MdTableRule,
+) frame.Frame.PosError!void {
+    if (max_w == 0 or layout.ncols == 0) return;
+
+    const border_st = frame.Style{
+        .fg = theme.get().border_muted,
+        .bg = base_st.bg,
+    };
+
+    const left_cp: u21 = switch (rule) {
+        .top => 0x250C, // ┌
+        .mid => 0x251C, // ├
+        .bottom => 0x2514, // └
+    };
+    const mid_cp: u21 = switch (rule) {
+        .top => 0x252C, // ┬
+        .mid => 0x253C, // ┼
+        .bottom => 0x2534, // ┴
+    };
+    const right_cp: u21 = switch (rule) {
+        .top => 0x2510, // ┐
+        .mid => 0x2524, // ┤
+        .bottom => 0x2518, // ┘
+    };
+
+    var col: usize = 0;
+    if (col < max_w) {
+        try frm.set(x + col, y, left_cp, border_st);
+        col += 1;
+    }
+
+    var ci: usize = 0;
+    while (ci < layout.ncols) : (ci += 1) {
+        const seg_w = layout.widths[ci] + 2; // left/right padding spaces around cell text
+        var k: usize = 0;
+        while (k < seg_w and col < max_w) : (k += 1) {
+            try frm.set(x + col, y, 0x2500, border_st); // ─
+            col += 1;
+        }
+        if (col < max_w) {
+            const cp = if (ci + 1 < layout.ncols) mid_cp else right_cp;
+            try frm.set(x + col, y, cp, border_st);
+            col += 1;
+        }
+    }
+}
+
+fn renderMdTableRowAligned(
+    frm: *frame.Frame,
+    x: usize,
+    y: usize,
+    max_w: usize,
+    line: []const u8,
+    layout: MdTableLayout,
+    base_st: frame.Style,
+    is_header: bool,
+) (frame.Frame.PosError || error{InvalidUtf8})!void {
+    if (max_w == 0 or layout.ncols == 0) return;
+
+    const border_st = frame.Style{
+        .fg = theme.get().border_muted,
+        .bg = base_st.bg,
+    };
+
+    var col: usize = 0;
+
+    var cells_buf: [table_max_cols][]const u8 = undefined;
+    const ncells = splitMdTableCells(line, &cells_buf);
+
+    if (col < max_w) {
+        try frm.set(x + col, y, 0x2502, border_st); // │
+        col += 1;
+    }
+
+    var ci: usize = 0;
+    while (ci < layout.ncols) : (ci += 1) {
+        if (col < max_w) {
+            try frm.set(x + col, y, ' ', base_st);
+            col += 1;
+        }
+
+        const cell = if (ci < ncells) cells_buf[ci] else "";
+        var cell_st = base_st;
+        if (is_header) cell_st.bold = true;
+
+        const written = try writeClippedUtf8Cols(frm, x + col, y, max_w - col, cell, layout.widths[ci], cell_st);
+        col += written;
+
+        var pad: usize = written;
+        while (pad < layout.widths[ci] and col < max_w) : (pad += 1) {
+            try frm.set(x + col, y, ' ', cell_st);
+            col += 1;
+        }
+
+        if (col < max_w) {
+            try frm.set(x + col, y, ' ', base_st);
+            col += 1;
+        }
+        if (col < max_w) {
+            try frm.set(x + col, y, 0x2502, border_st); // │
+            col += 1;
+        }
+    }
+}
+
+fn writeClippedUtf8Cols(
+    frm: *frame.Frame,
+    x: usize,
+    y: usize,
+    max_w: usize,
+    text: []const u8,
+    col_limit: usize,
+    st: frame.Style,
+) (frame.Frame.PosError || error{InvalidUtf8})!usize {
+    if (max_w == 0 or col_limit == 0 or text.len == 0) return 0;
+
+    var col: usize = 0;
+    var i: usize = 0;
+    while (i < text.len and col < col_limit and col < max_w) {
+        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
+        if (i + n > text.len) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
+        const cw = wc.wcwidth(cp);
+        if (cw == 0) {
+            i += n;
+            continue;
+        }
+        if (col + cw > col_limit or col + cw > max_w) break;
+
+        try frm.set(x + col, y, cp, st);
+        if (cw == 2 and col + 1 < max_w) {
+            try frm.set(x + col + 1, y, frame.Frame.wide_pad, st);
+        }
+        col += cw;
+        i += n;
+    }
+    return col;
+}
+
 pub fn countLines(text: []const u8, w: usize) usize {
     if (w == 0) return 0;
     if (text.len == 0) return 1; // empty block = 1 display line
@@ -592,6 +1129,51 @@ pub fn countLines(text: []const u8, w: usize) usize {
     var it = wrapIter(text, w);
     while (it.next() != null) n += 1;
     return if (n == 0) 1 else n;
+}
+
+fn countMdLines(text: []const u8, w: usize) usize {
+    if (w == 0) return 0;
+    if (text.len == 0) return 1;
+    var n: usize = 0;
+    var it = mdWrapIter(text, w);
+    var pending: ?[]const u8 = null;
+    while (true) {
+        const line = if (pending) |p| blk: {
+            pending = null;
+            break :blk p;
+        } else it.next() orelse break;
+
+        if (isMdTableLine(line)) {
+            if (it.next()) |sep_line| {
+                if (isMdTableSepLine(sep_line)) {
+                    var data_n: usize = 0;
+                    while (it.next()) |tbl_line| {
+                        if (!isMdTableLine(tbl_line)) {
+                            pending = tbl_line;
+                            break;
+                        }
+                        data_n += 1;
+                    }
+                    n += mdTableVisualRows(data_n);
+                    continue;
+                }
+                pending = sep_line;
+            }
+        }
+
+        n += 1;
+    }
+    return if (n == 0) 1 else n;
+}
+
+fn mdTableVisualRows(data_n: usize) usize {
+    // top + header + header-separator + bottom
+    var out: usize = 4;
+    // One visual row per data row
+    out += data_n;
+    // Pi-style separators between data rows
+    if (data_n > 1) out += data_n - 1;
+    return out;
 }
 
 // -- Per-span styled write --
@@ -916,6 +1498,28 @@ fn rowAscii(frm: *const frame.Frame, y: usize, out: []u8) ![]const u8 {
     return out[0..frm.w];
 }
 
+fn tableBorderCols(frm: *const frame.Frame, y: usize, out: []usize) !usize {
+    var n: usize = 0;
+    var x: usize = 0;
+    while (x < frm.w) : (x += 1) {
+        const c = try frm.cell(x, y);
+        const is_border = c.cp == 0x2502 or // │
+            c.cp == 0x251C or // ├
+            c.cp == 0x253C or // ┼
+            c.cp == 0x2524 or // ┤
+            c.cp == 0x250C or // ┌
+            c.cp == 0x252C or // ┬
+            c.cp == 0x2510 or // ┐
+            c.cp == 0x2514 or // └
+            c.cp == 0x2534 or // ┴
+            c.cp == 0x2518; // ┘
+        if (!is_border) continue;
+        if (n < out.len) out[n] = x;
+        n += 1;
+    }
+    return n;
+}
+
 // ============================================================
 // Tests
 // ============================================================
@@ -1043,6 +1647,137 @@ test "word wrap tabs count as width 1" {
     const l1 = it.next().?;
     try std.testing.expectEqualStrings("b\tc", l1); // b + tab + c = 3 cols, fits
     try std.testing.expect(it.next() == null);
+}
+
+test "markdown wrap keeps table rows intact" {
+    var it = mdWrapIter(
+        "| Name | Description |\n| --- | --- |\n| A | a very long description that should not wrap |",
+        12,
+    );
+    const l0 = it.next().?;
+    const l1 = it.next().?;
+    const l2 = it.next().?;
+    try std.testing.expectEqualStrings("| Name | Description |", l0);
+    try std.testing.expectEqualStrings("| --- | --- |", l1);
+    try std.testing.expectEqualStrings("| A | a very long description that should not wrap |", l2);
+    try std.testing.expect(it.next() == null);
+}
+
+test "markdown table keeps aligned padded columns and full enclosure" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .text = "| Name | Value |\n" ++
+        "| --- | --- |\n" ++
+        "| a | 1 |\n" ++
+        "| longer-name | 12345 |" });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 80, 10);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 80, .h = 10 });
+
+    var hcols: [8]usize = undefined;
+    var top_cols: [8]usize = undefined;
+    var r1cols: [8]usize = undefined;
+    var r3cols: [8]usize = undefined;
+    var r5cols: [8]usize = undefined;
+    var bot_cols: [8]usize = undefined;
+    const hn = try tableBorderCols(&frm, 0, hcols[0..]);
+    const tn = try tableBorderCols(&frm, 0, top_cols[0..]);
+    const r1n = try tableBorderCols(&frm, 1, r1cols[0..]);
+    const r3n = try tableBorderCols(&frm, 3, r3cols[0..]);
+    const r5n = try tableBorderCols(&frm, 5, r5cols[0..]);
+    const bn = try tableBorderCols(&frm, 6, bot_cols[0..]);
+
+    try std.testing.expectEqual(@as(usize, 3), hn);
+    try std.testing.expectEqual(@as(usize, 3), tn);
+    try std.testing.expectEqual(@as(usize, 3), r1n);
+    try std.testing.expectEqual(@as(usize, 3), r3n);
+    try std.testing.expectEqual(@as(usize, 3), r5n);
+    try std.testing.expectEqual(@as(usize, 3), bn);
+
+    try std.testing.expectEqual(hcols[0], r1cols[0]);
+    try std.testing.expectEqual(hcols[1], r1cols[1]);
+    try std.testing.expectEqual(hcols[2], r1cols[2]);
+    try std.testing.expectEqual(hcols[0], r3cols[0]);
+    try std.testing.expectEqual(hcols[1], r3cols[1]);
+    try std.testing.expectEqual(hcols[2], r3cols[2]);
+    try std.testing.expectEqual(hcols[0], r5cols[0]);
+    try std.testing.expectEqual(hcols[1], r5cols[1]);
+    try std.testing.expectEqual(hcols[2], r5cols[2]);
+    try std.testing.expectEqual(hcols[0], bot_cols[0]);
+    try std.testing.expectEqual(hcols[1], bot_cols[1]);
+    try std.testing.expectEqual(hcols[2], bot_cols[2]);
+
+    const top_l = try frm.cell(hcols[0], 0);
+    const top_m = try frm.cell(hcols[1], 0);
+    const top_r = try frm.cell(hcols[2], 0);
+    try std.testing.expectEqual(@as(u21, 0x250C), top_l.cp); // ┌
+    try std.testing.expectEqual(@as(u21, 0x252C), top_m.cp); // ┬
+    try std.testing.expectEqual(@as(u21, 0x2510), top_r.cp); // ┐
+
+    const sep_l = try frm.cell(hcols[0], 2);
+    const sep_m = try frm.cell(hcols[1], 2);
+    const sep_r = try frm.cell(hcols[2], 2);
+    try std.testing.expectEqual(@as(u21, 0x251C), sep_l.cp); // ├
+    try std.testing.expectEqual(@as(u21, 0x253C), sep_m.cp); // ┼
+    try std.testing.expectEqual(@as(u21, 0x2524), sep_r.cp); // ┤
+
+    const bot_l = try frm.cell(hcols[0], 6);
+    const bot_m = try frm.cell(hcols[1], 6);
+    const bot_r = try frm.cell(hcols[2], 6);
+    try std.testing.expectEqual(@as(u21, 0x2514), bot_l.cp); // └
+    try std.testing.expectEqual(@as(u21, 0x2534), bot_m.cp); // ┴
+    try std.testing.expectEqual(@as(u21, 0x2518), bot_r.cp); // ┘
+
+    // Cells are padded with spaces around content: "│ a           │ 1     │"
+    try std.testing.expectEqual(@as(u21, ' '), (try frm.cell(hcols[0] + 1, 3)).cp);
+    try std.testing.expectEqual(@as(u21, 'a'), (try frm.cell(hcols[0] + 2, 3)).cp);
+    try std.testing.expectEqual(@as(u21, ' '), (try frm.cell(hcols[1] - 1, 3)).cp);
+    try std.testing.expectEqual(@as(u21, ' '), (try frm.cell(hcols[1] + 1, 3)).cp);
+    try std.testing.expectEqual(@as(u21, '1'), (try frm.cell(hcols[1] + 2, 3)).cp);
+    try std.testing.expectEqual(@as(u21, ' '), (try frm.cell(hcols[2] - 1, 3)).cp);
+}
+
+test "markdown wrap still wraps non-table lines" {
+    var it = mdWrapIter("alpha beta gamma", 8);
+    const l0 = it.next().?;
+    const l1 = it.next().?;
+    const l2 = it.next().?;
+    try std.testing.expectEqualStrings("alpha", l0);
+    try std.testing.expectEqualStrings("beta", l1);
+    try std.testing.expectEqualStrings("gamma", l2);
+    try std.testing.expect(it.next() == null);
+}
+
+test "transcript keeps markdown table state when top rows are skipped" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .text = "| H1 | H2 |\n" ++
+        "| --- | --- |\n" ++
+        "| a1 | b1 |\n" ++
+        "| a2 | b2 |" });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 2);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    var a2_col: ?usize = null;
+    var x: usize = 0;
+    while (x < frm.w) : (x += 1) {
+        const c = try frm.cell(x, 0);
+        if (c.cp == 'a') {
+            const n = if (x + 1 < frm.w) try frm.cell(x + 1, 0) else continue;
+            if (n.cp == '2') {
+                a2_col = x;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(a2_col != null);
+    const c = try frm.cell(a2_col.?, 0);
+    try std.testing.expect(!c.style.bold);
 }
 
 test "text coalescing merges consecutive text events" {
@@ -1496,7 +2231,7 @@ test "info text has dim fg and no bg" {
     try std.testing.expect(c1.style.bg.isDefault());
 }
 
-test "tool result success has dim fg" {
+test "tool result success uses tool output fg" {
     var tr = Transcript.init(std.testing.allocator);
     defer tr.deinit();
 
@@ -1512,7 +2247,26 @@ test "tool result success has dim fg" {
 
     const t = theme.get();
     const c1 = try frm.cell(1, 0);
-    try std.testing.expect(frame.Color.eql(c1.style.fg, t.dim));
+    try std.testing.expect(frame.Color.eql(c1.style.fg, t.tool_output));
+    try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_success_bg));
+}
+
+test "tool result ask payload renders as readable lines" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_result = .{
+        .id = "ask-1",
+        .out = "{\"cancelled\":false,\"answers\":[{\"id\":\"scope\",\"answer\":\"Ship it\",\"index\":0},{\"id\":\"risk\",\"answer\":\"Low\",\"index\":1}]}",
+        .is_err = false,
+    } });
+
+    try std.testing.expectEqual(@as(usize, 1), tr.count());
+    const txt = tr.blocks.items[0].text();
+    try std.testing.expect(std.mem.indexOf(u8, txt, "ask: 2 answers") != null);
+    try std.testing.expect(std.mem.indexOf(u8, txt, "scope: Ship it") != null);
+    try std.testing.expect(std.mem.indexOf(u8, txt, "risk: Low") != null);
+    try std.testing.expect(std.mem.indexOfScalar(u8, txt, '{') == null);
 }
 
 test "tool result error has err fg and error bg" {
@@ -1533,6 +2287,48 @@ test "tool result error has err fg and error bg" {
     const c1 = try frm.cell(1, 0);
     try std.testing.expect(frame.Color.eql(c1.style.fg, t.err));
     try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_error_bg));
+}
+
+test "tool call pending recolors to success and joins result block" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_call = .{ .id = "c9", .name = "read", .args = "{\"path\":\"a\"}" } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 2);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    const t = theme.get();
+    const call_pending = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(call_pending.style.bg, t.tool_pending_bg));
+
+    try tr.append(.{ .tool_result = .{ .id = "c9", .out = "ok", .is_err = false } });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    const call_done = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(call_done.style.bg, t.tool_success_bg));
+    const result_row = try frm.cell(1, 1);
+    try std.testing.expect(frame.Color.eql(result_row.style.bg, t.tool_success_bg));
+}
+
+test "tool call recolors to error with failed result" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_call = .{ .id = "ce", .name = "bash", .args = "{\"cmd\":\"false\"}" } });
+    try tr.append(.{ .tool_result = .{ .id = "ce", .out = "failed", .is_err = true } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 2);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    const t = theme.get();
+    const call_row = try frm.cell(1, 0);
+    const result_row = try frm.cell(1, 1);
+    try std.testing.expect(frame.Color.eql(call_row.style.bg, t.tool_error_bg));
+    try std.testing.expect(frame.Color.eql(result_row.style.bg, t.tool_error_bg));
+    try std.testing.expect(frame.Color.eql(result_row.style.fg, t.err));
 }
 
 test "usage and stop produce no transcript blocks" {

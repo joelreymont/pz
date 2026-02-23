@@ -70,6 +70,7 @@ fn checkLatest(alloc: std.mem.Allocator) !?[]u8 {
 
     var http = std.http.Client{ .allocator = ar };
     defer http.deinit();
+    try http.initDefaultProxies(ar);
 
     const uri = std.Uri{
         .scheme = "https",
@@ -80,8 +81,8 @@ fn checkLatest(alloc: std.mem.Allocator) !?[]u8 {
     const ua = "pz/" ++ cli.version;
     var req = try http.request(.GET, uri, .{
         .extra_headers = &.{
-            .{ .name = "user-agent", .value = ua },
-            .{ .name = "accept", .value = "application/vnd.github+json" },
+            .{ .name = "User-Agent", .value = ua },
+            .{ .name = "Accept", .value = "application/vnd.github+json" },
         },
         .keep_alive = false,
     });
