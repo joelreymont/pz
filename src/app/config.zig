@@ -58,6 +58,49 @@ pub const Config = struct {
     }
 };
 
+pub const pz_state_dir = ".pz";
+pub const pz_state_file = "state.json";
+
+pub const PzState = struct {
+    last_hash: ?[]const u8 = null,
+
+    pub fn load(alloc: std.mem.Allocator) ?PzState {
+        const home = std.posix.getenv("HOME") orelse return null;
+        const path = std.fs.path.join(alloc, &.{ home, pz_state_dir, pz_state_file }) catch return null;
+        defer alloc.free(path);
+        const raw = std.fs.cwd().readFileAlloc(alloc, path, 64 * 1024) catch return null;
+        defer alloc.free(raw);
+        const parsed = std.json.parseFromSlice(PzState, alloc, raw, .{
+            .allocate = .alloc_always,
+            .ignore_unknown_fields = true,
+        }) catch return null;
+        defer parsed.deinit();
+        // Dupe fields so they outlive the parsed arena
+        return .{
+            .last_hash = if (parsed.value.last_hash) |h| (alloc.dupe(u8, h) catch return null) else null,
+        };
+    }
+
+    pub fn save(self: PzState, alloc: std.mem.Allocator) void {
+        const home = std.posix.getenv("HOME") orelse return;
+        const dir_path = std.fs.path.join(alloc, &.{ home, pz_state_dir }) catch return;
+        defer alloc.free(dir_path);
+        std.fs.cwd().makePath(dir_path) catch return;
+        const path = std.fs.path.join(alloc, &.{ dir_path, pz_state_file }) catch return;
+        defer alloc.free(path);
+        const json = std.json.Stringify.valueAlloc(alloc, self, .{}) catch return;
+        defer alloc.free(json);
+        const file = std.fs.cwd().createFile(path, .{}) catch return;
+        defer file.close();
+        file.writeAll(json) catch return;
+    }
+
+    pub fn deinit(self: *PzState, alloc: std.mem.Allocator) void {
+        if (self.last_hash) |h| alloc.free(h);
+        self.* = undefined;
+    }
+};
+
 pub const Err = anyerror;
 
 pub fn discover(

@@ -5,8 +5,70 @@ const std = @import("std");
 pub fn wcwidth(cp: u21) u2 {
     if (cp < 0x20) return 0;
     if (cp == 0x7f) return 0;
+    if (isZeroWidth(cp)) return 0;
     if (isWide(cp)) return 2;
     return 1;
+}
+
+/// Zero-width codepoints: combining marks, joiners, variation selectors,
+/// default ignorable format characters.
+fn isZeroWidth(cp: u21) bool {
+    // Fast path: most text is ASCII/Latin (except soft hyphen)
+    if (cp < 0x00AD) return false;
+
+    const Range = struct { lo: u21, hi: u21 };
+    // Sorted by .lo for binary search
+    const ranges = comptime [_]Range{
+        .{ .lo = 0x00AD, .hi = 0x00AD }, // Soft Hyphen
+        .{ .lo = 0x0300, .hi = 0x036F }, // Combining Diacritical Marks
+        .{ .lo = 0x0591, .hi = 0x05BD }, // Hebrew combining
+        .{ .lo = 0x05BF, .hi = 0x05BF },
+        .{ .lo = 0x05C1, .hi = 0x05C2 },
+        .{ .lo = 0x05C4, .hi = 0x05C5 },
+        .{ .lo = 0x05C7, .hi = 0x05C7 },
+        .{ .lo = 0x0610, .hi = 0x061A }, // Arabic combining
+        .{ .lo = 0x064B, .hi = 0x065F },
+        .{ .lo = 0x0670, .hi = 0x0670 },
+        .{ .lo = 0x06D6, .hi = 0x06DC },
+        .{ .lo = 0x06DF, .hi = 0x06E4 },
+        .{ .lo = 0x06E7, .hi = 0x06E8 },
+        .{ .lo = 0x06EA, .hi = 0x06ED },
+        .{ .lo = 0x0900, .hi = 0x0903 }, // Devanagari/Indic combining
+        .{ .lo = 0x093A, .hi = 0x094F },
+        .{ .lo = 0x0951, .hi = 0x0957 },
+        .{ .lo = 0x0962, .hi = 0x0963 },
+        .{ .lo = 0x0E31, .hi = 0x0E31 }, // Thai combining
+        .{ .lo = 0x0E34, .hi = 0x0E3A },
+        .{ .lo = 0x0E47, .hi = 0x0E4E },
+        .{ .lo = 0x1160, .hi = 0x11FF }, // Hangul Jamo combining
+        .{ .lo = 0x1AB0, .hi = 0x1AFF }, // Combining Diacritical Marks Extended
+        .{ .lo = 0x1DC0, .hi = 0x1DFF }, // Combining Diacritical Marks Supplement
+        .{ .lo = 0x200B, .hi = 0x200D }, // ZWSP, ZWNJ, ZWJ
+        .{ .lo = 0x2060, .hi = 0x2064 }, // Word Joiner etc.
+        .{ .lo = 0x20D0, .hi = 0x20FF }, // Combining Marks for Symbols
+        .{ .lo = 0x302A, .hi = 0x302D }, // CJK combining
+        .{ .lo = 0x3099, .hi = 0x309A }, // Kana combining (dakuten/handakuten)
+        .{ .lo = 0xFE00, .hi = 0xFE0F }, // Variation Selectors
+        .{ .lo = 0xFE20, .hi = 0xFE2F }, // Combining Half Marks
+        .{ .lo = 0xFEFF, .hi = 0xFEFF }, // BOM/ZWNBSP
+        .{ .lo = 0xE0001, .hi = 0xE007F }, // Tags
+        .{ .lo = 0xE0100, .hi = 0xE01EF }, // Variation Selectors Supplement
+    };
+
+    // Binary search (ranges are sorted by .lo)
+    var lo: usize = 0;
+    var hi: usize = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (cp > ranges[mid].hi) {
+            lo = mid + 1;
+        } else if (cp < ranges[mid].lo) {
+            hi = mid;
+        } else {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// String display width in columns, decoding UTF-8.
@@ -236,4 +298,64 @@ test "strwidth: empty" {
 test "strwidth: invalid UTF-8 fallback" {
     const bad = [_]u8{ 0xff, 0xfe };
     try std.testing.expectEqual(@as(usize, 2), strwidth(&bad));
+}
+
+test "wcwidth: combining marks are zero-width" {
+    // U+0301 Combining Acute Accent
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x0301));
+    // U+0300 Combining Grave Accent
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x0300));
+    // U+036F end of basic combining range
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x036F));
+}
+
+test "wcwidth: ZWJ and ZWNJ are zero-width" {
+    // U+200D Zero Width Joiner
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x200D));
+    // U+200C Zero Width Non-Joiner
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x200C));
+    // U+200B Zero Width Space
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x200B));
+}
+
+test "wcwidth: variation selectors are zero-width" {
+    // U+FE0F Variation Selector 16 (emoji presentation)
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0xFE0F));
+    // U+FE00 Variation Selector 1
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0xFE00));
+    // U+E0100 Variation Selector Supplement
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0xE0100));
+}
+
+test "wcwidth: soft hyphen is zero-width" {
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x00AD));
+}
+
+test "wcwidth: BOM/ZWNBSP is zero-width" {
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0xFEFF));
+}
+
+test "wcwidth: Hebrew combining marks" {
+    // U+05B0 Hebrew Point Sheva
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x05B0));
+}
+
+test "wcwidth: Arabic combining marks" {
+    // U+064E Arabic Fathah
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x064E));
+}
+
+test "wcwidth: Thai combining marks" {
+    // U+0E34 Thai Sara I
+    try std.testing.expectEqual(@as(u2, 0), wcwidth(0x0E34));
+}
+
+test "strwidth: combining mark after base char" {
+    // "é" as e + U+0301 = 1 column (base + zero-width combining)
+    try std.testing.expectEqual(@as(usize, 1), strwidth("e\xcc\x81"));
+}
+
+test "strwidth: emoji with variation selector" {
+    // U+2764 U+FE0F (heart + emoji presentation) = 2 columns
+    try std.testing.expectEqual(@as(usize, 2), strwidth("\xe2\x9d\xa4\xef\xb8\x8f"));
 }

@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-linux
+            os: ubuntu-latest
+            artifact: pz-x86_64-linux
+          - target: aarch64-linux
+            os: ubuntu-latest
+            artifact: pz-aarch64-linux
+          - target: x86_64-macos
+            os: macos-latest
+            artifact: pz-x86_64-macos
+          - target: aarch64-macos
+            os: macos-latest
+            artifact: pz-aarch64-macos
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 50
+
+      - name: setup zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: build
+        run: zig build -Doptimize=ReleaseFast -Dtarget=${{ matrix.target }}
+
+      - name: package
+        run: |
+          cd zig-out/bin
+          tar czf ../../${{ matrix.artifact }}.tar.gz pz
+          cd ../..
+
+      - name: upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: create release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            pz-x86_64-linux.tar.gz
+            pz-aarch64-linux.tar.gz
+            pz-x86_64-macos.tar.gz
+            pz-aarch64-macos.tar.gz

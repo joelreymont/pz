@@ -1,8 +1,11 @@
 const std = @import("std");
 const Args = @import("args.zig");
 const config = @import("config.zig");
+const build_options = @import("build_options");
 
-pub const version = "0.0.0";
+pub const version = build_options.version;
+pub const git_hash = build_options.git_hash;
+pub const changelog = build_options.changelog;
 
 pub const ParseError = Args.ParseError || config.Err;
 
@@ -23,6 +26,7 @@ pub const Run = struct {
 pub const Command = union(enum) {
     help: []const u8,
     version: []const u8,
+    changelog: []const u8,
     run: Run,
 
     pub fn deinit(self: *Command, alloc: std.mem.Allocator) void {
@@ -44,6 +48,7 @@ pub fn parse(
 
     if (parsed.show_help) return .{ .help = help_text };
     if (parsed.show_version) return .{ .version = version_text };
+    if (parsed.show_changelog) return .{ .changelog = changelog_text };
 
     var cfg = try config.discover(alloc, dir, parsed, env);
     errdefer cfg.deinit(alloc);
@@ -104,11 +109,13 @@ pub const help_text =
     \\      --system-prompt <TEXT>   Override system prompt
     \\      --append-system-prompt <TEXT>
     \\                             Append to system prompt
+    \\      --changelog             Show changelog
     \\  -h, --help                  Show help
     \\  -V, --version               Show version
 ;
 
-pub const version_text = "pz " ++ version ++ "\n";
+pub const version_text = "pz " ++ version ++ " (" ++ git_hash ++ ")\n";
+pub const changelog_text = changelog ++ "\n";
 
 test "cli returns help and version commands" {
     var tmp = std.testing.tmpDir(.{});

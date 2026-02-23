@@ -56,6 +56,7 @@ pub const Parsed = struct {
     max_turns: u16 = 0,
     show_help: bool = false,
     show_version: bool = false,
+    show_changelog: bool = false,
 };
 
 pub const SessionSel = union(enum) {
@@ -136,6 +137,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         verbose,
         system_prompt,
         append_system_prompt,
+        changelog,
         max_turns,
     };
     const flag_map = std.StaticStringMap(Flag).initComptime(.{
@@ -169,6 +171,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
         .{ "--verbose", .verbose },
         .{ "--system-prompt", .system_prompt },
         .{ "--append-system-prompt", .append_system_prompt },
+        .{ "--changelog", .changelog },
         .{ "--max-turns", .max_turns },
     });
     const mode_map = std.StaticStringMap(Mode).initComptime(.{
@@ -197,6 +200,7 @@ pub fn parse(argv: []const []const u8) ParseError!Parsed {
             switch (flag) {
                 .help => out.show_help = true,
                 .version => out.show_version = true,
+                .changelog => out.show_changelog = true,
                 .cont => try setSession(&out, &session_seen, .cont),
                 .resm => try setSession(&out, &session_seen, .resm),
                 .session => {
