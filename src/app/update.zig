@@ -201,6 +201,9 @@ fn httpGetResult(
 ) !HttpResult {
     var http = std.http.Client{ .allocator = alloc };
     defer http.deinit();
+    var proxy_arena = std.heap.ArenaAllocator.init(alloc);
+    defer proxy_arena.deinit();
+    try http.initDefaultProxies(proxy_arena.allocator());
 
     const uri = try std.Uri.parse(url);
     const ua = "pz/" ++ cli.version;
@@ -278,6 +281,7 @@ fn sanitizeSnippetAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 fn statusHint(status: u16) []const u8 {
     return switch (status) {
+        400 => "bad request from upstream (often proxy/header rewriting).",
         401 => "GitHub rejected the request as unauthorized.",
         403 => "GitHub denied the request (possibly rate-limited or blocked).",
         404 => "Release endpoint not found.",
@@ -285,6 +289,84 @@ fn statusHint(status: u16) []const u8 {
         500...599 => "GitHub returned a server error. Retry shortly.",
         else => "GitHub returned an unexpected response.",
     };
+}
+
+fn indexOfIgnoreCasePos(hay: []const u8, start: usize, needle: []const u8) ?usize {
+    if (start >= hay.len) return null;
+    const rel = std.ascii.indexOfIgnoreCase(hay[start..], needle) orelse return null;
+    return start + rel;
+}
+
+fn stripHtmlTagsCollapseAlloc(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(alloc);
+    var i: usize = 0;
+    var in_tag = false;
+    var pending_sp = false;
+    while (i < raw.len) : (i += 1) {
+        const b = raw[i];
+        if (b == '<') {
+            in_tag = true;
+            continue;
+        }
+        if (b == '>') {
+            in_tag = false;
+            pending_sp = true;
+            continue;
+        }
+        if (in_tag) continue;
+        if (b == '\n' or b == '\r' or b == '\t' or b == ' ') {
+            pending_sp = true;
+            continue;
+        }
+        if (pending_sp and out.items.len != 0) {
+            try out.append(alloc, ' ');
+        }
+        pending_sp = false;
+        try out.append(alloc, b);
+    }
+    const owned = try out.toOwnedSlice(alloc);
+    const trimmed = std.mem.trim(u8, owned, " ");
+    if (trimmed.ptr == owned.ptr and trimmed.len == owned.len) return owned;
+    const dup = try alloc.dupe(u8, trimmed);
+    alloc.free(owned);
+    return dup;
+}
+
+fn htmlTagTextAlloc(alloc: std.mem.Allocator, body: []const u8, tag: []const u8) !?[]u8 {
+    var open_buf: [16]u8 = undefined;
+    var close_buf: [20]u8 = undefined;
+    const open = std.fmt.bufPrint(&open_buf, "<{s}", .{tag}) catch return null;
+    const close = std.fmt.bufPrint(&close_buf, "</{s}>", .{tag}) catch return null;
+    const open_idx = std.ascii.indexOfIgnoreCase(body, open) orelse return null;
+    const gt_rel = std.mem.indexOfScalar(u8, body[open_idx..], '>') orelse return null;
+    const val_start = open_idx + gt_rel + 1;
+    const close_idx = indexOfIgnoreCasePos(body, val_start, close) orelse return null;
+    if (close_idx <= val_start) return null;
+    const raw = body[val_start..close_idx];
+    const txt = try stripHtmlTagsCollapseAlloc(alloc, raw);
+    if (txt.len == 0) {
+        alloc.free(txt);
+        return null;
+    }
+    return txt;
+}
+
+fn responseDetailAlloc(alloc: std.mem.Allocator, body: []const u8) ![]u8 {
+    if (std.ascii.indexOfIgnoreCase(body, "<html") != null) {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        const tags = [_][]const u8{ "title", "h1", "h2", "p" };
+        for (tags) |tag| {
+            const part = try htmlTagTextAlloc(alloc, body, tag) orelse continue;
+            defer alloc.free(part);
+            if (out.items.len != 0) try out.appendSlice(alloc, " | ");
+            try out.appendSlice(alloc, part);
+        }
+        if (out.items.len != 0) return out.toOwnedSlice(alloc);
+        out.deinit(alloc);
+    }
+    return sanitizeSnippetAlloc(alloc, body);
 }
 
 fn formatTransportFailure(
@@ -307,12 +389,12 @@ fn formatHttpFailure(
     status: u16,
     body: []const u8,
 ) ![]u8 {
-    const snip = try sanitizeSnippetAlloc(alloc, body);
-    defer alloc.free(snip);
+    const detail = try responseDetailAlloc(alloc, body);
+    defer alloc.free(detail);
     return std.fmt.allocPrint(
         alloc,
         "upgrade failed: could not {s}\nhttp status: {d}\nreason: {s}\nurl: {s}\nresponse: {s}\nnext: retry later or install manually from https://github.com/joelreymont/pz/releases/latest\n",
-        .{ step, status, statusHint(status), url, snip },
+        .{ step, status, statusHint(status), url, detail },
     );
 }
 
@@ -629,4 +711,26 @@ test "formatHttpFailure includes actionable fields" {
     try std.testing.expect(std.mem.indexOf(u8, msg, "http status: 403") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "rate-limited") != null);
     try std.testing.expect(std.mem.indexOf(u8, msg, "response: ") != null);
+}
+
+test "formatHttpFailure extracts concise html error text" {
+    const html =
+        \\<!DOCTYPE HTML>
+        \\<html><head><title>Bad Request</title></head>
+        \\<body><h2>Bad Request - Invalid Header</h2>
+        \\<p>HTTP Error 400. The request has an invalid header name.</p></body></html>
+    ;
+    const msg = try formatHttpFailure(
+        std.testing.allocator,
+        "download release archive",
+        "https://example.invalid/archive",
+        400,
+        html,
+    );
+    defer std.testing.allocator.free(msg);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "http status: 400") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "proxy/header rewriting") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "Bad Request - Invalid Header") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "invalid header name") != null);
+    try std.testing.expect(std.mem.indexOf(u8, msg, "<html>") == null);
 }

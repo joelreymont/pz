@@ -295,7 +295,7 @@ test "golden snapshot deterministic frame text" {
         \\  .row8: []const u8
         \\    ""
         \\  .row9: []const u8
-        \\    "mode steering q0 1 turn (p) m"
+        \\    "1 turn m"
     ).expectEqual(snap);
 }
 
@@ -360,11 +360,10 @@ test "e2e footer visible at bottom" {
     defer vs.deinit();
     try renderToVs(&ui, &vs);
 
-    // h=8: footer at rows 6-7. Check footer line 2 has (provider) model.
+    // h=8: footer at rows 6-7. Check footer line 2 has model.
     const row7 = try vs.rowText(std.testing.allocator, 7);
     defer std.testing.allocator.free(row7);
     try std.testing.expect(std.mem.indexOf(u8, row7, "gpt-4") != null);
-    try std.testing.expect(std.mem.indexOf(u8, row7, "(openai)") != null);
 }
 
 // ── Golden parity tests ──
@@ -387,7 +386,7 @@ test "golden: text block has default fg, no bg fill" {
     try vs.expectBg(0, 0, .{ .default = {} }); // padding col also default
 }
 
-test "golden: tool_call has dim fg, no bg fill" {
+test "golden: tool_call has dim fg with pending bg fill" {
     var ui = try Ui.init(std.testing.allocator, 30, 8, "m", "p");
     defer ui.deinit();
 
@@ -413,11 +412,11 @@ test "golden: tool_call has dim fg, no bg fill" {
 
     // Content fg = dim
     try vs.expectFg(tr, 1, .{ .rgb = 0x666666 });
-    // No bg fill
-    try vs.expectBg(tr, 0, .{ .default = {} });
+    // Pending bg fill across row
+    try vs.expectBg(tr, 0, .{ .rgb = 0x282832 });
 }
 
-test "golden: tool_result success has dim fg" {
+test "golden: tool_result success has dim fg with success bg" {
     var ui = try Ui.init(std.testing.allocator, 40, 8, "m", "p");
     defer ui.deinit();
 
@@ -442,6 +441,7 @@ test "golden: tool_result success has dim fg" {
     const rr = result_row.?;
 
     try vs.expectFg(rr, 1, .{ .rgb = 0x666666 }); // dim
+    try vs.expectBg(rr, 1, .{ .rgb = 0x283228 }); // success bg
 }
 
 test "golden: error block has err fg, bold, and error bg full row" {

@@ -15,6 +15,7 @@ pub const Rect = struct {
 const imgproto = @import("imgproto.zig");
 
 const Kind = enum { text, user, thinking, tool, err, meta, image };
+const ToolPhase = enum { none, call, result };
 
 const Span = struct {
     start: usize, // byte offset in buf
@@ -27,6 +28,8 @@ const Block = struct {
     buf: std.ArrayListUnmanaged(u8),
     st: frame.Style,
     spans: std.ArrayListUnmanaged(Span) = .empty,
+    tool_gid: u64 = 0,
+    tool_phase: ToolPhase = .none,
 
     pub fn deinit(self: *Block, alloc: std.mem.Allocator) void {
         self.spans.deinit(alloc);
@@ -136,17 +139,23 @@ pub const Transcript = struct {
                 defer self.alloc.free(display);
                 try self.pushBlock(.tool, display, .{
                     .fg = theme.get().dim,
+                    .bg = theme.get().tool_pending_bg,
                 });
+                self.tagLastTool(toolGroup(tc.id), .call);
             },
             .tool_result => |tr| {
+                const gid = toolGroup(tr.id);
+                self.setToolCallStatus(gid, tr.is_err);
                 if (tr.is_err) {
                     try self.pushAnsi(.err, "", .{}, tr.out, .{
                         .fg = theme.get().err,
                         .bg = theme.get().tool_error_bg,
                     });
+                    self.tagLastTool(gid, .result);
                 } else {
                     // Show result with collapsing like pi
                     try self.pushToolResult(tr.out);
+                    self.tagLastTool(gid, .result);
                 }
             },
             .err => |t| try self.pushFmt(.err, "[err] {s}", .{t}, .{
@@ -200,13 +209,15 @@ pub const Transcript = struct {
         const bar_w: usize = if (avail_w >= 2) 1 else 0;
         const count_w = avail_w - bar_w;
         var total: usize = 0;
-        var vis_ct: usize = 0;
+        var prev_vis: ?*Block = null;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
+            if (prev_vis) |prev| {
+                if (needsGap(prev, b)) total += 1;
+            }
             total += blockLineCount(b, count_w);
-            vis_ct += 1;
+            prev_vis = b;
         }
-        if (vis_ct > 1) total += vis_ct - 1; // gaps
         if (total == 0) return;
 
         const has_bar = total > rect.h and bar_w > 0;
@@ -226,11 +237,12 @@ pub const Transcript = struct {
 
         var md = markdown.MdRenderer{};
         var first_vis = true;
+        var prev_rendered: ?*Block = null;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
 
             // 1-line gap between blocks
-            if (!first_vis) {
+            if (!first_vis and (prev_rendered == null or needsGap(prev_rendered.?, b))) {
                 if (skipped < skip) {
                     skipped += 1;
                 } else if (row < rect.h) {
@@ -238,6 +250,7 @@ pub const Transcript = struct {
                 }
             }
             first_vis = false;
+            prev_rendered = b;
 
             // Image blocks: header line + reserved rows
             if (b.kind == .image) {
@@ -274,13 +287,14 @@ pub const Transcript = struct {
             const use_md = b.kind == .text or b.kind == .user;
             if (use_md) md = .{};
             var wit = wrapIter(txt, text_w);
-            while (wit.next()) |line| {
+            var md_wit = mdWrapIter(txt, text_w);
+            while (true) {
+                const line = if (use_md) md_wit.next() orelse break else wit.next() orelse break;
                 if (skipped < skip) {
                     skipped += 1;
                     if (use_md) {
-                        // Advance md state for skipped lines
-                        if (md.in_code_block or markdown.isFence(line))
-                            md.advanceSkipped(line);
+                        // Advance markdown state for all skipped lines.
+                        md.advanceSkipped(line);
                     }
                     continue;
                 }
@@ -342,6 +356,7 @@ pub const Transcript = struct {
 
     fn blockLineCount(b: *const Block, w: usize) usize {
         if (b.kind == .image) return imgproto.img_rows;
+        if (b.kind == .text or b.kind == .user) return countMdLines(b.text(), w);
         return countLines(b.text(), w);
     }
 
@@ -438,6 +453,7 @@ pub const Transcript = struct {
             // Short enough: show all
             try self.pushAnsi(.tool, "", .{}, out, .{
                 .fg = theme.get().dim,
+                .bg = theme.get().tool_success_bg,
             });
             return;
         }
@@ -458,9 +474,39 @@ pub const Transcript = struct {
 
         try self.pushAnsi(.tool, " ... ({d} earlier lines, ctrl+o to expand)\n", .{hidden}, out[skip..], .{
             .fg = theme.get().dim,
+            .bg = theme.get().tool_success_bg,
         });
     }
+
+    fn setToolCallStatus(self: *Transcript, gid: u64, is_err: bool) void {
+        if (gid == 0) return;
+        var i = self.blocks.items.len;
+        while (i > 0) {
+            i -= 1;
+            var b = &self.blocks.items[i];
+            if (b.tool_gid != gid or b.tool_phase != .call) continue;
+            b.st.bg = if (is_err) theme.get().tool_error_bg else theme.get().tool_success_bg;
+            return;
+        }
+    }
+
+    fn tagLastTool(self: *Transcript, gid: u64, phase: ToolPhase) void {
+        if (self.blocks.items.len == 0) return;
+        var b = &self.blocks.items[self.blocks.items.len - 1];
+        b.tool_gid = gid;
+        b.tool_phase = phase;
+    }
 };
+
+fn toolGroup(id: []const u8) u64 {
+    if (id.len == 0) return 0;
+    return std.hash.Wyhash.hash(0, id);
+}
+
+fn needsGap(prev: *const Block, cur: *const Block) bool {
+    if (prev.tool_gid != 0 and prev.tool_gid == cur.tool_gid) return false;
+    return true;
+}
 
 // -- Tool call formatting --
 
@@ -585,11 +631,58 @@ pub fn wrapIter(text: []const u8, w: usize) WrapIter {
     return .{ .text = text, .pos = 0, .w = w };
 }
 
+pub const MdWrapIter = struct {
+    text: []const u8,
+    pos: usize,
+    w: usize,
+    line_wit: ?WrapIter = null,
+
+    pub fn next(self: *MdWrapIter) ?[]const u8 {
+        if (self.w == 0) return null;
+        while (true) {
+            if (self.line_wit) |*wit| {
+                if (wit.next()) |seg| return seg;
+                self.line_wit = null;
+            }
+            if (self.pos >= self.text.len) return null;
+
+            const start = self.pos;
+            var i = start;
+            while (i < self.text.len and self.text[i] != '\n') : (i += 1) {}
+            const line = self.text[start..i];
+            self.pos = if (i < self.text.len) i + 1 else i;
+
+            if (line.len == 0) return line;
+            if (isMdTableLine(line)) return line;
+
+            self.line_wit = wrapIter(line, self.w);
+        }
+    }
+};
+
+pub fn mdWrapIter(text: []const u8, w: usize) MdWrapIter {
+    return .{ .text = text, .pos = 0, .w = w };
+}
+
+fn isMdTableLine(line: []const u8) bool {
+    const t = std.mem.trimLeft(u8, line, " \t");
+    return t.len > 0 and t[0] == '|';
+}
+
 pub fn countLines(text: []const u8, w: usize) usize {
     if (w == 0) return 0;
     if (text.len == 0) return 1; // empty block = 1 display line
     var n: usize = 0;
     var it = wrapIter(text, w);
+    while (it.next() != null) n += 1;
+    return if (n == 0) 1 else n;
+}
+
+fn countMdLines(text: []const u8, w: usize) usize {
+    if (w == 0) return 0;
+    if (text.len == 0) return 1;
+    var n: usize = 0;
+    var it = mdWrapIter(text, w);
     while (it.next() != null) n += 1;
     return if (n == 0) 1 else n;
 }
@@ -1043,6 +1136,63 @@ test "word wrap tabs count as width 1" {
     const l1 = it.next().?;
     try std.testing.expectEqualStrings("b\tc", l1); // b + tab + c = 3 cols, fits
     try std.testing.expect(it.next() == null);
+}
+
+test "markdown wrap keeps table rows intact" {
+    var it = mdWrapIter(
+        "| Name | Description |\n| --- | --- |\n| A | a very long description that should not wrap |",
+        12,
+    );
+    const l0 = it.next().?;
+    const l1 = it.next().?;
+    const l2 = it.next().?;
+    try std.testing.expectEqualStrings("| Name | Description |", l0);
+    try std.testing.expectEqualStrings("| --- | --- |", l1);
+    try std.testing.expectEqualStrings("| A | a very long description that should not wrap |", l2);
+    try std.testing.expect(it.next() == null);
+}
+
+test "markdown wrap still wraps non-table lines" {
+    var it = mdWrapIter("alpha beta gamma", 8);
+    const l0 = it.next().?;
+    const l1 = it.next().?;
+    const l2 = it.next().?;
+    try std.testing.expectEqualStrings("alpha", l0);
+    try std.testing.expectEqualStrings("beta", l1);
+    try std.testing.expectEqualStrings("gamma", l2);
+    try std.testing.expect(it.next() == null);
+}
+
+test "transcript keeps markdown table state when top rows are skipped" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .text =
+        "| H1 | H2 |\n" ++
+        "| --- | --- |\n" ++
+        "| a1 | b1 |\n" ++
+        "| a2 | b2 |"
+    });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 1);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 1 });
+
+    var a2_col: ?usize = null;
+    var x: usize = 0;
+    while (x < frm.w) : (x += 1) {
+        const c = try frm.cell(x, 0);
+        if (c.cp == 'a') {
+            const n = if (x + 1 < frm.w) try frm.cell(x + 1, 0) else continue;
+            if (n.cp == '2') {
+                a2_col = x;
+                break;
+            }
+        }
+    }
+    try std.testing.expect(a2_col != null);
+    const c = try frm.cell(a2_col.?, 0);
+    try std.testing.expect(!c.style.bold);
 }
 
 test "text coalescing merges consecutive text events" {
@@ -1513,6 +1663,7 @@ test "tool result success has dim fg" {
     const t = theme.get();
     const c1 = try frm.cell(1, 0);
     try std.testing.expect(frame.Color.eql(c1.style.fg, t.dim));
+    try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_success_bg));
 }
 
 test "tool result error has err fg and error bg" {
@@ -1533,6 +1684,48 @@ test "tool result error has err fg and error bg" {
     const c1 = try frm.cell(1, 0);
     try std.testing.expect(frame.Color.eql(c1.style.fg, t.err));
     try std.testing.expect(frame.Color.eql(c1.style.bg, t.tool_error_bg));
+}
+
+test "tool call pending recolors to success and joins result block" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_call = .{ .id = "c9", .name = "read", .args = "{\"path\":\"a\"}" } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 2);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    const t = theme.get();
+    const call_pending = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(call_pending.style.bg, t.tool_pending_bg));
+
+    try tr.append(.{ .tool_result = .{ .id = "c9", .out = "ok", .is_err = false } });
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    const call_done = try frm.cell(1, 0);
+    try std.testing.expect(frame.Color.eql(call_done.style.bg, t.tool_success_bg));
+    const result_row = try frm.cell(1, 1);
+    try std.testing.expect(frame.Color.eql(result_row.style.bg, t.tool_success_bg));
+}
+
+test "tool call recolors to error with failed result" {
+    var tr = Transcript.init(std.testing.allocator);
+    defer tr.deinit();
+
+    try tr.append(.{ .tool_call = .{ .id = "ce", .name = "bash", .args = "{\"cmd\":\"false\"}" } });
+    try tr.append(.{ .tool_result = .{ .id = "ce", .out = "failed", .is_err = true } });
+
+    var frm = try frame.Frame.init(std.testing.allocator, 30, 2);
+    defer frm.deinit(std.testing.allocator);
+    try tr.render(&frm, .{ .x = 0, .y = 0, .w = 30, .h = 2 });
+
+    const t = theme.get();
+    const call_row = try frm.cell(1, 0);
+    const result_row = try frm.cell(1, 1);
+    try std.testing.expect(frame.Color.eql(call_row.style.bg, t.tool_error_bg));
+    try std.testing.expect(frame.Color.eql(result_row.style.bg, t.tool_error_bg));
+    try std.testing.expect(frame.Color.eql(result_row.style.fg, t.err));
 }
 
 test "usage and stop produce no transcript blocks" {

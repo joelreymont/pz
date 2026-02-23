@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.7] - 2026-02-23
+
+### Changed
+- Footer status line now prioritizes token/accounting data and shows input/output tokens as `R... W...` (matching Pi-style read/write labels).
+- Footer no longer shows provider prefix or input-mode/queue counters (`(anthropic)`, `steering`, `qN`) to reduce clutter.
+
+### Fixed
+- Markdown table rendering in transcript view now preserves table row structure instead of wrapping pipe rows into broken layouts.
+- Markdown scroll-state handling now advances table/header state correctly for skipped rows, preventing bold/header styling bleed during scrollback.
+- Tool call/result transcript blocks now recolor post-factum on result (pending -> success/error) and keep grouped tool rows visually contiguous.
+- Footer right-side model rendering now respects left-side stats width and no longer overwrites token/cost counters on narrow terminals.
+
+### Tests
+- Added transcript regressions for markdown-aware wrapping, table-row preservation, and skipped-row table-state correctness.
+- Added footer regressions validating `R/W` token display and absence of mode/queue text.
+
+## [0.1.6] - 2026-02-23
+
+### Changed
+- Updater/version HTTP client now initializes proxy settings from standard env vars (`http_proxy`, `https_proxy`, `all_proxy` and uppercase variants).
+
+### Fixed
+- Upgrade HTTP errors now extract meaningful HTML message text (`title`/`h1`/`h2`/`p`) instead of printing truncated markup.
+- HTTP 400 upgrade failures now report a targeted hint for proxy/header rewriting scenarios.
+
+### Tests
+- Added updater regression covering HTML error-message extraction for 400 responses.
+
+## [0.1.5] - 2026-02-23
+
+### Fixed
+- TUI now decodes SS3 arrow sequences (`ESC O A/B`) so Up/Down navigation works in command preview and overlays on terminals using application-cursor mode.
+- Slash-command transcript writes now sanitize invalid UTF-8 instead of crashing, preventing `/upgrade` and other command outputs from aborting the UI on non-UTF-8 bytes.
+
+### Tests
+- Added input parser regressions for SS3 Up/Down arrow decoding.
+- Added runtime regressions for lossy UTF-8 sanitization and safe transcript insertion of invalid command output.
+
 ## [0.1.4] - 2026-02-23
 
 ### Added

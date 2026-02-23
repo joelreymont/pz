@@ -70,6 +70,7 @@ fn checkLatest(alloc: std.mem.Allocator) !?[]u8 {
 
     var http = std.http.Client{ .allocator = ar };
     defer http.deinit();
+    try http.initDefaultProxies(ar);
 
     const uri = std.Uri{
         .scheme = "https",
