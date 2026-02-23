@@ -199,7 +199,7 @@ pub const Panels = struct {
 
     /// Render footer matching pi layout:
     ///   Line 1: dim(cwd (branch))
-    ///   Line 2: dim(↑turns ↓tok R1.2k W3.4k $0.05 (sub) 2.9%/200k (auto))  dim((prov) model • thinking)
+    ///   Line 2: dim(Rin Wout CRcw CWcw $0.05 (sub) 2.9%/200k (auto))  dim(model • thinking)
     pub fn renderFooter(self: *const Panels, frm: *frame.Frame, rect: Rect) RenderError!void {
         if (rect.w == 0 or rect.h == 0) return;
 
@@ -249,13 +249,6 @@ pub const Panels = struct {
             var x = rect.x;
 
             // Left: turn count + usage stats
-            try writePart(frm, &x, x_end, y2, "mode ", dim_st);
-            try writePart(frm, &x, x_end, y2, inputModeText(self.input_mode), dim_st);
-            try writePart(frm, &x, x_end, y2, " q", dim_st);
-            var qbuf: [16]u8 = undefined;
-            const qtxt = fmtBuf(&qbuf, "{d}", .{self.queued_msgs}) catch return error.NoSpaceLeft;
-            try writePart(frm, &x, x_end, y2, qtxt, dim_st);
-            try writePart(frm, &x, x_end, y2, " ", dim_st);
 
             if (self.bg_launched > 0) {
                 try writePart(frm, &x, x_end, y2, "bg L", dim_st);
@@ -284,25 +277,25 @@ pub const Panels = struct {
                 try writePart(frm, &x, x_end, y2, if (self.turns == 1) " turn " else " turns ", dim_st);
             }
             if (self.has_usage) {
-                try writePart(frm, &x, x_end, y2, "\xe2\x86\x91", dim_st); // ↑
+                try writePart(frm, &x, x_end, y2, "R", dim_st);
                 var ib: [16]u8 = undefined;
                 const it = fmtCompact(&ib, self.usage.in_tok) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, it, dim_st);
 
-                try writePart(frm, &x, x_end, y2, " \xe2\x86\x93", dim_st); // ↓
+                try writePart(frm, &x, x_end, y2, " W", dim_st);
                 var ob: [16]u8 = undefined;
                 const ot = fmtCompact(&ob, self.usage.out_tok) catch return error.NoSpaceLeft;
                 try writePart(frm, &x, x_end, y2, ot, dim_st);
 
-                // R/W cache tokens
+                // Cache read/write tokens
                 if (self.usage.cache_read > 0) {
-                    try writePart(frm, &x, x_end, y2, " R", dim_st);
+                    try writePart(frm, &x, x_end, y2, " CR", dim_st);
                     var rb: [16]u8 = undefined;
                     const rt = fmtCompact(&rb, self.usage.cache_read) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, rt, dim_st);
                 }
                 if (self.usage.cache_write > 0) {
-                    try writePart(frm, &x, x_end, y2, " W", dim_st);
+                    try writePart(frm, &x, x_end, y2, " CW", dim_st);
                     var wb: [16]u8 = undefined;
                     const wt = fmtCompact(&wb, self.usage.cache_write) catch return error.NoSpaceLeft;
                     try writePart(frm, &x, x_end, y2, wt, dim_st);
@@ -344,26 +337,20 @@ pub const Panels = struct {
                 try writePart(frm, &x, x_end, y2, " (auto)", dim_st);
             }
 
-            // Right: (prov) model • thinking-level
+            // Right: model • thinking-level
             const model_text = self.model.items;
-            const prov_text = self.provider.items;
             if (model_text.len > 0) {
                 var right_cols = cpCountSlice(model_text);
-                if (prov_text.len > 0)
-                    right_cols += cpCountSlice(prov_text) + 3; // "(" + prov + ") "
                 if (self.thinking_label.len > 0)
                     right_cols += 3 + self.thinking_label.len; // " • " + label
                 if (right_cols < rect.w) {
                     var rx = x_end - right_cols;
-                    if (prov_text.len > 0) {
-                        try writePart(frm, &rx, x_end, y2, "(", dim_st);
-                        try writePart(frm, &rx, x_end, y2, prov_text, dim_st);
-                        try writePart(frm, &rx, x_end, y2, ") ", dim_st);
-                    }
-                    try writePart(frm, &rx, x_end, y2, model_text, dim_st);
-                    if (self.thinking_label.len > 0) {
-                        try writePart(frm, &rx, x_end, y2, " \xe2\x80\xa2 ", dim_st); // " • "
-                        try writePart(frm, &rx, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
+                    if (rx > x) {
+                        try writePart(frm, &rx, x_end, y2, model_text, dim_st);
+                        if (self.thinking_label.len > 0) {
+                            try writePart(frm, &rx, x_end, y2, " \xe2\x80\xa2 ", dim_st); // " • "
+                            try writePart(frm, &rx, x_end, y2, self.thinking_label, .{ .fg = theme.get().accent });
+                        }
                     }
                 }
             }
@@ -498,19 +485,11 @@ fn digitCols(n: u64) usize {
     return c;
 }
 
-fn inputModeText(mode: InputMode) []const u8 {
-    return switch (mode) {
-        .steering => "steering",
-        .queue => "queue",
-    };
-}
-
 fn usageCols(self: *const Panels) usize {
-    // ↑N ↓N = 1+digits + 1 + 1+digits
+    // RN WN = 1+digits + 2 + digits
     var c: usize = 0;
-    c += 1 + digitCols(self.usage.in_tok); // ↑N (↑ is 1 col)
-    c += 1; // space
-    c += 1 + digitCols(self.usage.out_tok); // ↓N
+    c += 1 + digitCols(self.usage.in_tok); // RN
+    c += 2 + digitCols(self.usage.out_tok); // WN (with leading " W")
     if (self.ctx_limit > 0) {
         const pct = self.cum_tok *| 100 / self.ctx_limit;
         c += 1; // space
@@ -822,7 +801,7 @@ test "panels footer shows (auto) after usage" {
 
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    // Search for "(auto)" in frame row 1 (contains non-ASCII ↑↓)
+    // Search for "(auto)" in frame row 1
     try std.testing.expect(findAsciiSeq(&frm, 1, "(auto)"));
 }
 
@@ -945,20 +924,24 @@ test "panels footer shows turn count" {
     try std.testing.expect(findAsciiSeq(&frm, 1, "5 turns"));
 }
 
-test "panels footer shows input mode and queue count" {
+test "panels footer hides input mode and queue count and shows R/W tokens" {
     var ps = try Panels.initFull(std.testing.allocator, "m", "p", "", "");
     defer ps.deinit();
     ps.setInputStatus(.queue, 3);
+    try ps.append(.{ .usage = .{ .in_tok = 12, .out_tok = 3, .tot_tok = 15 } });
 
     var frm = try frame.Frame.init(std.testing.allocator, 60, 2);
     defer frm.deinit(std.testing.allocator);
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
 
-    try std.testing.expect(findAsciiSeq(&frm, 1, "mode queue q3"));
+    try std.testing.expect(findAsciiSeq(&frm, 1, "R12 W3"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "queue"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "q3"));
 
     ps.setInputStatus(.steering, 0);
     try ps.renderFooter(&frm, .{ .x = 0, .y = 0, .w = 60, .h = 2 });
-    try std.testing.expect(findAsciiSeq(&frm, 1, "mode steering q0"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "steering"));
+    try std.testing.expect(!findAsciiSeq(&frm, 1, "q0"));
 }
 
 test "panels footer shows background job counts" {
