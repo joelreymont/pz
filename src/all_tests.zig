@@ -1,4 +1,6 @@
 const app_cli = @import("app/cli.zig");
+const app_changelog = @import("app/changelog.zig");
+const app_version = @import("app/version.zig");
 const app_runtime = @import("app/runtime.zig");
 const core_loop = @import("core/loop.zig");
 const sess = @import("core/session/mod.zig");
@@ -13,6 +15,8 @@ const perf_baseline = @import("perf/baseline.zig");
 
 test "all module tests" {
     _ = app_cli;
+    _ = app_changelog;
+    _ = app_version;
     _ = app_runtime;
     _ = core_loop;
     _ = sess;

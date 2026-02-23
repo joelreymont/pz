@@ -24,6 +24,7 @@ pub const Ui = struct {
     cp: ?cmdprev_mod.CmdPreview = null,
     arg_src: ?[]const []const u8 = null, // runtime-provided arg completion source
     path_items: ?[][]u8 = null, // owned file path completion items
+    path_prefix: ?[]u8 = null, // cached prefix for path_items
     img_cap: imgproto_mod.ImageCap = .none,
     spin: u8 = 0,
 
@@ -81,6 +82,10 @@ pub const Ui = struct {
         if (self.path_items) |items| {
             pathcomp_mod.freeList(self.alloc, items);
             self.path_items = null;
+        }
+        if (self.path_prefix) |p| {
+            self.alloc.free(p);
+            self.path_prefix = null;
         }
     }
 
@@ -242,10 +247,10 @@ pub const Ui = struct {
 
     pub fn updatePreview(self: *Ui) void {
         self.cp = null;
-        self.clearPathItems();
 
         const text = self.ed.text();
         if (text.len > 0 and text[0] == '/') {
+            self.clearPathItems();
             const prefix = text[1..];
             if (std.mem.indexOfScalar(u8, prefix, ' ')) |sp| {
                 if (self.arg_src) |src| {
@@ -262,15 +267,128 @@ pub const Ui = struct {
             const word = text[ws..cur];
             if (word.len > 0 and word[0] == '@') {
                 const pattern = word[1..];
-                if (pathcomp_mod.list(self.alloc, pattern)) |items| {
-                    self.path_items = items;
-                    self.cp = cmdprev_mod.CmdPreview.updateArgs(
-                        pathcomp_mod.asConst(items),
-                        pattern,
-                    );
+                self.updatePathCompletion(pattern);
+            } else {
+                self.clearPathItems();
+            }
+        } else {
+            self.clearPathItems();
+        }
+    }
+
+    /// Update path completion with caching: if pattern extends cached prefix,
+    /// filter in-place instead of re-scanning the filesystem.
+    fn updatePathCompletion(self: *Ui, pattern: []const u8) void {
+        // Check if we can filter cached results
+        if (self.path_items != null and self.path_prefix != null) {
+            const cached = self.path_prefix.?;
+            if (pattern.len >= cached.len and std.mem.startsWith(u8, pattern, cached)) {
+                // Pattern extends cached prefix — filter existing items
+                var items = self.path_items.?;
+                const old_len = items.len;
+                var keep: usize = 0;
+                for (items) |item| {
+                    // Item paths have dir prefix; match against the file portion
+                    if (std.mem.indexOf(u8, item, pattern) != null or
+                        matchItemPrefix(item, pattern))
+                    {
+                        items[keep] = item;
+                        keep += 1;
+                    } else {
+                        self.alloc.free(item);
+                    }
                 }
+                if (keep == 0) {
+                    self.alloc.free(items[0..old_len]);
+                    self.path_items = null;
+                    self.clearPathPrefix();
+                    return;
+                }
+                const narrowed = self.alloc.alloc([]u8, keep) catch {
+                    // Fallback: drop cache on allocation failure.
+                    for (items[0..keep]) |item| self.alloc.free(item);
+                    self.alloc.free(items[0..old_len]);
+                    self.path_items = null;
+                    self.clearPathPrefix();
+                    return;
+                };
+                @memcpy(narrowed[0..keep], items[0..keep]);
+                self.alloc.free(items[0..old_len]);
+                self.path_items = narrowed;
+                self.updatePathPrefix(pattern);
+                self.cp = cmdprev_mod.CmdPreview.updateArgs(
+                    pathcomp_mod.asConst(self.path_items.?),
+                    pattern,
+                );
+                return;
             }
         }
+
+        // Cache miss — full directory scan
+        self.clearPathItems();
+        if (pathcomp_mod.list(self.alloc, pattern)) |items| {
+            self.path_items = items;
+            self.updatePathPrefix(pattern);
+            self.cp = cmdprev_mod.CmdPreview.updateArgs(
+                pathcomp_mod.asConst(items),
+                pattern,
+            );
+        }
+    }
+
+    fn updatePathPrefix(self: *Ui, pattern: []const u8) void {
+        if (self.path_prefix) |p| self.alloc.free(p);
+        self.path_prefix = self.alloc.dupe(u8, pattern) catch null;
+    }
+
+    fn clearPathPrefix(self: *Ui) void {
+        if (self.path_prefix) |p| {
+            self.alloc.free(p);
+            self.path_prefix = null;
+        }
+    }
+
+    fn matchItemPrefix(item: []const u8, pattern: []const u8) bool {
+        // pathcomp items are "dir/name" or "name"; check if basename starts with partial
+        const base = if (std.mem.lastIndexOfScalar(u8, item, '/')) |sep|
+            item[sep + 1 ..]
+        else
+            item;
+        // Strip trailing '/' for directory entries
+        const name = if (base.len > 0 and base[base.len - 1] == '/')
+            base[0 .. base.len - 1]
+        else
+            base;
+        // Pattern may include directory prefix
+        const pat_base = if (std.mem.lastIndexOfScalar(u8, pattern, '/')) |sep|
+            pattern[sep + 1 ..]
+        else
+            pattern;
+        return std.mem.startsWith(u8, name, pat_base);
+    }
+
+    const CpStep = struct {
+        cp: u21,
+        n: usize,
+        w: usize,
+    };
+
+    fn nextCpLossy(text: []const u8, idx: *usize) ?CpStep {
+        if (idx.* >= text.len) return null;
+        const wcw = @import("wcwidth.zig").wcwidth;
+        const n = std.unicode.utf8ByteSequenceLength(text[idx.*]) catch return null;
+        if (idx.* + n > text.len) return null;
+        const cp = std.unicode.utf8Decode(text[idx.* .. idx.* + n]) catch return null;
+        return .{ .cp = cp, .n = n, .w = wcw(cp) };
+    }
+
+    fn nextCpStrict(text: []const u8, idx: *usize) error{InvalidUtf8}!?CpStep {
+        if (idx.* >= text.len) return null;
+        const wcw = @import("wcwidth.zig").wcwidth;
+        const n = std.unicode.utf8ByteSequenceLength(text[idx.*]) catch return error.InvalidUtf8;
+        if (idx.* + n > text.len) return error.InvalidUtf8;
+        const cp = std.unicode.utf8Decode(text[idx.* .. idx.* + n]) catch return error.InvalidUtf8;
+        return .{ .cp = cp, .n = n, .w = wcw(cp) };
     }
 
     pub fn clearTranscript(self: *Ui) void {
@@ -336,7 +454,6 @@ pub const Ui = struct {
         const pad: usize = 1;
         if (self.frm.w <= pad or rows == 0) return;
         const text = self.ed.text();
-        const wcw = @import("wcwidth.zig").wcwidth;
 
         // Walk text, tracking wrapped rows
         var row: usize = 0;
@@ -344,37 +461,38 @@ pub const Ui = struct {
         var i: usize = 0;
         var vis_row: usize = 0;
         while (i < text.len and vis_row < rows) {
-            const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-            if (i + n > text.len) break;
-            const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
-            if (cp == '\n') {
+            const step = nextCpLossy(text, &i) orelse break;
+            if (step.cp == '\n') {
                 row += 1;
                 col = 0;
-                i += n;
+                i += step.n;
                 if (row >= scroll) vis_row = row - scroll;
                 continue;
             }
-            const cw = wcw(cp);
-            if (col + cw > width) {
+            if (step.w == 0) {
+                i += step.n;
+                continue;
+            }
+            if (col + step.w > width) {
                 row += 1;
                 col = 0;
             }
             if (row >= scroll and row < scroll + rows) {
                 vis_row = row - scroll;
-                try self.frm.set(pad + col, y_base + vis_row, cp, .{});
+                const x = pad + col;
+                const y = y_base + vis_row;
+                try self.frm.set(x, y, step.cp, .{});
+                if (step.w == 2 and x + 1 < self.frm.w) {
+                    try self.frm.set(x + 1, y, frame.Frame.wide_pad, .{});
+                }
             }
-            col += cw;
-            i += n;
+            col += step.w;
+            i += step.n;
         }
     }
 };
 
-/// Find start of the word containing cursor position.
-fn lastWordStart(text: []const u8, cur: usize) usize {
-    var i = cur;
-    while (i > 0 and text[i - 1] != ' ' and text[i - 1] != '\n' and text[i - 1] != '\t') i -= 1;
-    return i;
-}
+const lastWordStart = editor.wordStartIn;
 
 /// Wrapped-line info for cursor positioning and rendering.
 const WrapInfo = struct {
@@ -386,7 +504,6 @@ const WrapInfo = struct {
 /// Compute wrap info for text at given display width.
 fn wrapInfo(text: []const u8, byte_pos: usize, width: usize) WrapInfo {
     if (width == 0) return .{ .rows = 1, .cur_row = 0, .cur_col = 0 };
-    const wcw = @import("wcwidth.zig").wcwidth;
     var row: usize = 0;
     var col: usize = 0;
     var cur_row: usize = 0;
@@ -397,22 +514,19 @@ fn wrapInfo(text: []const u8, byte_pos: usize, width: usize) WrapInfo {
             cur_row = row;
             cur_col = col;
         }
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-        if (i + n > text.len) break;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
-        if (cp == '\n') {
+        const step = Ui.nextCpLossy(text, &i) orelse break;
+        if (step.cp == '\n') {
             row += 1;
             col = 0;
-            i += n;
+            i += step.n;
             continue;
         }
-        const cw = wcw(cp);
-        if (col + cw > width) {
+        if (col + step.w > width) {
             row += 1;
             col = 0;
         }
-        col += cw;
-        i += n;
+        col += step.w;
+        i += step.n;
     }
     if (byte_pos >= text.len) {
         cur_row = row;
@@ -424,29 +538,25 @@ fn wrapInfo(text: []const u8, byte_pos: usize, width: usize) WrapInfo {
 /// Find byte offset at start of a given wrapped row.
 fn wrapRowStart(text: []const u8, target_row: usize, width: usize) usize {
     if (width == 0 or target_row == 0) return 0;
-    const wcw = @import("wcwidth.zig").wcwidth;
     var row: usize = 0;
     var col: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
         if (row == target_row) return i;
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-        if (i + n > text.len) break;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
-        if (cp == '\n') {
+        const step = Ui.nextCpLossy(text, &i) orelse break;
+        if (step.cp == '\n') {
             row += 1;
             col = 0;
-            i += n;
+            i += step.n;
             continue;
         }
-        const cw = wcw(cp);
-        if (col + cw > width) {
+        if (col + step.w > width) {
             row += 1;
             col = 0;
             if (row == target_row) return i;
         }
-        col += cw;
-        i += n;
+        col += step.w;
+        i += step.n;
     }
     return i;
 }
@@ -454,94 +564,77 @@ fn wrapRowStart(text: []const u8, target_row: usize, width: usize) usize {
 /// Find byte offset for a given (row, col) in wrapped text.
 fn wrapRowCol(text: []const u8, target_row: usize, target_col: usize, width: usize) usize {
     if (width == 0) return 0;
-    const wcw = @import("wcwidth.zig").wcwidth;
     var row: usize = 0;
     var col: usize = 0;
     var i: usize = 0;
     while (i < text.len) {
         if (row == target_row and col >= target_col) return i;
         if (row > target_row) return i;
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-        if (i + n > text.len) break;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
-        if (cp == '\n') {
+        const step = Ui.nextCpLossy(text, &i) orelse break;
+        if (step.cp == '\n') {
             if (row == target_row) return i; // at end of target row
             row += 1;
             col = 0;
-            i += n;
+            i += step.n;
             continue;
         }
-        const cw = wcw(cp);
-        if (col + cw > width) {
+        if (col + step.w > width) {
             row += 1;
             col = 0;
             if (row == target_row and col >= target_col) return i;
             if (row > target_row) return i;
         }
-        col += cw;
-        i += n;
+        col += step.w;
+        i += step.n;
     }
     return i;
 }
 
 fn cursorCol(text: []const u8, byte_pos: usize) usize {
-    const wcwidth = @import("wcwidth.zig").wcwidth;
     var i: usize = 0;
     var col: usize = 0;
     while (i < byte_pos and i < text.len) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch break;
-        if (i + n > text.len) break;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch break;
-        col += wcwidth(cp);
-        i += n;
+        const step = Ui.nextCpLossy(text, &i) orelse break;
+        col += step.w;
+        i += step.n;
     }
     return col;
 }
 
 fn viewportSlice(text: []const u8, skip_cols: usize, cols: usize) error{InvalidUtf8}![]const u8 {
     if (cols == 0 or text.len == 0) return text[0..0];
-    const wcwidth = @import("wcwidth.zig").wcwidth;
     var i: usize = 0;
     var col: usize = 0;
 
     // Skip `skip_cols` columns
     while (i < text.len and col < skip_cols) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
-        if (i + n > text.len) return error.InvalidUtf8;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
-        col += wcwidth(cp);
-        i += n;
+        const step = (try Ui.nextCpStrict(text, &i)) orelse return error.InvalidUtf8;
+        col += step.w;
+        i += step.n;
     }
     const start = i;
 
     // Take `cols` columns
     var used: usize = 0;
     while (i < text.len) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
-        if (i + n > text.len) return error.InvalidUtf8;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
-        const w: usize = wcwidth(cp);
-        if (used + w > cols) break;
-        i += n;
-        used += w;
+        const step = (try Ui.nextCpStrict(text, &i)) orelse break;
+        if (used + step.w > cols) break;
+        i += step.n;
+        used += step.w;
     }
     return text[start..i];
 }
 
 fn clipCols(text: []const u8, cols: usize) error{InvalidUtf8}![]const u8 {
     if (cols == 0 or text.len == 0) return text[0..0];
-    const wcwidth = @import("wcwidth.zig").wcwidth;
 
     var i: usize = 0;
     var used: usize = 0;
     while (i < text.len) {
-        const n = std.unicode.utf8ByteSequenceLength(text[i]) catch return error.InvalidUtf8;
-        if (i + n > text.len) return error.InvalidUtf8;
-        const cp = std.unicode.utf8Decode(text[i .. i + n]) catch return error.InvalidUtf8;
-        const w: usize = wcwidth(cp);
-        if (used + w > cols) break;
-        i += n;
-        used += w;
+        const step = (try Ui.nextCpStrict(text, &i)) orelse break;
+        if (used + step.w > cols) break;
+        i += step.n;
+        used += step.w;
     }
     return text[0..i];
 }
@@ -594,6 +687,25 @@ test "harness editor interaction returns submit and clears line" {
     try std.testing.expect((try ui.onKey(.{ .enter = {} })) == .submit);
     try std.testing.expectEqualStrings("", ui.editorText());
     try std.testing.expect(ui.tr.count() >= 1);
+}
+
+test "harness editor writes wide characters with wide-pad cell" {
+    var ui = try Ui.init(std.testing.allocator, 10, 6, "m", "p");
+    defer ui.deinit();
+
+    try ui.ed.setText("中A");
+
+    var raw: [4096]u8 = undefined;
+    var out = TestBuf.init(raw[0..]);
+    try ui.draw(&out);
+
+    // h=6 => editor row is 2 (tx_h=1, border omitted, editor starts at y=2)
+    const c1 = try ui.frm.cell(1, 2);
+    const c2 = try ui.frm.cell(2, 2);
+    const c3 = try ui.frm.cell(3, 2);
+    try std.testing.expectEqual(@as(u21, 0x4E2D), c1.cp);
+    try std.testing.expectEqual(@as(u21, frame.Frame.wide_pad), c2.cp);
+    try std.testing.expectEqual(@as(u21, 'A'), c3.cp);
 }
 
 test "harness renders tiny terminal without bounds errors" {
@@ -743,6 +855,25 @@ test "updatePreview slash overrides file mode" {
     ui.updatePreview();
     try std.testing.expect(ui.cp != null);
     try std.testing.expect(ui.path_items == null); // not file mode
+}
+
+test "updatePreview narrows cached path completion prefix" {
+    var ui = try Ui.init(std.testing.allocator, 40, 10, "m", "p");
+    defer ui.deinit();
+
+    try ui.ed.setText("@src/");
+    ui.updatePreview();
+    try std.testing.expect(ui.path_items != null);
+    const before_len = ui.path_items.?.len;
+    try std.testing.expect(ui.path_prefix != null);
+    try std.testing.expectEqualStrings("src/", ui.path_prefix.?);
+
+    try ui.ed.setText("@src/m");
+    ui.updatePreview();
+    try std.testing.expect(ui.path_items != null);
+    try std.testing.expect(ui.path_items.?.len <= before_len);
+    try std.testing.expect(ui.path_prefix != null);
+    try std.testing.expectEqualStrings("src/m", ui.path_prefix.?);
 }
 
 test "lastWordStart finds word boundary" {

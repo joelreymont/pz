@@ -10,8 +10,13 @@ pub const Opts = struct {
 
 pub const ReplayReader = struct {
     alloc: std.mem.Allocator,
-    raw: []u8,
-    pos: usize = 0,
+    file: std.fs.File,
+    io_buf: [8192]u8 = undefined,
+    io_pos: usize = 0,
+    io_len: usize = 0,
+    eof: bool = false,
+    line_buf: std.ArrayList(u8) = .empty,
+    line_too_long: bool = false,
     arena: std.heap.ArenaAllocator,
     max_line_bytes: usize,
     line_no: usize = 0,
@@ -23,14 +28,10 @@ pub const ReplayReader = struct {
         defer alloc.free(path);
 
         const file = try dir.openFile(path, .{ .mode = .read_only });
-        defer file.close();
-        const size_u64 = try file.getEndPos();
-        if (size_u64 > std.math.maxInt(usize)) return error.ReplayTooLarge;
-        const raw = try file.readToEndAlloc(alloc, @intCast(size_u64));
 
         return .{
             .alloc = alloc,
-            .raw = raw,
+            .file = file,
             .arena = std.heap.ArenaAllocator.init(alloc),
             .max_line_bytes = opts.max_line_bytes,
         };
@@ -40,26 +41,33 @@ pub const ReplayReader = struct {
         self.arena.deinit();
         self.arena = std.heap.ArenaAllocator.init(self.alloc);
 
-        if (self.pos >= self.raw.len) return null;
+        while (true) {
+            if (self.io_pos >= self.io_len) {
+                if (self.eof) {
+                    if (self.line_buf.items.len == 0 and !self.line_too_long) return null;
+                    const ev = try self.finishLine();
+                    return ev;
+                }
 
-        const start = self.pos;
-        const end = std.mem.indexOfScalarPos(u8, self.raw, start, '\n') orelse self.raw.len;
-        self.pos = if (end < self.raw.len) end + 1 else self.raw.len;
+                self.io_len = try self.file.read(&self.io_buf);
+                self.io_pos = 0;
+                if (self.io_len == 0) {
+                    self.eof = true;
+                }
+                continue;
+            }
 
-        const raw_line = self.raw[start..end];
+            const slice = self.io_buf[self.io_pos..self.io_len];
+            if (std.mem.indexOfScalar(u8, slice, '\n')) |rel| {
+                try self.appendLinePart(slice[0..rel]);
+                self.io_pos += rel + 1;
+                const ev = try self.finishLine();
+                return ev;
+            }
 
-        self.line_no += 1;
-        if (raw_line.len == 0) return error.EmptyReplayLine;
-        if (raw_line.len > self.max_line_bytes) return error.ReplayLineTooLong;
-
-        const parsed = schema.decodeSlice(self.arena.allocator(), raw_line) catch |err| switch (err) {
-            error.UnsupportedVersion => return error.UnsupportedVersion,
-            else => return error.MalformedReplayLine,
-        };
-        // Don't deinit parsed — string slices in the Event reference memory
-        // owned by self.arena, which resets at the start of the next next() call.
-
-        return parsed.value;
+            try self.appendLinePart(slice);
+            self.io_pos = self.io_len;
+        }
     }
 
     pub fn line(self: *const ReplayReader) usize {
@@ -68,7 +76,36 @@ pub const ReplayReader = struct {
 
     pub fn deinit(self: *ReplayReader) void {
         self.arena.deinit();
-        self.alloc.free(self.raw);
+        self.line_buf.deinit(self.alloc);
+        self.file.close();
+    }
+
+    fn appendLinePart(self: *ReplayReader, part: []const u8) !void {
+        if (self.line_too_long) return;
+        if (self.line_buf.items.len + part.len > self.max_line_bytes) {
+            self.line_too_long = true;
+            return;
+        }
+        try self.line_buf.appendSlice(self.alloc, part);
+    }
+
+    fn finishLine(self: *ReplayReader) !Event {
+        self.line_no += 1;
+        defer {
+            self.line_buf.clearRetainingCapacity();
+            self.line_too_long = false;
+        }
+
+        if (self.line_too_long) return error.ReplayLineTooLong;
+        if (self.line_buf.items.len == 0) return error.EmptyReplayLine;
+
+        const parsed = schema.decodeSlice(self.arena.allocator(), self.line_buf.items) catch |err| switch (err) {
+            error.UnsupportedVersion => return error.UnsupportedVersion,
+            else => return error.MalformedReplayLine,
+        };
+        // Don't deinit parsed — string slices in the Event reference memory
+        // owned by self.arena, which resets at the start of the next next() call.
+        return parsed.value;
     }
 };
 
@@ -215,4 +252,52 @@ test "jsonl replay rejects zero max line bytes" {
         "s1",
         .{ .max_line_bytes = 0 },
     ));
+}
+
+test "jsonl replay handles final line without trailing newline" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("tail.jsonl", .{});
+        defer file.close();
+        const ev = Event{
+            .at_ms = 1,
+            .data = .{ .text = .{ .text = "ok" } },
+        };
+        const raw = try schema.encodeAlloc(std.testing.allocator, ev);
+        defer std.testing.allocator.free(raw);
+        try file.writeAll(raw); // no trailing '\n'
+    }
+
+    var rdr = try ReplayReader.init(std.testing.allocator, tmp.dir, "tail", .{});
+    defer rdr.deinit();
+
+    const first = (try rdr.next()) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(first.data == .text);
+    try std.testing.expectEqualStrings("ok", first.data.text.text);
+    try std.testing.expect((try rdr.next()) == null);
+}
+
+test "jsonl replay enforces max line bytes in streaming mode" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    {
+        const file = try tmp.dir.createFile("long.jsonl", .{});
+        defer file.close();
+        // Write a line that is definitely larger than max_line_bytes.
+        try file.writeAll("{\"version\":1,\"at_ms\":1,\"data\":{\"text\":{\"text\":\"");
+        var pad: [256]u8 = undefined;
+        @memset(&pad, 'a');
+        try file.writeAll(&pad);
+        try file.writeAll("\"}}}\n");
+    }
+
+    var rdr = try ReplayReader.init(std.testing.allocator, tmp.dir, "long", .{
+        .max_line_bytes = 64,
+    });
+    defer rdr.deinit();
+
+    try std.testing.expectError(error.ReplayLineTooLong, rdr.next());
 }

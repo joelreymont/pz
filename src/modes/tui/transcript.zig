@@ -193,30 +193,24 @@ pub const Transcript = struct {
         const content_x = rect.x + pad;
         const avail_w = rect.w - pad;
 
-        // Count total display lines (including 1-line gap between blocks)
+        // Count total display lines at scrollbar-reserved width (single pass).
+        // Using avail_w - 1 means: if overflow, count is already correct;
+        // if no overflow, we use full avail_w for rendering (the slightly
+        // wider width can only reduce line count, so no-overflow is stable).
+        const bar_w: usize = if (avail_w >= 2) 1 else 0;
+        const count_w = avail_w - bar_w;
         var total: usize = 0;
         var vis_ct: usize = 0;
         for (self.blocks.items) |*b| {
             if (!self.blockVisible(b)) continue;
-            total += blockLineCount(b, avail_w);
+            total += blockLineCount(b, count_w);
             vis_ct += 1;
         }
         if (vis_ct > 1) total += vis_ct - 1; // gaps
         if (total == 0) return;
 
-        // If content overflows, reserve 1 col for scrollbar
-        const has_bar = total > rect.h and avail_w >= 2;
-        const text_w = if (has_bar) avail_w - 1 else avail_w;
-
-        // Recount with narrower width if scrollbar present
-        if (has_bar) {
-            total = 0;
-            for (self.blocks.items) |*b| {
-                if (!self.blockVisible(b)) continue;
-                total += blockLineCount(b, text_w);
-            }
-            if (vis_ct > 1) total += vis_ct - 1;
-        }
+        const has_bar = total > rect.h and bar_w > 0;
+        const text_w = if (has_bar) count_w else avail_w;
 
         // Auto-scroll when scroll_off == 0, otherwise respect manual offset
         const max_skip = if (total > rect.h) total - rect.h else 0;
@@ -695,6 +689,22 @@ pub fn parseAnsi(alloc: std.mem.Allocator, text: []const u8, base_st: frame.Styl
                                 span_start = buf.items.len;
                             }
                         }
+                        break;
+                    }
+                    i += 1;
+                }
+            } else if (text[i] == ']') {
+                // OSC: ESC ] ... (BEL | ESC \)
+                i += 1; // consume ']'
+                while (i < text.len) {
+                    if (text[i] == 0x07) {
+                        // BEL terminator
+                        i += 1;
+                        break;
+                    }
+                    if (text[i] == 0x1b and i + 1 < text.len and text[i + 1] == '\\') {
+                        // ST terminator
+                        i += 2;
                         break;
                     }
                     i += 1;
@@ -1271,6 +1281,26 @@ test "parseAnsi bg color" {
     }
     try std.testing.expectEqualStrings("green", res.buf.items);
     try std.testing.expect(frame.Color.eql(res.spans.items[0].st.bg, .{ .idx = 2 }));
+}
+
+test "parseAnsi strips OSC terminated by BEL" {
+    const base: frame.Style = .{};
+    var res = try parseAnsi(std.testing.allocator, "\x1b]0;my title\x07hello", base);
+    defer {
+        res.buf.deinit(std.testing.allocator);
+        res.spans.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqualStrings("hello", res.buf.items);
+}
+
+test "parseAnsi strips OSC terminated by ST" {
+    const base: frame.Style = .{};
+    var res = try parseAnsi(std.testing.allocator, "\x1b]0;my title\x1b\\world", base);
+    defer {
+        res.buf.deinit(std.testing.allocator);
+        res.spans.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqualStrings("world", res.buf.items);
 }
 
 test "scrollUp and scrollDown adjust offset" {

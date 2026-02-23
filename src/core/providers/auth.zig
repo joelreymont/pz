@@ -146,7 +146,7 @@ pub fn refreshOAuth(alloc: std.mem.Allocator, old: OAuth) !OAuth {
 
     var transfer_buf: [16384]u8 = undefined;
     var decomp: std.http.Decompress = undefined;
-    var decomp_buf: [16384]u8 = undefined;
+    var decomp_buf: [std.compress.flate.max_window_len]u8 = undefined;
     const rdr = resp.readerDecompressing(&transfer_buf, &decomp, &decomp_buf);
     const resp_body = try rdr.allocRemaining(ar, .limited(65536));
 

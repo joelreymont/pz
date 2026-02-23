@@ -188,7 +188,7 @@ pub const Client = struct {
         if (stream.response.head.status != .ok) {
             stream.err_mode = true;
             var decomp: std.http.Decompress = undefined;
-            var decomp_buf: [16384]u8 = undefined;
+            var decomp_buf: [std.compress.flate.max_window_len]u8 = undefined;
             const rdr = stream.response.readerDecompressing(
                 &stream.transfer_buf,
                 &decomp,
@@ -493,6 +493,8 @@ fn mapStopReason(reason: []const u8) providers.StopReason {
         .{ "end_turn", .done },
         .{ "max_tokens", .max_out },
         .{ "tool_use", .tool },
+        .{ "canceled", .canceled },
+        .{ "err", .err },
     });
     return map.get(reason) orelse .done;
 }
@@ -531,6 +533,23 @@ fn buildBody(alloc: std.mem.Allocator, req: providers.Req) ![]u8 {
 
     try js.objectField("stream");
     try js.write(true);
+
+    if (req.opts.temp) |temp| {
+        try js.objectField("temperature");
+        try js.write(temp);
+    }
+
+    if (req.opts.top_p) |top_p| {
+        try js.objectField("top_p");
+        try js.write(top_p);
+    }
+
+    if (req.opts.stop.len > 0) {
+        try js.objectField("stop_sequences");
+        try js.beginArray();
+        for (req.opts.stop) |seq| try js.write(seq);
+        try js.endArray();
+    }
 
     // Thinking configuration
     switch (req.opts.thinking) {
@@ -713,4 +732,475 @@ fn writeMessages(js: *std.json.Stringify, msgs: []const providers.Msg) !void {
     }
 
     try js.endArray();
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+
+const testing = std.testing;
+
+fn testStream() SseStream {
+    return SseStream.initFields(testing.allocator);
+}
+
+fn testParse(stream: *SseStream, data: []const u8) !?providers.Ev {
+    const ar = stream.arena.allocator();
+    const copy = try ar.dupe(u8, data);
+    return stream.parseSseData(copy);
+}
+
+test "mapStopReason known values" {
+    try testing.expectEqual(providers.StopReason.done, mapStopReason("end_turn"));
+    try testing.expectEqual(providers.StopReason.max_out, mapStopReason("max_tokens"));
+    try testing.expectEqual(providers.StopReason.tool, mapStopReason("tool_use"));
+    try testing.expectEqual(providers.StopReason.canceled, mapStopReason("canceled"));
+    try testing.expectEqual(providers.StopReason.err, mapStopReason("err"));
+}
+
+test "mapStopReason unknown falls back to done" {
+    try testing.expectEqual(providers.StopReason.done, mapStopReason("unknown_xyz"));
+}
+
+test "jsonU64 integer" {
+    try testing.expectEqual(@as(u64, 42), jsonU64(.{ .integer = 42 }));
+}
+
+test "jsonU64 negative clamps to zero" {
+    try testing.expectEqual(@as(u64, 0), jsonU64(.{ .integer = -5 }));
+}
+
+test "jsonU64 float" {
+    try testing.expectEqual(@as(u64, 3), jsonU64(.{ .float = 3.7 }));
+}
+
+test "jsonU64 null" {
+    try testing.expectEqual(@as(u64, 0), jsonU64(null));
+}
+
+test "jsonU64 non-numeric" {
+    try testing.expectEqual(@as(u64, 0), jsonU64(.{ .bool = true }));
+}
+
+test "sanitizeUtf8 valid passes through" {
+    const input = "hello world";
+    const result = try sanitizeUtf8(testing.allocator, input);
+    try testing.expectEqualStrings("hello world", result);
+}
+
+test "sanitizeUtf8 invalid bytes replaced" {
+    const input = "ab\xfe\xffcd";
+    const result = try sanitizeUtf8(testing.allocator, input);
+    defer testing.allocator.free(result);
+    try testing.expectEqualStrings("ab??cd", result);
+}
+
+test "parseSseData text delta" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    const ev = try testParse(&stream,
+        \\{"type":"content_block_delta","delta":{"type":"text_delta","text":"hello"}}
+    );
+    try testing.expect(ev != null);
+    try testing.expectEqualStrings("hello", ev.?.text);
+}
+
+test "parseSseData thinking delta" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    const ev = try testParse(&stream,
+        \\{"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"hmm"}}
+    );
+    try testing.expect(ev != null);
+    try testing.expectEqualStrings("hmm", ev.?.thinking);
+}
+
+test "parseSseData message_start extracts usage" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    const ev = try testParse(&stream,
+        \\{"type":"message_start","message":{"usage":{"input_tokens":100,"cache_read_input_tokens":50,"cache_creation_input_tokens":25}}}
+    );
+    try testing.expect(ev == null);
+    try testing.expectEqual(@as(u64, 100), stream.in_tok);
+    try testing.expectEqual(@as(u64, 50), stream.cache_read);
+    try testing.expectEqual(@as(u64, 25), stream.cache_write);
+}
+
+test "parseSseData tool_use block accumulates" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+    defer stream.tool_id.deinit(testing.allocator);
+    defer stream.tool_name.deinit(testing.allocator);
+    defer stream.tool_args.deinit(testing.allocator);
+
+    // Start tool block
+    _ = try testParse(&stream,
+        \\{"type":"content_block_start","content_block":{"type":"tool_use","id":"t1","name":"bash"}}
+    );
+    try testing.expect(stream.in_tool);
+    try testing.expectEqualStrings("t1", stream.tool_id.items);
+    try testing.expectEqualStrings("bash", stream.tool_name.items);
+
+    // Accumulate args
+    _ = try testParse(&stream,
+        \\{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"{\"cmd\":"}}
+    );
+    _ = try testParse(&stream,
+        \\{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"\"ls\"}"}}
+    );
+    try testing.expectEqualStrings("{\"cmd\":\"ls\"}", stream.tool_args.items);
+
+    // Stop — should emit tool_call event
+    const ev = try testParse(&stream,
+        \\{"type":"content_block_stop"}
+    );
+    try testing.expect(ev != null);
+    const tc = ev.?.tool_call;
+    try testing.expectEqualStrings("t1", tc.id);
+    try testing.expectEqualStrings("bash", tc.name);
+    try testing.expectEqualStrings("{\"cmd\":\"ls\"}", tc.args);
+    try testing.expect(!stream.in_tool);
+}
+
+test "parseSseData message_delta stop reason and usage" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    stream.in_tok = 100;
+
+    const ev = try testParse(&stream,
+        \\{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":42}}
+    );
+    try testing.expect(ev != null);
+    const usage = ev.?.usage;
+    try testing.expectEqual(@as(u64, 100), usage.in_tok);
+    try testing.expectEqual(@as(u64, 42), usage.out_tok);
+    try testing.expectEqual(@as(u64, 142), usage.tot_tok);
+    // Pending stop event
+    try testing.expect(stream.pending != null);
+    try testing.expectEqual(providers.StopReason.done, stream.pending.?.stop.reason);
+    try testing.expect(stream.done);
+}
+
+test "parseSseData unknown type returns null" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    const ev = try testParse(&stream,
+        \\{"type":"ping"}
+    );
+    try testing.expect(ev == null);
+}
+
+test "parseSseData invalid json returns null" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    const ev = try testParse(&stream, "not json at all");
+    try testing.expect(ev == null);
+}
+
+test "buildBody minimal request" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "hi" }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .off },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try testing.expectEqualStrings("claude-sonnet-4-20250514", root.get("model").?.string);
+    try testing.expect(root.get("stream").?.bool);
+    try testing.expectEqual(@as(i64, 16384), root.get("max_tokens").?.integer);
+    try testing.expect(root.get("messages").?.array.items.len > 0);
+    try testing.expect(root.get("thinking") == null);
+    try testing.expect(root.get("temperature") == null);
+    try testing.expect(root.get("top_p") == null);
+    try testing.expect(root.get("stop_sequences") == null);
+}
+
+test "buildBody includes temp top_p and stop sequences" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "hi" }} },
+    };
+    const stops = [_][]const u8{ "END", "STOP" };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{
+            .thinking = .off,
+            .temp = 0.25,
+            .top_p = 0.9,
+            .stop = stops[0..],
+        },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try testing.expect(root.get("temperature") != null);
+    try testing.expect(root.get("top_p") != null);
+    try testing.expect(root.get("stop_sequences") != null);
+    const stop_arr = root.get("stop_sequences").?.array;
+    try testing.expectEqual(@as(usize, 2), stop_arr.items.len);
+    try testing.expectEqualStrings("END", stop_arr.items[0].string);
+    try testing.expectEqualStrings("STOP", stop_arr.items[1].string);
+}
+
+test "buildBody with system message and cache_control" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .system, .parts = &.{.{ .text = "You are helpful." }} },
+        .{ .role = .user, .parts = &.{.{ .text = "hi" }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .off },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const sys = root.get("system").?.array;
+    try testing.expectEqual(@as(usize, 1), sys.items.len);
+    const sys0 = sys.items[0].object;
+    try testing.expectEqualStrings("You are helpful.", sys0.get("text").?.string);
+    try testing.expect(sys0.get("cache_control") != null);
+}
+
+test "buildBody with tools" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "run ls" }} },
+    };
+    const tools = [_]providers.Tool{
+        .{ .name = "bash", .desc = "Run commands", .schema = "{\"type\":\"object\",\"properties\":{\"cmd\":{\"type\":\"string\"}}}" },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .tools = &tools,
+        .opts = .{ .thinking = .off },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const tl = root.get("tools").?.array;
+    try testing.expectEqual(@as(usize, 1), tl.items.len);
+    const t0 = tl.items[0].object;
+    try testing.expectEqualStrings("bash", t0.get("name").?.string);
+    try testing.expectEqualStrings("Run commands", t0.get("description").?.string);
+    try testing.expect(t0.get("input_schema") != null);
+}
+
+test "buildBody thinking adaptive" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "think" }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-opus-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .adaptive },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const think = root.get("thinking").?.object;
+    try testing.expectEqualStrings("adaptive", think.get("type").?.string);
+}
+
+test "buildBody thinking budget" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "think" }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .budget, .thinking_budget = 8192 },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const think = root.get("thinking").?.object;
+    try testing.expectEqualStrings("enabled", think.get("type").?.string);
+    try testing.expectEqual(@as(i64, 8192), think.get("budget_tokens").?.integer);
+    try testing.expect(root.get("max_tokens").?.integer >= 8192);
+}
+
+test "buildBody thinking budget exceeds max_tokens" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "think" }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-opus-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .budget, .thinking_budget = 32768 },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    try testing.expectEqual(@as(i64, 49152), root.get("max_tokens").?.integer);
+}
+
+test "buildBody message merging same roles" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "one" }} },
+        .{ .role = .user, .parts = &.{.{ .text = "two" }} },
+        .{ .role = .assistant, .parts = &.{.{ .text = "reply" }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .off },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const messages = root.get("messages").?.array;
+    try testing.expectEqual(@as(usize, 2), messages.items.len);
+    const first = messages.items[0].object;
+    try testing.expectEqualStrings("user", first.get("role").?.string);
+    try testing.expectEqual(@as(usize, 2), first.get("content").?.array.items.len);
+}
+
+test "buildBody tool_call and tool_result" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "run ls" }} },
+        .{ .role = .assistant, .parts = &.{.{ .tool_call = .{
+            .id = "tc1",
+            .name = "bash",
+            .args = "{\"cmd\":\"ls\"}",
+        } }} },
+        .{ .role = .tool, .parts = &.{.{ .tool_result = .{
+            .id = "tc1",
+            .out = "file.txt",
+        } }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .off },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const root = parsed.value.object;
+    const messages = root.get("messages").?.array;
+    try testing.expectEqual(@as(usize, 3), messages.items.len);
+
+    const asst = messages.items[1].object;
+    try testing.expectEqualStrings("assistant", asst.get("role").?.string);
+    const asst_content = asst.get("content").?.array;
+    const tc = asst_content.items[0].object;
+    try testing.expectEqualStrings("tool_use", tc.get("type").?.string);
+    try testing.expectEqualStrings("tc1", tc.get("id").?.string);
+
+    const tool_msg = messages.items[2].object;
+    try testing.expectEqualStrings("user", tool_msg.get("role").?.string);
+    const tr = tool_msg.get("content").?.array.items[0].object;
+    try testing.expectEqualStrings("tool_result", tr.get("type").?.string);
+    try testing.expectEqualStrings("tc1", tr.get("tool_use_id").?.string);
+}
+
+test "buildBody tool_result error flag" {
+    const msgs = [_]providers.Msg{
+        .{ .role = .user, .parts = &.{.{ .text = "run bad" }} },
+        .{ .role = .assistant, .parts = &.{.{ .tool_call = .{
+            .id = "tc2",
+            .name = "bash",
+            .args = "{}",
+        } }} },
+        .{ .role = .tool, .parts = &.{.{ .tool_result = .{
+            .id = "tc2",
+            .out = "command failed",
+            .is_err = true,
+        } }} },
+    };
+    const body = try buildBody(testing.allocator, .{
+        .model = "claude-sonnet-4-20250514",
+        .msgs = &msgs,
+        .opts = .{ .thinking = .off },
+    });
+    defer testing.allocator.free(body);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{
+        .allocate = .alloc_always,
+    });
+    defer parsed.deinit();
+
+    const messages = parsed.value.object.get("messages").?.array;
+    const tr = messages.items[2].object.get("content").?.array.items[0].object;
+    try testing.expect(tr.get("is_error").?.bool);
+}
+
+test "supportsThinking" {
+    try testing.expect(supportsThinking("claude-opus-4-20250514"));
+    try testing.expect(supportsThinking("claude-sonnet-4-20250514"));
+    try testing.expect(!supportsThinking("claude-haiku-3-20240307"));
+    try testing.expect(!supportsThinking("claude-3-5-sonnet-20241022"));
+}
+
+test "SseStream error mode emits err then stop" {
+    var stream = testStream();
+    defer stream.arena.deinit();
+
+    stream.err_mode = true;
+    stream.err_text = "401 unauthorized";
+
+    const ev1 = try stream.next();
+    try testing.expect(ev1 != null);
+    try testing.expectEqualStrings("401 unauthorized", ev1.?.err);
+
+    const ev2 = try stream.next();
+    try testing.expect(ev2 != null);
+    try testing.expectEqual(providers.StopReason.err, ev2.?.stop.reason);
+
+    const ev3 = try stream.next();
+    try testing.expect(ev3 == null);
 }

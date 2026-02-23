@@ -76,6 +76,13 @@ pub const UndoEntry = struct {
     }
 };
 
+/// Start of the word containing/before `pos` in `text` (whitespace-delimited).
+pub fn wordStartIn(text: []const u8, pos: usize) usize {
+    var i = pos;
+    while (i > 0 and text[i - 1] != ' ' and text[i - 1] != '\n' and text[i - 1] != '\t') i -= 1;
+    return i;
+}
+
 pub const Editor = struct {
     alloc: std.mem.Allocator,
     buf: std.ArrayListUnmanaged(u8) = .empty,
@@ -125,6 +132,11 @@ pub const Editor = struct {
         return self.cur;
     }
 
+    /// Start of the word containing/before `pos` (whitespace-delimited).
+    pub fn wordStart(self: *const Editor, pos: usize) usize {
+        return wordStartIn(self.text(), pos);
+    }
+
     pub fn setText(self: *Editor, t: []const u8) !void {
         self.buf.items.len = 0;
         try self.buf.appendSlice(self.alloc, t);
@@ -172,9 +184,16 @@ pub const Editor = struct {
         }
         // Track kill accumulation and yank-pop state
         switch (key) {
-            .ctrl_k, .ctrl_u, .ctrl_w, .alt_d => { self.yank_mark = null; },
-            .ctrl_y, .alt_y => { self.last_was_kill = false; },
-            else => { self.last_was_kill = false; self.yank_mark = null; },
+            .ctrl_k, .ctrl_u, .ctrl_w, .alt_d => {
+                self.yank_mark = null;
+            },
+            .ctrl_y, .alt_y => {
+                self.last_was_kill = false;
+            },
+            else => {
+                self.last_was_kill = false;
+                self.yank_mark = null;
+            },
         }
         return switch (key) {
             .char => |cp| blk: {

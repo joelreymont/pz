@@ -6,7 +6,6 @@ pub const Err = error{
     InvalidArgs,
     NotFound,
     Denied,
-    TooLarge,
     Io,
     OutOfMemory,
 };
@@ -59,7 +58,7 @@ pub const Handler = struct {
         while (walk.next() catch |next_err| return mapFsErr(next_err)) |ent| {
             const base = std.fs.path.basename(ent.path);
             if (std.mem.indexOf(u8, base, args.name) == null) continue;
-            if (matches.items.len >= collect_limit) return error.TooLarge;
+            if (matches.items.len >= collect_limit) break;
 
             const dup = self.alloc.dupe(u8, ent.path) catch return error.OutOfMemory;
             errdefer self.alloc.free(dup);
@@ -262,4 +261,59 @@ test "find handler validates args and handles missing roots" {
         .at_ms = 0,
     };
     try std.testing.expectError(error.NotFound, handler.run(missing, sink));
+}
+
+test "find handler truncates on high hit count instead of erroring" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    // Create more files than max_results * 8
+    try tmp.dir.makePath("d");
+    var i: usize = 0;
+    while (i < 20) : (i += 1) {
+        var name: [12]u8 = undefined;
+        const n = std.fmt.bufPrint(&name, "d/f{d}.txt", .{i}) catch unreachable;
+        try tmp.dir.writeFile(.{ .sub_path = n, .data = "" });
+    }
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, "d");
+    defer std.testing.allocator.free(root);
+
+    const SinkImpl = struct {
+        fn push(_: *@This(), _: tools.Event) !void {}
+    };
+    var sink_impl = SinkImpl{};
+    const sink = tools.Sink.from(SinkImpl, &sink_impl, SinkImpl.push);
+
+    const handler = Handler.init(.{
+        .alloc = std.testing.allocator,
+        .max_bytes = 4096,
+        .now_ms = 0,
+    });
+    const call: tools.Call = .{
+        .id = "f4",
+        .kind = .find,
+        .args = .{
+            .find = .{
+                .path = root,
+                .name = ".txt",
+                .max_results = 2, // collect_limit = 2 * 8 = 16 < 20 files
+            },
+        },
+        .src = .model,
+        .at_ms = 0,
+    };
+
+    // Should succeed (truncated) instead of erroring
+    const res = try handler.run(call, sink);
+    defer handler.deinitResult(res);
+
+    // Should have 1 data chunk with at most max_results lines
+    try std.testing.expect(res.out.len >= 1);
+    const chunk = res.out[0].chunk;
+    var lines: usize = 0;
+    for (chunk) |c| {
+        if (c == '\n') lines += 1;
+    }
+    try std.testing.expect(lines <= 2);
 }
