@@ -1,5 +1,8 @@
 const std = @import("std");
 const cli = @import("cli.zig");
+const changelog = @import("changelog.zig");
+const version_check = @import("version.zig");
+const config = @import("config.zig");
 const core = @import("../core/mod.zig");
 const print_fmt = @import("../modes/print/format.zig");
 const print_err = @import("../modes/print/errors.zig");
@@ -603,8 +606,19 @@ fn runTui(
     ui.pn.thinking_label = thinkingLabel(thinking);
     ui.border_fg = thinkingBorderFg(thinking);
 
+    // Background version check (TUI only, skip for dev builds)
+    const skip_ver = std.posix.getenv("PZ_SKIP_VERSION_CHECK") != null or
+        std.mem.indexOf(u8, cli.version, "-dev") != null;
+    var ver_check = version_check.Check.init(alloc);
+    if (!skip_ver) ver_check.spawn();
+    defer ver_check.deinit();
+
     // Startup info matching pi's display
-    try showStartup(alloc, &ui);
+    const is_resumed = switch (run_cmd.session) {
+        .cont, .resm, .explicit => true,
+        .auto => false,
+    };
+    try showStartup(alloc, &ui, is_resumed);
 
     // Set terminal title (OSC 0)
     try out.writeAll("\x1b]0;pz\x07");
@@ -613,6 +627,16 @@ fn runTui(
     };
 
     try ui.draw(out);
+
+    // Check for new version after initial draw
+    if (ver_check.poll()) |new_ver| {
+        const t = tui_theme.get();
+        const ver_msg = try std.fmt.allocPrint(alloc, "Update available: {s}", .{new_ver});
+        defer alloc.free(ver_msg);
+        try ui.tr.styledText(ver_msg, .{ .fg = t.accent });
+        try ui.tr.infoText("  https://github.com/joelreymont/pz/releases");
+        try ui.draw(out);
+    }
     if (run_cmd.prompt) |prompt| {
         var init_cmd_buf: [4096]u8 = undefined;
         var init_cmd_fbs = std.io.fixedBufferStream(&init_cmd_buf);
@@ -844,8 +868,7 @@ fn runTui(
                                     if (cp.selectedArg()) |path| {
                                         const text = ui.ed.text();
                                         const cur = ui.ed.cursor();
-                                        var ws: usize = cur;
-                                        while (ws > 0 and text[ws - 1] != ' ' and text[ws - 1] != '\n' and text[ws - 1] != '\t') ws -= 1;
+                                        const ws = ui.ed.wordStart(cur);
                                         const has_at = ws < cur and text[ws] == '@';
                                         const at_s: []const u8 = if (has_at) "@" else "";
                                         const new_text = std.fmt.allocPrint(alloc, "{s}{s}{s}{s}", .{
@@ -1141,12 +1164,17 @@ fn runTui(
                         .ext_editor => {
                             if (pre) |p| alloc.free(p);
                             tui_term.restore(stdin_fd);
-                            if (openExtEditor(alloc, ui.editorText())) |txt| {
-                                defer alloc.free(txt);
-                                _ = tui_term.enableRaw(stdin_fd);
-                                try ui.ed.setText(txt);
-                            } else {
-                                _ = tui_term.enableRaw(stdin_fd);
+                            const ed_result = openExtEditor(alloc, ui.editorText());
+                            _ = tui_term.enableRaw(stdin_fd);
+                            if (ed_result) |maybe_txt| {
+                                if (maybe_txt) |txt| {
+                                    defer alloc.free(txt);
+                                    try ui.ed.setText(txt);
+                                }
+                            } else |err| {
+                                const msg = try std.fmt.allocPrint(alloc, "[editor failed: {s}]", .{@errorName(err)});
+                                defer alloc.free(msg);
+                                try ui.tr.infoText(msg);
                             }
                             try ui.draw(out);
                         },
@@ -1810,10 +1838,11 @@ fn handleSlashCommand(
             const stats = try sessionStats(alloc, session_dir_path, sid.*, no_session);
             defer if (stats.path_owned) |path| alloc.free(path);
             const total = stats.user_msgs + stats.asst_msgs + stats.tool_calls + stats.tool_results;
-            const info = try std.fmt.allocPrint(alloc,
+            const info = try std.fmt.allocPrint(
+                alloc,
                 "Session Info\n\nFile: {s}\nID:   {s}\n\nMessages\n" ++
-                "  User:         {d}\n  Assistant:    {d}\n  Tool Calls:   {d}\n" ++
-                "  Tool Results: {d}\n  Total:        {d}\n",
+                    "  User:         {d}\n  Assistant:    {d}\n  Tool Calls:   {d}\n" ++
+                    "  Tool Results: {d}\n  Total:        {d}\n",
                 .{ stats.path, sid.*, stats.user_msgs, stats.asst_msgs, stats.tool_calls, stats.tool_results, total },
             );
             defer alloc.free(info);
@@ -2028,7 +2057,11 @@ fn handleSlashCommand(
             try writeTextLine(alloc, out, "shared: {s}\n", .{gist_url});
         },
         .changelog => {
-            try out.writeAll("pz — no changelog yet\n");
+            const cl = try changelog.formatForDisplay(alloc, 50);
+            defer alloc.free(cl);
+            try out.writeAll("[What's New]\n");
+            try out.writeAll(cl);
+            try out.writeAll("\n");
         },
     }
     return .handled;
@@ -2309,9 +2342,7 @@ fn completeFilePath(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
     const cur = ui.ed.cursor();
     if (cur == 0) return;
 
-    // Find last word
-    var ws: usize = cur;
-    while (ws > 0 and text[ws - 1] != ' ' and text[ws - 1] != '\n' and text[ws - 1] != '\t') ws -= 1;
+    const ws = ui.ed.wordStart(cur);
     const word = text[ws..cur];
     if (word.len == 0) return;
 
@@ -2711,11 +2742,12 @@ fn thinkingBorderFg(level: args_mod.ThinkingLevel) @import("../modes/tui/frame.z
     };
 }
 
-fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
+fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui, is_resumed: bool) !void {
     const t = tui_theme.get();
 
     // Version banner (matching pi's "pi v0.52.12")
-    try ui.tr.styledText(" pz v0.0.0", .{ .fg = t.dim });
+    const ver_line = " pz v" ++ cli.version ++ " (" ++ cli.git_hash ++ ")";
+    try ui.tr.styledText(ver_line, .{ .fg = t.dim });
 
     // Hotkeys — key in dim, description in muted
     const keys = [_][2][]const u8{
@@ -2791,6 +2823,31 @@ fn showStartup(alloc: std.mem.Allocator, ui: *tui_harness.Ui) !void {
             defer alloc.free(display2);
             try ui.tr.infoText(display2);
         }
+    }
+
+    // What's New section (only on fresh sessions)
+    if (!is_resumed) {
+        var state = config.PzState.load(alloc) orelse config.PzState{};
+        defer state.deinit(alloc);
+
+        const new_entries = changelog.entriesSince(state.last_hash);
+        if (new_entries.len > 0) {
+            const formatted = try changelog.formatRaw(alloc, new_entries, 10);
+            defer alloc.free(formatted);
+            try ui.tr.styledText("", .{}); // blank line
+            try ui.tr.styledText("[What's New]", .{ .fg = t.md_heading });
+            // Split and display each line
+            var off: usize = 0;
+            while (off < formatted.len) {
+                const eol = std.mem.indexOfScalarPos(u8, formatted, off, '\n') orelse formatted.len;
+                try ui.tr.infoText(formatted[off..eol]);
+                off = eol + 1;
+            }
+        }
+
+        // Update state with current git hash
+        const new_state = config.PzState{ .last_hash = cli.git_hash };
+        new_state.save(alloc);
     }
 
     // Trailing blank lines before prompt (matching pi's spacing)
@@ -2985,20 +3042,20 @@ fn runBashMode(
     }
 }
 
-fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
+fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) !?[]u8 {
     const ed = std.posix.getenv("EDITOR") orelse std.posix.getenv("VISUAL") orelse "vi";
 
     // Write current text to unique temp file
     var tmp_buf: [64]u8 = undefined;
     const ts: u64 = @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())));
-    const tmp = std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts}) catch return null;
+    const tmp = try std.fmt.bufPrint(&tmp_buf, "/tmp/pz-edit-{d}.txt", .{ts});
     defer std.fs.deleteFileAbsolute(tmp) catch |err| {
         std.debug.print("warning: temp file cleanup failed: {s}\n", .{@errorName(err)});
     };
     {
-        const f = std.fs.createFileAbsolute(tmp, .{}) catch return null;
+        const f = try std.fs.createFileAbsolute(tmp, .{});
         defer f.close();
-        f.writeAll(current) catch return null;
+        try f.writeAll(current);
     }
 
     const argv = [_][]const u8{ ed, tmp };
@@ -3006,13 +3063,13 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
     child.stdin_behavior = .Inherit;
     child.stdout_behavior = .Inherit;
     child.stderr_behavior = .Inherit;
-    child.spawn() catch return null;
-    _ = child.wait() catch return null;
+    try child.spawn();
+    _ = try child.wait();
 
     // Read back
-    const f = std.fs.openFileAbsolute(tmp, .{}) catch return null;
+    const f = try std.fs.openFileAbsolute(tmp, .{});
     defer f.close();
-    const content = f.readToEndAlloc(alloc, 1024 * 1024) catch return null;
+    const content = try f.readToEndAlloc(alloc, 1024 * 1024);
     // Trim trailing newline
     var len = content.len;
     while (len > 0 and (content[len - 1] == '\n' or content[len - 1] == '\r')) len -= 1;
@@ -3021,10 +3078,7 @@ fn openExtEditor(alloc: std.mem.Allocator, current: []const u8) ?[]u8 {
         return null;
     }
     if (len < content.len) {
-        const trimmed = alloc.dupe(u8, content[0..len]) catch {
-            alloc.free(content);
-            return null;
-        };
+        const trimmed = try alloc.dupe(u8, content[0..len]);
         alloc.free(content);
         return trimmed;
     }

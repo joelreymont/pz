@@ -24,6 +24,7 @@ pub const Ui = struct {
     cp: ?cmdprev_mod.CmdPreview = null,
     arg_src: ?[]const []const u8 = null, // runtime-provided arg completion source
     path_items: ?[][]u8 = null, // owned file path completion items
+    path_prefix: ?[]u8 = null, // cached prefix for path_items
     img_cap: imgproto_mod.ImageCap = .none,
     spin: u8 = 0,
 
@@ -81,6 +82,10 @@ pub const Ui = struct {
         if (self.path_items) |items| {
             pathcomp_mod.freeList(self.alloc, items);
             self.path_items = null;
+        }
+        if (self.path_prefix) |p| {
+            self.alloc.free(p);
+            self.path_prefix = null;
         }
     }
 
@@ -242,10 +247,10 @@ pub const Ui = struct {
 
     pub fn updatePreview(self: *Ui) void {
         self.cp = null;
-        self.clearPathItems();
 
         const text = self.ed.text();
         if (text.len > 0 and text[0] == '/') {
+            self.clearPathItems();
             const prefix = text[1..];
             if (std.mem.indexOfScalar(u8, prefix, ' ')) |sp| {
                 if (self.arg_src) |src| {
@@ -262,15 +267,93 @@ pub const Ui = struct {
             const word = text[ws..cur];
             if (word.len > 0 and word[0] == '@') {
                 const pattern = word[1..];
-                if (pathcomp_mod.list(self.alloc, pattern)) |items| {
-                    self.path_items = items;
-                    self.cp = cmdprev_mod.CmdPreview.updateArgs(
-                        pathcomp_mod.asConst(items),
-                        pattern,
-                    );
+                self.updatePathCompletion(pattern);
+            } else {
+                self.clearPathItems();
+            }
+        } else {
+            self.clearPathItems();
+        }
+    }
+
+    /// Update path completion with caching: if pattern extends cached prefix,
+    /// filter in-place instead of re-scanning the filesystem.
+    fn updatePathCompletion(self: *Ui, pattern: []const u8) void {
+        // Check if we can filter cached results
+        if (self.path_items != null and self.path_prefix != null) {
+            const cached = self.path_prefix.?;
+            if (pattern.len >= cached.len and std.mem.startsWith(u8, pattern, cached)) {
+                // Pattern extends cached prefix — filter existing items
+                var items = self.path_items.?;
+                var keep: usize = 0;
+                for (items) |item| {
+                    // Item paths have dir prefix; match against the file portion
+                    if (std.mem.indexOf(u8, item, pattern) != null or
+                        matchItemPrefix(item, pattern))
+                    {
+                        items[keep] = item;
+                        keep += 1;
+                    } else {
+                        self.alloc.free(item);
+                    }
                 }
+                if (keep == 0) {
+                    self.alloc.free(items);
+                    self.path_items = null;
+                    self.clearPathPrefix();
+                    return;
+                }
+                self.path_items = items[0..keep];
+                self.updatePathPrefix(pattern);
+                self.cp = cmdprev_mod.CmdPreview.updateArgs(
+                    pathcomp_mod.asConst(self.path_items.?),
+                    pattern,
+                );
+                return;
             }
         }
+
+        // Cache miss — full directory scan
+        self.clearPathItems();
+        if (pathcomp_mod.list(self.alloc, pattern)) |items| {
+            self.path_items = items;
+            self.updatePathPrefix(pattern);
+            self.cp = cmdprev_mod.CmdPreview.updateArgs(
+                pathcomp_mod.asConst(items),
+                pattern,
+            );
+        }
+    }
+
+    fn updatePathPrefix(self: *Ui, pattern: []const u8) void {
+        if (self.path_prefix) |p| self.alloc.free(p);
+        self.path_prefix = self.alloc.dupe(u8, pattern) catch null;
+    }
+
+    fn clearPathPrefix(self: *Ui) void {
+        if (self.path_prefix) |p| {
+            self.alloc.free(p);
+            self.path_prefix = null;
+        }
+    }
+
+    fn matchItemPrefix(item: []const u8, pattern: []const u8) bool {
+        // pathcomp items are "dir/name" or "name"; check if basename starts with partial
+        const base = if (std.mem.lastIndexOfScalar(u8, item, '/')) |sep|
+            item[sep + 1 ..]
+        else
+            item;
+        // Strip trailing '/' for directory entries
+        const name = if (base.len > 0 and base[base.len - 1] == '/')
+            base[0 .. base.len - 1]
+        else
+            base;
+        // Pattern may include directory prefix
+        const pat_base = if (std.mem.lastIndexOfScalar(u8, pattern, '/')) |sep|
+            pattern[sep + 1 ..]
+        else
+            pattern;
+        return std.mem.startsWith(u8, name, pat_base);
     }
 
     pub fn clearTranscript(self: *Ui) void {
@@ -369,12 +452,7 @@ pub const Ui = struct {
     }
 };
 
-/// Find start of the word containing cursor position.
-fn lastWordStart(text: []const u8, cur: usize) usize {
-    var i = cur;
-    while (i > 0 and text[i - 1] != ' ' and text[i - 1] != '\n' and text[i - 1] != '\t') i -= 1;
-    return i;
-}
+const lastWordStart = editor.wordStartIn;
 
 /// Wrapped-line info for cursor positioning and rendering.
 const WrapInfo = struct {

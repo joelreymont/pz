@@ -21,6 +21,7 @@ pub fn run() !void {
     switch (cmd) {
         .help => |txt| try out.writeAll(txt),
         .version => |txt| try out.writeAll(txt),
+        .changelog => |txt| try out.writeAll(txt),
         .run => |run_cmd| {
             const sid = try runtime.exec(alloc, run_cmd);
             alloc.free(sid);
