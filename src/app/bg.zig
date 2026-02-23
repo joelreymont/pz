@@ -382,8 +382,7 @@ pub const Mgr = struct {
         var n: u32 = 0;
         while (n < 64) : (n += 1) {
             const ts = std.time.milliTimestamp();
-            const path = try std.fmt.allocPrint(self.alloc, "/tmp/pz-bg-{d}-{d}-{d}.log", .{
-                std.c.getpid(),
+            const path = try std.fmt.allocPrint(self.alloc, "/tmp/pz-bg-{d}-{d}.log", .{
                 id,
                 ts + @as(i64, n),
             });
