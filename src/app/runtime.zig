@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const cli = @import("cli.zig");
 const bg = @import("bg.zig");
+const activity = @import("activity.zig");
 const changelog = @import("changelog.zig");
 const report = @import("report.zig");
 const update_mod = @import("update.zig");
@@ -723,6 +724,27 @@ const PrintSink = struct {
             },
             else => {}, // .replay, .session, .tool, .agent_status not used in print sink
         }
+    }
+};
+
+const ActivityModeSink = struct {
+    mode_sink: core.loop.ModeSink = .{ .vt = &core.loop.ModeSink.Bind(@This(), @This().push).vt },
+    inner: *core.loop.ModeSink,
+    activity_sink: *activity.ActivitySink,
+    sid: []const u8,
+
+    fn push(self: *ActivityModeSink, ev: core.loop.ModeEv) !void {
+        switch (ev) {
+            .provider => |provider_event| switch (provider_event) {
+                .tool_call => |tool_call| self.activity_sink.emit(.{ .activity = .{
+                    .session_id = self.sid,
+                    .tool_name = tool_call.name,
+                } }),
+                else => {},
+            },
+            else => {},
+        }
+        try self.inner.push(ev);
     }
 };
 
@@ -2064,7 +2086,7 @@ fn execWithIoHooks(
     out: ?*std.Io.Writer,
     audit_hooks: AuditHooks,
 ) (Err || anyerror)![]u8 {
-    return execWithIoTuiHooks(alloc, run_cmd, in, out, audit_hooks, .{});
+    return execWithIoAllHooks(alloc, run_cmd, in, out, audit_hooks, .{}, .{});
 }
 
 fn execWithIoTuiHooks(
@@ -2074,6 +2096,28 @@ fn execWithIoTuiHooks(
     out: ?*std.Io.Writer,
     audit_hooks: AuditHooks,
     tui_hooks: TuiHooks,
+) (Err || anyerror)![]u8 {
+    return execWithIoAllHooks(alloc, run_cmd, in, out, audit_hooks, tui_hooks, .{});
+}
+
+fn execWithIoActivityHooks(
+    alloc: std.mem.Allocator,
+    run_cmd: cli.Run,
+    in: ?*std.Io.Reader,
+    out: ?*std.Io.Writer,
+    activity_hooks: activity.ActivityHooks,
+) (Err || anyerror)![]u8 {
+    return execWithIoAllHooks(alloc, run_cmd, in, out, .{}, .{}, activity_hooks);
+}
+
+fn execWithIoAllHooks(
+    alloc: std.mem.Allocator,
+    run_cmd: cli.Run,
+    in: ?*std.Io.Reader,
+    out: ?*std.Io.Writer,
+    audit_hooks: AuditHooks,
+    tui_hooks: TuiHooks,
+    activity_hooks: activity.ActivityHooks,
 ) (Err || anyerror)![]u8 {
     var provider_rt: ProviderRuntime = undefined;
     var hooks = audit_hooks;
@@ -2090,6 +2134,19 @@ fn execWithIoTuiHooks(
     defer if (has_provider_rt) provider_rt.deinit();
 
     const home = run_cmd.home;
+    var activity_bridge: activity.Bridge = undefined;
+    var has_activity_bridge = false;
+    defer if (has_activity_bridge) activity_bridge.deinit();
+    var activity_sink = activity_hooks.sink;
+    if (activity_sink == null) {
+        if (home) |h| {
+            if (activity.Bridge.init(alloc, run_cmd.io, h)) |bridge| {
+                activity_bridge = bridge;
+                has_activity_bridge = true;
+                activity_sink = activity_bridge.activitySink();
+            } else |_| {}
+        }
+    }
     var pol = try RuntimePolicy.load(alloc, defaultIo(), home);
     defer pol.deinit();
 
@@ -2234,6 +2291,14 @@ fn execWithIoTuiHooks(
         store = &fs_store_impl.session_store;
     }
 
+    var activity_sid: ?[]u8 = null;
+    defer if (activity_sid) |owned_sid| alloc.free(owned_sid);
+    defer if (activity_sid) |owned_sid| activity_sink.?.emit(.{ .stop = .{ .session_id = owned_sid } });
+    if (activity_sink) |sink| {
+        activity_sid = alloc.dupe(u8, sid) catch null;
+        if (activity_sid) |owned_sid| sink.emit(.{ .session_start = .{ .session_id = owned_sid } });
+    }
+
     // Dispatch
     {
         const sess_store = store.?;
@@ -2252,6 +2317,7 @@ fn execWithIoTuiHooks(
                 writer,
                 sys_prompt,
                 audit_hooks,
+                activity_sink,
                 false,
             ),
             .json => try runJson(
@@ -2266,6 +2332,7 @@ fn execWithIoTuiHooks(
                 writer,
                 sys_prompt,
                 hooks,
+                activity_sink,
                 false,
             ),
             .tui => try runTui(
@@ -2284,6 +2351,7 @@ fn execWithIoTuiHooks(
                 false,
                 hooks,
                 tui_hooks,
+                activity_sink,
                 null,
                 needs_login,
             ),
@@ -2301,6 +2369,7 @@ fn execWithIoTuiHooks(
                 run_cmd.no_session,
                 sys_prompt,
                 hooks,
+                activity_sink,
                 false,
             ),
         }
@@ -2321,6 +2390,7 @@ fn runPrint(
     out: *std.Io.Writer,
     sys_prompt: ?[]const u8,
     audit_hooks: AuditHooks,
+    activity_sink: ?*activity.ActivitySink,
     is_oauth: bool,
 ) !void {
     const home = run_cmd.home;
@@ -2363,6 +2433,20 @@ fn runPrint(
     const approval_loc = try getApprovalLocAlloc(alloc, defaultIo());
     defer freeApprovalLoc(alloc, approval_loc);
 
+    if (activity_sink) |sink| sink.emit(.{ .prompt = .{
+        .session_id = sid,
+        .prompt_chars = prompt.len,
+    } });
+    var activity_mode: ActivityModeSink = undefined;
+    const mode = if (activity_sink) |sink| blk: {
+        activity_mode = .{
+            .inner = &sink_impl.mode_sink,
+            .activity_sink = sink,
+            .sid = sid,
+        };
+        break :blk &activity_mode.mode_sink;
+    } else &sink_impl.mode_sink;
+
     _ = try core.loop.run(.{
         .alloc = alloc,
         .sid = sid,
@@ -2373,7 +2457,7 @@ fn runPrint(
         .store = store,
         .reg = reg.registry(),
         .tool_auth = &tool_auth_impl.tool_auth,
-        .mode = &sink_impl.mode_sink,
+        .mode = mode,
         .system_prompt = sys_prompt,
         .provider_opts = run_cmd.thinking.toProviderOpts(),
         .max_turns = run_cmd.max_turns,
@@ -2508,6 +2592,7 @@ fn runJson(
     out: *std.Io.Writer,
     sys_prompt: ?[]const u8,
     audit_hooks: AuditHooks,
+    activity_sink: ?*activity.ActivitySink,
     is_oauth: bool,
 ) !void {
     const home = run_cmd.home;
@@ -2535,6 +2620,7 @@ fn runJson(
         .approval_bind = approval_bind,
         .approval_loc = approval_loc,
         .audit_hooks = audit_hooks,
+        .activity_sink = activity_sink,
         .skip_prompt_guard = is_oauth,
     };
 
@@ -2588,6 +2674,7 @@ fn runTui(
     is_sub: bool,
     audit_hooks: AuditHooks,
     tui_hooks: TuiHooks,
+    activity_sink: ?*activity.ActivitySink,
     native_rt: ?*NativeProviderRuntime,
     needs_login: ?NativeProviderKind,
 ) !void {
@@ -2706,6 +2793,7 @@ fn runTui(
         .approval_bind = approval_bind,
         .approval_loc = approval_loc,
         .approver = &prompt_approver_impl.approver,
+        .activity_sink = activity_sink,
         .skip_prompt_guard = is_sub,
     };
     defer tools_rt.ask_hook = null;
@@ -2931,6 +3019,7 @@ fn runTui(
             .cmd_cache = &live_cmd_cache,
             .approval_bind = live_approval_bind,
             .approval_loc = live_approval_loc,
+            .activity_sink = activity_sink,
             .skip_prompt_guard = is_sub,
         };
         var reader = tui_input.Reader.initWithNotify2(stdin_fd, bg_mgr.wakeFd(), live_turn.wakeFd());
@@ -3749,6 +3838,7 @@ fn runRpc(
     no_session: bool,
     sys_prompt: ?[]const u8,
     audit_hooks: AuditHooks,
+    activity_sink: ?*activity.ActivitySink,
     is_oauth: bool,
 ) !void {
     const home = run_cmd.home;
@@ -3783,6 +3873,7 @@ fn runRpc(
         .cmd_cache = &cmd_cache,
         .approval_bind = approval_bind,
         .approval_loc = approval_loc,
+        .activity_sink = activity_sink,
         .skip_prompt_guard = is_oauth,
     };
     var bg_mgr = try bg.Manager.initWithOpts(alloc, .{
@@ -7604,6 +7695,7 @@ const TurnCtx = struct {
     approval_loc: ?core.loop.CmdCache.Loc = null,
     approver: ?*core.loop.Approver = null,
     audit_hooks: AuditHooks = .{},
+    activity_sink: ?*activity.ActivitySink = null,
     skip_prompt_guard: bool = false,
 
     const TurnOpts = struct {
@@ -7616,6 +7708,11 @@ const TurnCtx = struct {
     };
 
     fn run(self: *const TurnCtx, opts: TurnOpts) !void {
+        if (self.activity_sink) |sink| sink.emit(.{ .prompt = .{
+            .session_id = opts.sid,
+            .prompt_chars = opts.prompt.len,
+        } });
+
         const prompt_hint = if (needsAskHint(opts.prompt))
             try std.fmt.allocPrint(
                 self.alloc,
@@ -7644,6 +7741,16 @@ const TurnCtx = struct {
             .seq = &tool_audit_seq,
         };
 
+        var activity_mode: ActivityModeSink = undefined;
+        const mode = if (self.activity_sink) |sink| blk: {
+            activity_mode = .{
+                .inner = self.mode,
+                .activity_sink = sink,
+                .sid = opts.sid,
+            };
+            break :blk &activity_mode.mode_sink;
+        } else self.mode;
+
         _ = try core.loop.run(.{
             .alloc = self.alloc,
             .sid = opts.sid,
@@ -7654,7 +7761,7 @@ const TurnCtx = struct {
             .store = self.store,
             .reg = reg.registry(),
             .tool_auth = &tool_auth_impl.tool_auth,
-            .mode = self.mode,
+            .mode = mode,
             .system_prompt = opts.system_prompt,
             .provider_opts = opts.provider_opts,
             .max_turns = self.max_turns,
@@ -8867,6 +8974,56 @@ const AuditRows = struct {
     }
 };
 
+const ActivityRows = struct {
+    sink: activity.ActivitySink = undefined,
+    rows: std.ArrayList(Row) = .empty,
+
+    const Row = struct {
+        kind: std.meta.Tag(activity.Event),
+        session_id: []u8,
+        prompt_chars: ?usize = null,
+        tool_name: ?[]u8 = null,
+    };
+
+    fn bind(self: *ActivityRows) void {
+        self.sink = .{ .ctx = self, .emit_fn = emit };
+    }
+
+    fn deinit(self: *ActivityRows, alloc: std.mem.Allocator) void {
+        for (self.rows.items) |row| {
+            alloc.free(row.session_id);
+            if (row.tool_name) |tool_name| alloc.free(tool_name);
+        }
+        self.rows.deinit(alloc);
+    }
+
+    fn emit(ctx: *anyopaque, event: activity.Event) void {
+        const self: *ActivityRows = @ptrCast(@alignCast(ctx));
+        const alloc = std.testing.allocator;
+        const row: Row = switch (event) {
+            .session_start => |payload| .{
+                .kind = .session_start,
+                .session_id = alloc.dupe(u8, payload.session_id) catch @panic("activity test allocation failed"),
+            },
+            .prompt => |payload| .{
+                .kind = .prompt,
+                .session_id = alloc.dupe(u8, payload.session_id) catch @panic("activity test allocation failed"),
+                .prompt_chars = payload.prompt_chars,
+            },
+            .activity => |payload| .{
+                .kind = .activity,
+                .session_id = alloc.dupe(u8, payload.session_id) catch @panic("activity test allocation failed"),
+                .tool_name = alloc.dupe(u8, payload.tool_name) catch @panic("activity test allocation failed"),
+            },
+            .stop => |payload| .{
+                .kind = .stop,
+                .session_id = alloc.dupe(u8, payload.session_id) catch @panic("activity test allocation failed"),
+            },
+        };
+        self.rows.append(alloc, row) catch @panic("activity test allocation failed");
+    }
+};
+
 const AuditAttrSnap = struct {
     key: []const u8,
     vis: core.audit.Vis,
@@ -9057,6 +9214,122 @@ test "runtime executes tool calls through loop registry in print mode" {
     const written = out_fbs.buffered();
     try std.testing.expect(std.mem.indexOf(u8, written, "done") != null);
     try std.testing.expect(std.mem.indexOf(u8, written, "stop reason=done") != null);
+}
+
+test "runtime emits ordered privacy-minimized activity lifecycle" {
+    const OhSnap = @import("ohsnap");
+    const oh = OhSnap{};
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    const prompt = "deploy sk-live-key";
+    const provider_cmd = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "cat >/dev/null; if [ -e '{s}/tool-seen' ]; then " ++
+            "printf 'text:done\\nstop:done\\n'; else touch '{s}/tool-seen'; " ++
+            "printf 'tool_call:call-1|bash|{{\"cmd\":\"printf super-secret-tool-body\"}}\\nstop:tool\\n'; fi",
+        .{ sess_abs, sess_abs },
+    );
+    defer std.testing.allocator.free(provider_cmd);
+
+    var cfg = cli.Run{
+        .mode = .print,
+        .prompt = prompt,
+        .verbose = true,
+        .cfg = .{
+            .mode = .print,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "p"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = try std.testing.allocator.dupe(u8, provider_cmd),
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var out_buf: [4096]u8 = undefined;
+    var out_fbs: std.Io.Writer = .fixed(&out_buf);
+    var rows = ActivityRows{};
+    rows.bind();
+    defer rows.deinit(std.testing.allocator);
+
+    const sid = try execWithIoActivityHooks(
+        std.testing.allocator,
+        cfg,
+        eofReader(),
+        &out_fbs,
+        .{ .sink = &rows.sink },
+    );
+    defer std.testing.allocator.free(sid);
+
+    var trace: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer trace.deinit();
+    var sid_match = true;
+    for (rows.rows.items) |row| {
+        sid_match = sid_match and std.mem.eql(u8, sid, row.session_id);
+        switch (row.kind) {
+            .session_start => try trace.writer.writeAll("session_start\n"),
+            .prompt => try trace.writer.print("prompt chars={}\n", .{row.prompt_chars.?}),
+            .activity => try trace.writer.print("activity tool={s}\n", .{row.tool_name.?}),
+            .stop => try trace.writer.writeAll("stop\n"),
+        }
+    }
+    const raw = trace.written();
+    try std.testing.expectEqualStrings(
+        "session_start\nprompt chars=18\nactivity tool=bash\nstop\n",
+        raw,
+    );
+    try std.testing.expect(sid_match);
+    try std.testing.expect(std.mem.indexOf(u8, raw, prompt) == null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "super-secret-tool-body") == null);
+    try oh.snap(@src(),
+        \\[]u8
+        \\  "session_start
+        \\prompt chars=18
+        \\activity tool=bash
+        \\stop
+        \\"
+    ).expectEqual(raw);
+}
+
+test "runtime activity emits stop when a turn fails after session start" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "sess");
+    const sess_abs = try testRealPathAlloc(std.testing.allocator, tmp.dir, "sess");
+    defer std.testing.allocator.free(sess_abs);
+
+    var cfg = cli.Run{
+        .mode = .print,
+        .prompt = null,
+        .cfg = .{
+            .mode = .print,
+            .model = try std.testing.allocator.dupe(u8, "m"),
+            .provider = try std.testing.allocator.dupe(u8, "p"),
+            .session_dir = try std.testing.allocator.dupe(u8, sess_abs),
+            .provider_cmd = try std.testing.allocator.dupe(u8, "cat >/dev/null"),
+        },
+    };
+    defer cfg.cfg.deinit(std.testing.allocator);
+
+    var rows = ActivityRows{};
+    rows.bind();
+    defer rows.deinit(std.testing.allocator);
+    try std.testing.expectError(error.EmptyPrompt, execWithIoActivityHooks(
+        std.testing.allocator,
+        cfg,
+        eofReader(),
+        null,
+        .{ .sink = &rows.sink },
+    ));
+    try std.testing.expectEqual(@as(usize, 2), rows.rows.items.len);
+    try std.testing.expectEqual(std.meta.Tag(activity.Event).session_start, rows.rows.items[0].kind);
+    try std.testing.expectEqual(std.meta.Tag(activity.Event).stop, rows.rows.items[1].kind);
+    try std.testing.expectEqualStrings(rows.rows.items[0].session_id, rows.rows.items[1].session_id);
 }
 
 test "runtime blocks tool dispatch under verified policy" {
@@ -9631,6 +9904,7 @@ test "runtime tui overflow retries once with injected live stdin" {
             .stop_after_completions = 1,
             .submit_text = "ping",
         },
+        null,
         null,
         null,
     );

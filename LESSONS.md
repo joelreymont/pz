@@ -4,6 +4,15 @@ Hard-won patterns and anti-patterns from building pz. **Update this file at the 
 
 ---
 
+## Session Notes (2026-07-12)
+
+### Worked Well
+- Emit privacy-minimized tool activity from the shared `ModeSink` provider-event seam; policy and approval checks can reject a call before its dispatch runs, but the provider tool-call event still represents real harness activity.
+- Keep lifecycle stop data in an owned session-id copy so `/new` or `/resume` cannot leave a deferred hook holding freed session memory.
+
+### Did Not Work
+- Deferring `stop` inside the `if (sink)` block emitted it at the end of that block, before the prompt. Lifecycle defers must be registered in the enclosing runtime scope.
+
 ## Session Notes (2026-06-19)
 
 ### Worked Well
