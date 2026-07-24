@@ -1166,7 +1166,7 @@ test "UX1 PTY startup shows version, hints, cwd and quits cleanly" {
 
     const steps = [_]InteractiveStep{
         .{ .wait_for = .{ .text = "drop files", .timeout_ms = 8000 } },
-        .{ .wait_for = .{ .text = "gpt-5.5", .timeout_ms = 5000 } },
+        .{ .wait_for = .{ .text = "gpt-5.6-sol", .timeout_ms = 5000 } },
         .{ .inject = "\x03" }, // ctrl-c once (clear)
         .{ .sleep = 400 },
         .{ .inject = "\x03" }, // ctrl-c again (quit)

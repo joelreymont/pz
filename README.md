@@ -89,10 +89,10 @@ Release builds require `-Dgit-hash=<hash>` and embed `CHANGELOG.md`. Debug build
 pz
 
 # Default approved provider command adapter
-pz --provider codex --model gpt-5.5
+pz --provider codex --model gpt-5.6-sol
 
 # Explicit approved provider command adapter override
-PZ_PROVIDER_CMD='pz-provider-codex' pz --provider codex --model gpt-5.5
+PZ_PROVIDER_CMD='pz-provider-codex' pz --provider codex --model gpt-5.6-sol
 
 # Headless
 pz --print "explain this codebase"

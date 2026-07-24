@@ -6585,7 +6585,7 @@ test "dynamic provider rejects a non-matching provider with a named error" {
     try std.testing.expectEqual(@as(usize, 0), backend.started);
 }
 
-const default_model = "gpt-5.5";
+const default_model = "gpt-5.6-sol";
 const default_provider = "codex";
 
 fn resolveDefault(model: []const u8) []const u8 {
